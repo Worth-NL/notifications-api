@@ -1,6 +1,6 @@
 # GOV.UK Notify API
 
-[![Build](https://github.com/Worth-NL/notifications-api/actions/workflows/build-and-test.yml/badge.svg?branch=main)](https://github.com/Worth-NL/notifications-api/actions/workflows/build-and-test.yml)
+[![Build](https://github.com/Worth-NL/notifications-api/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Worth-NL/notifications-api/actions/workflows/test.yml)
 
 Contains:
 - the public-facing REST API for GOV.UK Notify, which teams can integrate with using [our clients](https://www.notifications.service.gov.uk/documentation)
