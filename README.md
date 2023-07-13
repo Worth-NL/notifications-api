@@ -1,5 +1,7 @@
 # GOV.UK Notify API
 
+[![Build](https://github.com/Worth-NL/notifications-api/actions/workflows/build-and-test.yml/badge.svg?branch=main)](https://github.com/Worth-NL/notifications-api/actions/workflows/build-and-test.yml)
+
 Contains:
 - the public-facing REST API for GOV.UK Notify, which teams can integrate with using [our clients](https://www.notifications.service.gov.uk/documentation)
 - an internal-only REST API built using Flask to manage services, users, templates, etc (this is what the [admin app](http://github.com/alphagov/notifications-admin) talks to)
