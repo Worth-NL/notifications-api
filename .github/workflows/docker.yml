@@ -33,4 +33,5 @@ jobs:
           context: .
           file: ./docker/Dockerfile
           tags: ghcr.io/${{ env.REPO }}:latest
+          push: true
           # TODO: add a git tag and associated docker tag for it on merge
