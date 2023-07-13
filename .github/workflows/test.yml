@@ -1,0 +1,39 @@
+name: Test
+
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: python:3.9-slim-bullseye
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        PYTHONUNBUFFEREDf: 1
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Base dependencies
+        run: |
+          apt-get update -q
+          apt-get install -q -y --no-install-recommends build-essential git libcurl4-openssl-dev curl libssl-dev
+          apt-get -y clean -q
+          rm -Rf /var/lib/apt/lists/* /tmp/*
+
+      - name: Python dependencies
+        run: pip install -r requirements_for_test.txt -q
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Black
+        run: black --check .
+
+      - name: Test
+        run: pytest -n auto --maxfail=10
+        continue-on-error: true
+        # TODO: figure out how to get automated tests working (needs full environment running)
