@@ -4,6 +4,9 @@ on:
   push:
     branches: ["main"]
 
+env:
+  REPO: ${{ github.repository }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,10 +24,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - run: |
+          echo "REPO=${GITHUB_REPOSITORY,,}" >>${GITHUB_ENV}
+
       - uses: docker/build-push-action@v4
         with:
           platforms: linux/amd64
           context: .
           file: ./docker/Dockerfile
-          tags: ghcr.io/${{ github.repository }}:latest,ghcr.io/${{ github.repository }}:$(date +%s)
+          tags: ghcr.io/${{ env.REPO }}:latest,ghcr.io/${{ env.REPO }}:$(date +%s)
           # TODO: replace date tag with a git release tag when release methods are decided
