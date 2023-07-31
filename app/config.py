@@ -499,7 +499,7 @@ class Development(Config):
 
     NOTIFY_ENVIRONMENT = "development"
     NOTIFY_LOG_PATH = "application.log"
-    NOTIFY_EMAIL_DOMAIN = "notify.tools"
+    NOTIFY_EMAIL_DOMAIN = "notifynl.nl"
 
     SQLALCHEMY_DATABASE_URI = os.getenv("SQLALCHEMY_DATABASE_URI", "postgresql://localhost/notification_api")
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
