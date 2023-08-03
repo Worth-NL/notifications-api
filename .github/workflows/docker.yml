@@ -27,6 +27,9 @@ jobs:
       - run: |
           echo -e "__git_commit__ = \"${{ github.sha }}\"\n__time__ = \"$(date)\"" > ./app/version.py
 
+      - uses: azure/setup-kubectl@v3
+        id: install
+
       - name: Log in with Azure
         uses: azure/login@v1
         with:
@@ -38,14 +41,7 @@ jobs:
           azcliversion: 2.30.0
           inlineScript: |
             az aks get-credentials --resource-group dh-notify-rg --name dh-notify-aks
-
-      - uses: actions-hub/kubectl@master
-        env:
-          KUBE_CONFIG: /root/.kube/config
-
-      - uses: actions-hub/kubectl@master
-        with:
-          args: get deployments --all-namespaces
+            kubectl get deployments --all-namespaces
 
       - uses: docker/setup-qemu-action@v2
 
