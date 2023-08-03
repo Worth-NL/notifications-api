@@ -39,11 +39,13 @@ jobs:
           inlineScript: |
             az aks get-credentials --resource-group dh-notify-rg --name dh-notify-aks
 
-      - uses: azure/setup-kubectl@v3
-        id: install
+      - uses: actions-hub/kubectl@master
+        env:
+          KUBE_CONFIG: /root/.kube/config
 
-      - run: |
-          kubectl get deployments --all-namespaces
+      - uses: actions-hub/kubectl@master
+        with:
+          args: get deployments --all-namespaces
 
       - uses: docker/setup-qemu-action@v2
 
