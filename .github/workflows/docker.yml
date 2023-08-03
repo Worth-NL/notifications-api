@@ -40,13 +40,10 @@ jobs:
       #       az aks get-credentials --resource-group dh-notify-rg --name dh-notify-aks
       #       kubectl get deployments --all-namespaces
 
-      - uses: actions-hub/kubectl@master
+      - name: Install kubectl and configure
+        uses: actions-hub/kubectl@master
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
-
-      - uses: actions-hub/kubectl@master
-        with:
-          args: get deployments --all-namespaces
 
       - uses: docker/setup-qemu-action@v2
 
@@ -68,7 +65,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.REPO }}
 
-      - uses: docker/build-push-action@v4
+      - name: Build and push API image
+        id: build-api-image
+        uses: docker/build-push-action@v4
         with:
           platforms: linux/amd64
           context: .
@@ -77,3 +76,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           push: true
           # TODO: add a git tag and associated docker tag for it on merge
+
+      - name: Restart api deployment
+        if: steps.build-api-image.outcome == 'success'
+        uses: actions-hub/kubectl@master
+        with:
+          args: rollout restart -n notify-sandbox deployments/notifications-api-deployment-api
