@@ -29,11 +29,6 @@ jobs:
         run: |
           echo -e "__git_commit__ = \"${{ github.sha }}\"\n__time__ = \"$(date)\"" > ./app/version.py
 
-      - name: Install and configure kubectl
-        uses: actions-hub/kubectl@master
-        env:
-          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
 
@@ -68,6 +63,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           push: true
           # TODO: add a git tag and associated docker tag for it on merge
+
+      - name: Install and configure kubectl
+        uses: actions-hub/kubectl@master
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
 
       - name: Restart API deployment
         if: steps.build-api-image.outcome == 'success'
