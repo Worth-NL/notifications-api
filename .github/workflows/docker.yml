@@ -32,6 +32,19 @@ jobs:
         with:
           creds: '${{ secrets.AZURE_CREDENTIALS }}'
 
+      - name: Azure CLI script
+        uses: azure/CLI@v1
+        with:
+          azcliversion: 2.30.0
+          inlineScript: |
+            az aks get-credentials --resource-group dh-notify-rg --name dh-notify-aks
+
+      - uses: azure/setup-kubectl@v3
+        id: install
+
+      - run: |
+          echo kubectl get deployments --all-namespaces
+
       - uses: docker/setup-qemu-action@v2
 
       - uses: docker/setup-buildx-action@v2
