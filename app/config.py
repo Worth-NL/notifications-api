@@ -396,7 +396,7 @@ class Config(object):
     if os.getenv("CELERYD_PREFETCH_MULTIPLIER"):
         CELERY["worker_prefetch_multiplier"] = os.getenv("CELERYD_PREFETCH_MULTIPLIER")
 
-    FROM_NUMBER = "development"
+    FROM_NUMBER = "NotifyNL"
 
     STATSD_HOST = os.getenv("STATSD_HOST")
     STATSD_PORT = 8125
