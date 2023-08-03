@@ -48,6 +48,7 @@ jobs:
         # This is only here because docker freaks out if the repo/tag that you're pushing to is not all lowercase
 
       - name: Extract metadata from Git
+        id: meta
         uses: docker/metadata-action@v4
         with:
           images: ${{ env.REGISTRY }}/${{ env.REPO }}
