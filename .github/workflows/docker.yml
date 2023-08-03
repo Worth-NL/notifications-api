@@ -43,7 +43,7 @@ jobs:
         id: install
 
       - run: |
-          echo kubectl get deployments --all-namespaces
+          kubectl get deployments --all-namespaces
 
       - uses: docker/setup-qemu-action@v2
 
