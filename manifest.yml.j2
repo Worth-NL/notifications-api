@@ -49,7 +49,14 @@
     },
   },
 
-  'notify-delivery-celery-beat': {'memory': '512M'},
+  'notify-delivery-celery-beat': {
+    'memory': '512M',
+    'instances': {
+      'preview': 0,
+      'staging': 1,
+      'production': 1
+    },
+  },
   'notify-delivery-worker-jobs': {'memory': '2G'},
   'notify-delivery-worker-research': {},
   'notify-delivery-worker-sender': {'disk_quota': '2G', 'memory': '4G'},
@@ -125,6 +132,9 @@ applications:
       METRICS_BASIC_AUTH_TOKEN: {{ METRICS_BASIC_AUTH_TOKEN }}
       {% if SQLALCHEMY_DATABASE_URI is defined %}
       SQLALCHEMY_DATABASE_URI: '{{ SQLALCHEMY_DATABASE_URI }}'
+      {% endif %}
+      {% if REDIS_URL is defined %}
+      REDIS_URL: '{{ REDIS_URL }}'
       {% endif %}
 
       HIGH_VOLUME_SERVICE: '{{ HIGH_VOLUME_SERVICE | tojson }}'
