@@ -60,7 +60,8 @@ def send_sms_to_provider(notification):
         key_type = notification.key_type
         if notification.key_type == KEY_TYPE_TEST:
             update_notification_to_sending(notification, provider)
-            send_sms_response(provider.name, str(notification.id), notification.to)
+            send_sms_response(provider.name, str(
+                notification.id), notification.to)
 
         else:
             try:
@@ -82,13 +83,15 @@ def send_sms_to_provider(notification):
             except Exception as e:
                 notification.billable_units = template.fragment_count
                 dao_update_notification(notification)
-                dao_reduce_sms_provider_priority(provider.name, time_threshold=timedelta(minutes=1))
+                dao_reduce_sms_provider_priority(
+                    provider.name, time_threshold=timedelta(minutes=1))
                 raise e
             else:
                 notification.billable_units = template.fragment_count
                 update_notification_to_sending(notification, provider)
                 if notification.international:
-                    statsd_client.incr(f"international-sms.{NOTIFICATION_SENT}.{notification.phone_prefix}")
+                    statsd_client.incr(
+                        f"international-sms.{NOTIFICATION_SENT}.{notification.phone_prefix}")
 
         delta_seconds = (datetime.utcnow() - created_at).total_seconds()
         statsd_client.timing("sms.total-time", delta_seconds)
@@ -98,9 +101,11 @@ def send_sms_to_provider(notification):
         else:
             statsd_client.timing("sms.live-key.total-time", delta_seconds)
             if service.high_volume:
-                statsd_client.timing("sms.live-key.high-volume.total-time", delta_seconds)
+                statsd_client.timing(
+                    "sms.live-key.high-volume.total-time", delta_seconds)
             else:
-                statsd_client.timing("sms.live-key.not-high-volume.total-time", delta_seconds)
+                statsd_client.timing(
+                    "sms.live-key.not-high-volume.total-time", delta_seconds)
 
 
 def send_email_to_provider(notification):
@@ -120,7 +125,8 @@ def send_email_to_provider(notification):
             template_dict, values=notification.personalisation, **get_html_email_options(service)
         )
 
-        plain_text_email = PlainTextEmailTemplate(template_dict, values=notification.personalisation)
+        plain_text_email = PlainTextEmailTemplate(
+            template_dict, values=notification.personalisation)
         created_at = notification.created_at
         key_type = notification.key_type
         if notification.key_type == KEY_TYPE_TEST:
@@ -150,9 +156,11 @@ def send_email_to_provider(notification):
         else:
             statsd_client.timing("email.live-key.total-time", delta_seconds)
             if service.high_volume:
-                statsd_client.timing("email.live-key.high-volume.total-time", delta_seconds)
+                statsd_client.timing(
+                    "email.live-key.high-volume.total-time", delta_seconds)
             else:
-                statsd_client.timing("email.live-key.not-high-volume.total-time", delta_seconds)
+                statsd_client.timing(
+                    "email.live-key.not-high-volume.total-time", delta_seconds)
 
 
 def update_notification_to_sending(notification, provider):
@@ -173,7 +181,8 @@ def provider_to_use(notification_type, international=False):
     ]
 
     if not active_providers:
-        current_app.logger.error("%s failed as no active providers", notification_type)
+        current_app.logger.error(
+            "%s failed as no active providers", notification_type)
         raise Exception("No active {} providers".format(notification_type))
 
     if len(active_providers) == 1:
@@ -198,8 +207,7 @@ def get_logo_url(base_url, logo_file):
 
     logo_url = parse.ParseResult(
         scheme=base_url.scheme,
-        # netloc="static-logos." + netloc,
-        netloc=current_app.config["LOGO_CDN_DOMAIN"],
+        netloc="static-logos." + netloc,
         path=logo_file,
         params=base_url.params,
         query=base_url.query,
@@ -219,7 +227,8 @@ def get_html_email_options(service):
     else:
         branding = service.email_branding
 
-    logo_url = get_logo_url(current_app.config["ADMIN_BASE_URL"], branding.logo) if branding.logo else None
+    logo_url = get_logo_url(
+        current_app.config["ADMIN_BASE_URL"], branding.logo) if branding.logo else None
 
     return {
         "govuk_banner": branding.brand_type == BRANDING_BOTH,
