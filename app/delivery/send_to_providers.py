@@ -195,7 +195,8 @@ def get_logo_url(base_url, logo_file):
 
     logo_url = parse.ParseResult(
         scheme=base_url.scheme,
-        netloc="static-logos." + netloc,
+        # netloc="static-logos." + netloc,
+        netloc=current_app.config["LOGO_CDN_DOMAIN"],
         path=logo_file,
         params=base_url.params,
         query=base_url.query,
