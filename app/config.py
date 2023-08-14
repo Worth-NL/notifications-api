@@ -476,15 +476,15 @@ class Development(Config):
 
     REDIS_ENABLED = os.getenv("REDIS_ENABLED") == "1"
 
-    S3_BUCKET_CSV_UPLOAD = "development-notifications-csv-upload"
-    S3_BUCKET_CONTACT_LIST = "development-contact-list"
-    S3_BUCKET_TEST_LETTERS = "development-test-letters"
-    S3_BUCKET_DVLA_RESPONSE = "notify.tools-ftp"
-    S3_BUCKET_LETTERS_PDF = "development-letters-pdf"
-    S3_BUCKET_LETTERS_SCAN = "development-letters-scan"
-    S3_BUCKET_INVALID_PDF = "development-letters-invalid-pdf"
-    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "development-transient-uploaded-letters"
-    S3_BUCKET_LETTER_SANITISE = "development-letters-sanitise"
+    S3_BUCKET_CSV_UPLOAD = "development-notifications-csv-upload-notifynl"
+    S3_BUCKET_CONTACT_LIST = "development-contact-list-notifynl"
+    S3_BUCKET_TEST_LETTERS = "development-test-letters-notifynl"
+    S3_BUCKET_DVLA_RESPONSE = "notify.tools-ftp-notifynl"
+    S3_BUCKET_LETTERS_PDF = "development-letters-pdf-notifynl"
+    S3_BUCKET_LETTERS_SCAN = "development-letters-scan-notifynl"
+    S3_BUCKET_INVALID_PDF = "development-letters-invalid-pdf-notifynl"
+    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "development-transient-uploaded-letters-notifynl"
+    S3_BUCKET_LETTER_SANITISE = "development-letters-sanitise-notifynl"
 
     INTERNAL_CLIENT_API_KEYS = {
         Config.ADMIN_CLIENT_ID: ["dev-notify-secret-key"],
