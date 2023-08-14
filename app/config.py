@@ -466,6 +466,8 @@ class Development(Config):
     S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "development-transient-uploaded-letters-notifynl"
     S3_BUCKET_LETTER_SANITISE = "development-letters-sanitise-notifynl"
 
+    LOGO_CDN_DOMAIN = "d26j1qfpsndp6a.cloudfront.net"
+
     INTERNAL_CLIENT_API_KEYS = {
         Config.ADMIN_CLIENT_ID: ["dev-notify-secret-key"],
         Config.FUNCTIONAL_TESTS_CLIENT_ID: ["functional-tests-secret-key"],
