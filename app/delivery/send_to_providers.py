@@ -185,17 +185,18 @@ def provider_to_use(notification_type, international=False):
 
 def get_logo_url(base_url, logo_file):
     base_url = parse.urlparse(base_url)
-    netloc = base_url.netloc
+    # netloc = base_url.netloc
 
-    if base_url.netloc.startswith("localhost"):
-        netloc = "notify.tools"
-    elif base_url.netloc.startswith("www"):
-        # strip "www."
-        netloc = base_url.netloc[4:]
+    # if base_url.netloc.startswith("localhost"):
+    #     netloc = "notify.tools"
+    # elif base_url.netloc.startswith("www"):
+    #     # strip "www."
+    #     netloc = base_url.netloc[4:]
 
     logo_url = parse.ParseResult(
         scheme=base_url.scheme,
-        netloc="static-logos." + netloc,
+        # netloc="static-logos." + netloc,
+        netloc=current_app.config["LOGO_CDN_DOMAIN"],
         path=logo_file,
         params=base_url.params,
         query=base_url.query,
