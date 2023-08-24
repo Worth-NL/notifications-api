@@ -74,4 +74,4 @@ jobs:
         if: steps.build-api-image.outcome == 'success'
         uses: actions-hub/kubectl@master
         with:
-          args: rollout restart -n notify-sandbox deployments/notifications-api-deployment-api
+          args: rollout restart -n notify-sandbox deployments/notifications-api-deployment
