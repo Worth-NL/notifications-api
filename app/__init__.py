@@ -308,6 +308,16 @@ def register_v2_blueprints(application):
 
 
 def init_app(app):
+    from opencensus.ext.azure.trace_exporter import AzureExporter
+    from opencensus.ext.flask.flask_middleware import FlaskMiddleware
+    from opencensus.trace.samplers import ProbabilitySampler
+
+    FlaskMiddleware(
+        app,
+        exporter=AzureExporter(),
+        sampler=ProbabilitySampler(rate=1.0),
+    )
+
     @app.before_request
     def record_request_details():
         CONCURRENT_REQUESTS.inc()
@@ -405,7 +415,8 @@ def setup_sqlalchemy_events(app):
                 elif current_task:
                     connection_record.info["request_data"] = {
                         "method": "celery",
-                        "host": current_app.config["NOTIFY_APP_NAME"],  # worker name
+                        # worker name
+                        "host": current_app.config["NOTIFY_APP_NAME"],
                         "url_rule": current_task.name,  # task name
                     }
                 # anything else. migrations possibly, or flask cli commands.
