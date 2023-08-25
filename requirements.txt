@@ -179,7 +179,7 @@ msal-extensions==1.0.0
     # via azure-identity
 notifications-python-client==8.0.1
     # via -r requirements.in
-notifications-utils @ git+https://github.com/alphagov/notifications-utils.git@75.0.0
+notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@75.0.0
     # via -r requirements.in
 ordered-set==4.1.0
     # via notifications-utils
