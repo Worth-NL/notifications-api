@@ -316,7 +316,6 @@ def register_v2_blueprints(application):
 
 
 def init_app(app):
-    import os
     from opencensus.ext.azure.trace_exporter import AzureExporter
     from opencensus.ext.flask.flask_middleware import FlaskMiddleware
     from opencensus.trace.samplers import ProbabilitySampler
