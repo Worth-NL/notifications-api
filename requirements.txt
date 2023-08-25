@@ -194,7 +194,7 @@ msal-extensions==1.0.0
     # via azure-identity
 notifications-python-client==8.0.1
     # via -r requirements.in
-notifications-utils @ git+https://github.com/alphagov/notifications-utils.git@66.1.0
+notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@66.0.0a
     # via -r requirements.in
 opencensus==0.11.2
     # via
