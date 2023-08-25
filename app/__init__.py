@@ -88,16 +88,13 @@ def create_app(application):
     firetext_client.init_app(application, statsd_client=statsd_client)
     mmg_client.init_app(application, statsd_client=statsd_client)
     dvla_client.init_app(application, statsd_client=statsd_client)
-    aws_ses_client.init_app(
-        application.config["AWS_REGION"], statsd_client=statsd_client)
+    aws_ses_client.init_app(application.config["AWS_REGION"], statsd_client=statsd_client)
     aws_ses_stub_client.init_app(
         application.config["AWS_REGION"], statsd_client=statsd_client, stub_url=application.config["SES_STUB_URL"]
     )
     # If a stub url is provided for SES, then use the stub client rather than the real SES boto client
-    email_clients = [
-        aws_ses_stub_client] if application.config["SES_STUB_URL"] else [aws_ses_client]
-    notification_provider_clients.init_app(
-        sms_clients=[firetext_client, mmg_client], email_clients=email_clients)
+    email_clients = [aws_ses_stub_client] if application.config["SES_STUB_URL"] else [aws_ses_client]
+    notification_provider_clients.init_app(sms_clients=[firetext_client, mmg_client], email_clients=email_clients)
 
     notify_celery.init_app(application)
     encryption.init_app(application)
@@ -227,12 +224,10 @@ def register_blueprint(application):
     application.register_blueprint(events_blueprint)
 
     provider_details_blueprint.before_request(requires_admin_auth)
-    application.register_blueprint(
-        provider_details_blueprint, url_prefix="/provider-details")
+    application.register_blueprint(provider_details_blueprint, url_prefix="/provider-details")
 
     email_branding_blueprint.before_request(requires_admin_auth)
-    application.register_blueprint(
-        email_branding_blueprint, url_prefix="/email-branding")
+    application.register_blueprint(email_branding_blueprint, url_prefix="/email-branding")
 
     letter_job.before_request(requires_admin_auth)
     application.register_blueprint(letter_job)
@@ -247,8 +242,7 @@ def register_blueprint(application):
     application.register_blueprint(service_callback_blueprint)
 
     organisation_blueprint.before_request(requires_admin_auth)
-    application.register_blueprint(
-        organisation_blueprint, url_prefix="/organisations")
+    application.register_blueprint(organisation_blueprint, url_prefix="/organisations")
 
     complaint_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(complaint_blueprint)
@@ -257,8 +251,7 @@ def register_blueprint(application):
     application.register_blueprint(performance_dashboard_blueprint)
 
     platform_stats_blueprint.before_request(requires_admin_auth)
-    application.register_blueprint(
-        platform_stats_blueprint, url_prefix="/platform-stats")
+    application.register_blueprint(platform_stats_blueprint, url_prefix="/platform-stats")
 
     template_folder_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(template_folder_blueprint)
@@ -276,8 +269,7 @@ def register_blueprint(application):
     application.register_blueprint(govuk_alerts_blueprint)
 
     platform_admin_blueprint.before_request(requires_admin_auth)
-    application.register_blueprint(
-        platform_admin_blueprint, url_prefix="/platform-admin")
+    application.register_blueprint(platform_admin_blueprint, url_prefix="/platform-admin")
 
     letter_attachment_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(letter_attachment_blueprint)
@@ -338,10 +330,8 @@ def init_app(app):
         CONCURRENT_REQUESTS.dec()
 
         response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add("Access-Control-Allow-Headers",
-                             "Content-Type,Authorization")
-        response.headers.add(
-            "Access-Control-Allow-Methods", "GET,PUT,POST,DELETE")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+        response.headers.add("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE")
         return response
 
     @app.errorhandler(Exception)
@@ -431,16 +421,14 @@ def setup_sqlalchemy_events(app):
                     }
                 # anything else. migrations possibly, or flask cli commands.
                 else:
-                    current_app.logger.warning(
-                        "Checked out sqlalchemy connection from outside of request/task")
+                    current_app.logger.warning("Checked out sqlalchemy connection from outside of request/task")
                     connection_record.info["request_data"] = {
                         "method": "unknown",
                         "host": "unknown",
                         "url_rule": "unknown",
                     }
             except Exception:
-                current_app.logger.exception(
-                    "Exception caught for checkout event.")
+                current_app.logger.exception("Exception caught for checkout event.")
 
         @event.listens_for(db.engine, "checkin")
         def checkin(dbapi_connection, connection_record):
@@ -453,8 +441,7 @@ def setup_sqlalchemy_events(app):
                 TOTAL_CHECKED_OUT_DB_CONNECTIONS.dec()
 
                 # duration that connection was held by a single web request
-                duration = time.monotonic() - \
-                    connection_record.info["checkout_at"]
+                duration = time.monotonic() - connection_record.info["checkout_at"]
 
                 DB_CONNECTION_OPEN_DURATION_SECONDS.labels(
                     connection_record.info["request_data"]["method"],
@@ -462,5 +449,4 @@ def setup_sqlalchemy_events(app):
                     connection_record.info["request_data"]["url_rule"],
                 ).observe(duration)
             except Exception:
-                current_app.logger.exception(
-                    "Exception caught for checkin event.")
+                current_app.logger.exception("Exception caught for checkin event.")
