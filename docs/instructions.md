@@ -73,7 +73,11 @@ export NOTIFICATION_QUEUE_PREFIX='YOUR_OWN_PREFIX'
 export FLASK_APP=application.py
 export FLASK_DEBUG=1
 export WERKZEUG_DEBUG_PIN=off
+
+export APPLICATIONINSIGHTS_ENABLED=1
+export APPLICATIONINSIGHTS_CONNECTION_STRING=<InstrumentationKey>
 ```
+1. Ask your team for correct `<InstrumentationKey>`
 1. Open a terminal in the root of the repo and run `$ make bootstrap-with-docker` to create the docker image
 1. Run `$ make run-migrations-with-docker` to run migrations for the database
 1. Run `$ make run-flask-with-docker`
