@@ -53,7 +53,7 @@ def invite_user_to_org(organisation_id):
         service=template.service,
         personalisation={
             "user_name": (
-                "The GOV.UK Notify team"
+                "The NotifyNL team"
                 if invited_org_user.invited_by.platform_admin
                 else invited_org_user.invited_by.name
             ),
@@ -132,7 +132,7 @@ def validate_invitation_token(token):
         )
     except SignatureExpired as e:
         errors = {
-            "invitation": "Your invitation to GOV.UK Notify has expired. "
+            "invitation": "Your invitation to NotifyNL has expired. "
             "Please ask the person that invited you to send you another one"
         }
         raise InvalidRequest(errors, status_code=400) from e
