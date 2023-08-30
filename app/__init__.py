@@ -312,9 +312,15 @@ def init_app(app):
     from opencensus.ext.flask.flask_middleware import FlaskMiddleware
     from opencensus.trace.samplers import ProbabilitySampler
 
+    def callback_function(envelope):
+        envelope.tags["ai.cloud.role"] = "api"
+
+    azure_exporter = AzureExporter()
+    azure_exporter.add_telemetry_processor(callback_function)
+
     FlaskMiddleware(
         app,
-        exporter=AzureExporter(),
+        exporter=azure_exporter,
         sampler=ProbabilitySampler(rate=1.0),
     )
 
