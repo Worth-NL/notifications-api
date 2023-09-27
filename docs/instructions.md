@@ -39,7 +39,7 @@ aws_secret_access_key=<ACCESS_KEY_YOU_GOT>
 1. Open a terminal window
 1. Start the PostgreSQL server by running `$ /usr/local/opt/postgresql@11/bin/postgres -D /usr/local/var/postgresql@11`. This will run the service in the current terminal.
 1. Open another terminal window and connect to the server with `$ psql --host=127.0.0.1 --port=5432 --dbname=postgres`
-1. Once in the `psql` shell, run the following command to create a database called “notify” `$ create database notify`
+1. Once in the `psql` shell, run the following command to create a database called “notify” `$ create database notify;`
 1. Start `pgAdmin` and connect to the database
 
 The following changes must be made to the database:
