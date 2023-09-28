@@ -109,9 +109,7 @@ def service_can_send_to_recipient(send_to, key_type, service, allow_guest_list_r
         if key_type == KEY_TYPE_TEAM:
             message = "Can’t send to this recipient using a team-only API key"
         else:
-            message = (
-                "Can’t send to this recipient when service is in trial mode "
-            )
+            message = "Can’t send to this recipient when service is in trial mode "
         raise BadRequestError(message=message)
 
 
