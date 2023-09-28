@@ -144,9 +144,7 @@ def _service_allowed_to_send_to(notification, service):
         if api_user.key_type == KEY_TYPE_TEAM:
             message = "Can’t send to this recipient using a team-only API key"
         else:
-            message = (
-                "Can’t send to this recipient when service is in trial mode"
-            )
+            message = "Can’t send to this recipient when service is in trial mode"
         raise InvalidRequest({"to": [message]}, status_code=400)
 
 
