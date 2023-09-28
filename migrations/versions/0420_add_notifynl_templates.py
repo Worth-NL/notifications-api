@@ -25,7 +25,6 @@ templates = [
                     To complete your registration for NotifyNL please click the link below\n\n((url))
                     """,
     },
-
     # Invitation to collaborate - service
     {
         "id": "b24bf0fa-dd64-4105-867c-4ed529e12df3",
@@ -38,7 +37,6 @@ templates = [
                     This invitation will stop working at midnight tomorrow. This is to keep ((service_name)) secure.
                     """,
     },
-
     # Invitation to collaborate - organisation
     {
         "id": "dfd254da-39d1-468f-bd0d-2c9e017c13a6",
@@ -51,7 +49,6 @@ templates = [
                     This invitation will stop working at midnight tomorrow. This is to keep ((organisation_name)) secure.
                     """,
     },
-
     # SMS verification code
     {
         "id": "f8209d70-9aa2-4a8c-89f9-00514492fa27",
@@ -60,7 +57,6 @@ templates = [
         "subject": None,
         "content": "((verify_code)) is your NotifyNL authentication code",
     },
-
     # Password reset
     {
         "id": "4cc48b09-62d0-473f-8514-3023b306a0fb",
@@ -75,7 +71,6 @@ templates = [
                     ((url))
                     """,
     },
-
     # Create account for existing email
     {
         "id": "bb3c17a8-6009-4f67-a943-353982c15c98",
@@ -87,18 +82,16 @@ templates = [
                     If you''ve forgotten your password, you can reset it here: ((forgot_password_url))\n\n
                     """,
     },
-
     # Change email address
     {
         "id": "9eefb5bf-f1fb-46ce-9079-691260b0af9b",
         "name": "Confirm new email address",
-        "type":  "email",
+        "type": "email",
         "subject": "Confirm new email address for NotifyNL",
-        "content":  """Hi ((name)),\n\n
+        "content": """Hi ((name)),\n\n
                         Click this link to confirm your new email address:\n\n((url))
                     """,
     },
-
     # Email verification code
     {
         "id": "320a5f19-600f-451e-9646-11206c69828d",
@@ -109,7 +102,6 @@ templates = [
                         To sign in to NotifyNL please open this link: ((url))
                     """,
     },
-
     # Verify reply-to address
     {
         "id": "fcf9095b-d1e3-46d9-b44f-752887c09322",
@@ -123,7 +115,6 @@ templates = [
                     No need to reply.
                     """,
     },
-
     # Broadcast invitation email
     {
         "id": "86761e21-b39c-43e1-a06b-a3340bc2bc7a",
@@ -137,7 +128,6 @@ templates = [
                     """,
     },
 ]
-
 
 
 def upgrade():
