@@ -72,18 +72,7 @@ click-repl==0.2.0
     # via celery
 colorama==0.4.4
     # via awscli
-<<<<<<< HEAD
 dnspython==2.4.2
-||||||| parent of 5e25e8b8c (Application insights revert)
-cryptography==41.0.3
-    # via
-    #   azure-identity
-    #   msal
-    #   pyjwt
-dnspython==2.2.1
-=======
-dnspython==2.2.1
->>>>>>> 5e25e8b8c (Application insights revert)
     # via eventlet
 docopt==0.6.2
     # via notifications-python-client
