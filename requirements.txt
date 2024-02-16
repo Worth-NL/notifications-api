@@ -167,7 +167,7 @@ mistune==0.8.4
     # via notifications-utils
 notifications-python-client==8.0.1
     # via -r requirements.in
-notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@66.0.0c
+notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@66.0.0f
     # via -r requirements.in
 orderedset==2.0.3
     # via notifications-utils
