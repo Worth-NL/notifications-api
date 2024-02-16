@@ -315,22 +315,6 @@ def register_v2_blueprints(application):
 
 
 def init_app(app):
-    from opencensus.ext.azure.trace_exporter import AzureExporter
-    from opencensus.ext.flask.flask_middleware import FlaskMiddleware
-    from opencensus.trace.samplers import ProbabilitySampler
-
-    def callback_function(envelope):
-        envelope.tags["ai.cloud.role"] = "api"
-
-    azure_exporter = AzureExporter()
-    azure_exporter.add_telemetry_processor(callback_function)
-
-    FlaskMiddleware(
-        app,
-        exporter=azure_exporter,
-        sampler=ProbabilitySampler(rate=1.0),
-    )
-
     @app.before_request
     def record_request_details():
         CONCURRENT_REQUESTS.inc()
