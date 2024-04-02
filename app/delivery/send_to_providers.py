@@ -188,7 +188,7 @@ def provider_to_use(notification_type, international=False):
 
 def get_logo_url(base_url, logo_file):
     base_url = parse.urlparse(base_url)
-    netloc = base_url.netloc
+    # netloc = base_url.netloc
 
     if base_url.hostname.split(".")[-1] == "localhost":
         netloc = "notify.tools"
