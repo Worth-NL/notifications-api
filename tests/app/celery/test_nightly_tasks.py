@@ -17,6 +17,8 @@ from app.celery.nightly_tasks import (
     delete_inbound_sms,
     delete_letter_notifications_older_than_retention,
     delete_sms_notifications_older_than_retention,
+    delete_unneeded_notification_history_by_hour,
+    delete_unneeded_notification_history_for_specific_hour,
     get_letter_notifications_still_sending_when_they_shouldnt_be,
     letter_raise_alert_if_no_ack_file_for_zip,
     raise_alert_if_letter_notifications_still_sending,
@@ -532,7 +534,6 @@ def test_delete_notifications_task_calls_task_for_services_with_data_retention_b
 def test_delete_notifications_task_calls_task_for_services_that_have_sent_notifications_recently(
     notify_db_session, mocker
 ):
-
     service_will_delete_1 = create_service(service_name="a")
     service_will_delete_2 = create_service(service_name="b")
     service_nothing_to_delete = create_service(service_name="c")
@@ -576,4 +577,33 @@ def test_delete_notifications_task_calls_task_for_services_that_have_sent_notifi
                 },
             ),
         ],
+    )
+
+
+def test_delete_unneeded_notification_history_for_specific_hour(mocker):
+    delete_mock = mocker.patch("app.celery.nightly_tasks.delete_notification_history_between_two_datetimes")
+
+    start = "2022-04-04T01:00:00"
+    end = "2022-04-04T02:00:00"
+    delete_unneeded_notification_history_for_specific_hour(start, end)
+
+    delete_mock.assert_called_once_with(start, end)
+
+
+def test_delete_unneeded_notification_history_by_hour(mocker):
+    mock_subtask = mocker.patch("app.celery.nightly_tasks.delete_unneeded_notification_history_for_specific_hour")
+
+    delete_unneeded_notification_history_by_hour()
+
+    assert mock_subtask.apply_async.call_args_list[0] == call(
+        [datetime(2020, 8, 1, 0, 0, 0), datetime(2020, 8, 1, 1, 0, 0)], queue=ANY
+    )
+    assert mock_subtask.apply_async.call_args_list[1] == call(
+        [datetime(2020, 8, 1, 1, 0, 0), datetime(2020, 8, 1, 2, 0, 0)], queue=ANY
+    )
+    assert mock_subtask.apply_async.call_args_list[-2] == call(
+        [datetime(2022, 12, 31, 22, 0, 0), datetime(2022, 12, 31, 23, 0, 0)], queue=ANY
+    )
+    assert mock_subtask.apply_async.call_args_list[-1] == call(
+        [datetime(2022, 12, 31, 23, 0, 0), datetime(2023, 1, 1, 0, 0, 0)], queue=ANY
     )

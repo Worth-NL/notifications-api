@@ -39,8 +39,7 @@ def invite_user_to_org(organisation_id):
         email_address=data["email_address"],
         invited_by_id=data["invited_by"],
         organisation_id=organisation_id,
-        # TODO: Remove the .get/default value when admin is always sending this field
-        permissions=",".join(data.get("permissions", [])),
+        permissions=",".join(data["permissions"]),
     )
     save_invited_org_user(invited_org_user)
 
@@ -121,7 +120,6 @@ def get_invited_org_user(invited_org_user_id):
 @organisation_invite_blueprint.route("/invite/organisation/<token>", methods=["GET"])
 @organisation_invite_blueprint.route("/invite/organisation/check/<token>", methods=["GET"])
 def validate_invitation_token(token):
-
     max_age_seconds = 60 * 60 * 24 * current_app.config["INVITATION_EXPIRATION_DAYS"]
 
     try:

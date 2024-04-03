@@ -1,7 +1,9 @@
 import base64
+import contextlib
 import secrets
 import string
 import time
+from collections.abc import Callable
 from typing import Literal
 
 import boto3
@@ -43,6 +45,23 @@ class DvlaUnauthorisedRequestException(DvlaRetryableException):
 
 class DvlaThrottlingException(DvlaRetryableException):
     pass
+
+
+@contextlib.contextmanager
+def _handle_common_dvla_errors(custom_httperror_exc_handler: Callable[[requests.HTTPError], None] = lambda x: None):
+    try:
+        yield
+    except (ConnectionError, requests.ConnectionError, requests.Timeout) as e:
+        raise DvlaRetryableException() from e
+    except requests.HTTPError as e:
+        custom_httperror_exc_handler(e)
+
+        if e.response.status_code == 429:
+            raise DvlaThrottlingException() from e
+        elif e.response.status_code >= 500:
+            raise DvlaRetryableException(f"Received {e.response.status_code} from {e.request.url}") from e
+        else:
+            raise DvlaNonRetryableException(f"Received {e.response.status_code} from {e.request.url}") from e
 
 
 class SSMParameter:
@@ -125,19 +144,20 @@ class DVLAClient:
 
         return self._jwt_token
 
-    def _handle_common_dvla_errors(self, e: requests.HTTPError):
-        if e.response.status_code == 429:
-            raise DvlaThrottlingException() from e
-        elif e.response.status_code >= 500:
-            raise DvlaRetryableException() from e
-        else:
-            raise DvlaNonRetryableException() from e
-
     def authenticate(self):
         """
         Fetch a JWT from the DVLA API that can be used in other DVLA API requests
         """
-        try:
+
+        def _handle_401(e: requests.HTTPError):
+            if e.response.status_code == 401:
+                # likely the old password has already expired
+                current_app.logger.exception("Failed to generate a DVLA jwt token")
+
+                self.dvla_password.clear()
+                raise DvlaRetryableException(e.response.json()[0]["detail"]) from e
+
+        with _handle_common_dvla_errors(custom_httperror_exc_handler=_handle_401):
             response = self.session.post(
                 f"{self.base_url}/thirdparty-access/v1/authenticate",
                 json={
@@ -146,15 +166,6 @@ class DVLAClient:
                 },
             )
             response.raise_for_status()
-        except requests.HTTPError as e:
-            if e.response.status_code == 401:
-                # likely the old password has already expired
-                current_app.logger.exception("Failed to generate a DVLA jwt token")
-
-                self.dvla_password.clear()
-                raise DvlaRetryableException(e.response.json()[0]["detail"]) from e
-
-            self._handle_common_dvla_errors(e)
 
         return response.json()["id-token"]
 
@@ -165,13 +176,7 @@ class DVLAClient:
             # clear and re-fetch dvla api key, just to ensure we have the latest version
             self.dvla_api_key.clear()
 
-            try:
-                response = self.session.post(
-                    f"{self.base_url}/thirdparty-access/v1/new-api-key",
-                    headers=self._get_auth_headers(),
-                )
-                response.raise_for_status()
-            except requests.HTTPError as e:
+            def _handle_401(e: requests.HTTPError):
                 if e.response.status_code == 401:
                     # the api key is invalid, but we know it's current as per SSM as we fetched it at the beginning of
                     # this block. It feels most likely that the api key has just been changed by another process and
@@ -182,7 +187,12 @@ class DVLAClient:
                     self.dvla_api_key.clear()
                     raise DvlaNonRetryableException(e.response.json()[0]["detail"]) from e
 
-                self._handle_common_dvla_errors(e)
+            with _handle_common_dvla_errors(custom_httperror_exc_handler=_handle_401):
+                response = self.session.post(
+                    f"{self.base_url}/thirdparty-access/v1/new-api-key",
+                    headers=self._get_auth_headers(),
+                )
+                response.raise_for_status()
 
             self.dvla_api_key.set(response.json()["newApiKey"])
 
@@ -195,17 +205,7 @@ class DVLAClient:
             # clear and re-fetch dvla password, just to ensure we have the latest version
             self.dvla_password.clear()
 
-            try:
-                response = self.session.post(
-                    f"{self.base_url}/thirdparty-access/v1/password",
-                    json={
-                        "userName": self.dvla_username.get(),
-                        "password": self.dvla_password.get(),
-                        "newPassword": new_password,
-                    },
-                )
-                response.raise_for_status()
-            except requests.HTTPError as e:
+            def _handle_401(e: requests.HTTPError):
                 if e.response.status_code == 401:
                     # the password is invalid, but we know it's current as per SSM as we fetched it at the beginning of
                     # this block. It feels most likely that the password has just been changed by another process and
@@ -216,7 +216,16 @@ class DVLAClient:
                     self.dvla_password.clear()
                     raise DvlaNonRetryableException(e.response.json()[0]["detail"]) from e
 
-                self._handle_common_dvla_errors(e)
+            with _handle_common_dvla_errors(custom_httperror_exc_handler=_handle_401):
+                response = self.session.post(
+                    f"{self.base_url}/thirdparty-access/v1/password",
+                    json={
+                        "userName": self.dvla_username.get(),
+                        "password": self.dvla_password.get(),
+                        "newPassword": new_password,
+                    },
+                )
+                response.raise_for_status()
 
             self.dvla_password.set(new_password)
 
@@ -265,7 +274,18 @@ class DVLAClient:
         Sends a letter to the DVLA for printing
         """
 
-        try:
+        def _handle_http_errors(e: requests.HTTPError):
+            if e.response.status_code == 400:
+                raise DvlaNonRetryableException(e.response.json()["errors"][0]["detail"]) from e
+            elif e.response.status_code in {401, 403}:
+                # probably the api key is not valid
+                self.dvla_api_key.clear()
+
+                raise DvlaUnauthorisedRequestException(e.response.json()["errors"][0]["detail"]) from e
+            elif e.response.status_code == 409:
+                raise DvlaDuplicatePrintRequestException(e.response.json()["errors"][0]["detail"]) from e
+
+        with _handle_common_dvla_errors(custom_httperror_exc_handler=_handle_http_errors):
             response = self.session.post(
                 f"{self.base_url}/print-request/v1/print/jobs",
                 headers=self._get_auth_headers(),
@@ -280,21 +300,6 @@ class DVLAClient:
                 ),
             )
             response.raise_for_status()
-        except requests.HTTPError as e:
-            # Catch errors and raise our own to indicate what action to take.
-            # If the error has details, we add them to the error message.
-            if e.response.status_code == 400:
-                raise DvlaNonRetryableException(e.response.json()["errors"][0]["detail"]) from e
-            elif e.response.status_code in {401, 403}:
-                # probably the api key is not valid
-                self.dvla_api_key.clear()
-
-                raise DvlaUnauthorisedRequestException(e.response.json()["errors"][0]["detail"]) from e
-            elif e.response.status_code == 409:
-                raise DvlaDuplicatePrintRequestException(e.response.json()["errors"][0]["detail"]) from e
-
-            self._handle_common_dvla_errors(e)
-        else:
             return response.json()
 
     def _format_create_print_job_json(
@@ -304,6 +309,9 @@ class DVLAClient:
         # recorded the postage on the notification so we should respect that rather than introduce any possible
         # uncertainty from the PostalAddress resolving to something else dynamically.
         recipient, address_data = self._parse_recipient_and_address(postage=postage, address=address)
+
+        recipient = recipient[:255]
+        address_data = self._truncate_long_address_lines(address_data)
 
         json_payload = {
             "id": notification_id,
@@ -338,7 +346,8 @@ class DVLAClient:
         last_line = address_lines[-1]
 
         # The first line has already been used as the recipient, so we include everything other than that.
-        unstructured_address = dict(zip(address_line_keys, address_lines[:-1]))
+        unstructured_address = dict(zip(address_line_keys, address_lines[:-1], strict=False))
+
         unstructured_address[last_line_key] = last_line
 
         return unstructured_address
@@ -355,7 +364,7 @@ class DVLAClient:
         # at all, which would break. As the address could simply be: recipient, BFPO 1234, BF1 1AA.
         recipient = address_lines[0]
 
-        bfpo_address = dict(zip(address_line_keys, address_lines))
+        bfpo_address = dict(zip(address_line_keys, address_lines, strict=False))
 
         if address.postcode:
             bfpo_address["postcode"] = address.postcode
@@ -376,3 +385,17 @@ class DVLAClient:
             return recipient, {"internationalAddress": self._build_address(address_lines, "country")}
 
         return recipient, {"unstructuredAddress": self._build_address(address_lines, "postcode")}
+
+    def _truncate_long_address_lines(self, address_data: dict) -> tuple[str, dict]:
+        def truncate_line(key: str, value):
+            if not isinstance(value, str):
+                return value
+
+            max_length = {"postcode": 10, "country": 256}.get(key, 45)
+            return value[:max_length]
+
+        # there'll only ever be one nested dict in address_data, but we dont know what the key is so we need to iterate
+        for address_dict_type, address_dict in address_data.items():
+            return {address_dict_type: {k: truncate_line(k, v) for k, v in address_dict.items()}}
+
+        raise RuntimeError(f"Expected values in {address_data}")

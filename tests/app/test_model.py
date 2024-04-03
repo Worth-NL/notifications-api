@@ -2,7 +2,7 @@ import pytest
 from freezegun import freeze_time
 from sqlalchemy.exc import IntegrityError
 
-from app import encryption
+from app import signing
 from app.constants import (
     EMAIL_TYPE,
     MOBILE_TYPE,
@@ -64,7 +64,7 @@ def test_should_not_build_service_guest_list_from_invalid_contact(recipient_type
         ([NOTIFICATION_FAILED], NOTIFICATION_STATUS_TYPES_FAILED),
         ([NOTIFICATION_CREATED], [NOTIFICATION_CREATED]),
         ([NOTIFICATION_TECHNICAL_FAILURE], [NOTIFICATION_TECHNICAL_FAILURE]),
-        (NOTIFICATION_STATUS_LETTER_RECEIVED, NOTIFICATION_DELIVERED),
+        (NOTIFICATION_STATUS_LETTER_RECEIVED, [NOTIFICATION_DELIVERED]),
         # passing in lists containing multiple statuses
         ([NOTIFICATION_FAILED, NOTIFICATION_CREATED], NOTIFICATION_STATUS_TYPES_FAILED + [NOTIFICATION_CREATED]),
         ([NOTIFICATION_CREATED, NOTIFICATION_PENDING], [NOTIFICATION_CREATED, NOTIFICATION_PENDING]),
@@ -155,7 +155,7 @@ def test_notification_personalisation_getter_returns_empty_dict_from_None():
 
 def test_notification_personalisation_getter_always_returns_empty_dict():
     noti = Notification()
-    noti._personalisation = encryption.encrypt({})
+    noti._personalisation = signing.encode({})
     assert noti.personalisation == {}
 
 
@@ -164,7 +164,7 @@ def test_notification_personalisation_setter_always_sets_empty_dict(input_value)
     noti = Notification()
     noti.personalisation = input_value
 
-    assert noti._personalisation == encryption.encrypt({})
+    assert noti._personalisation == signing.encode({})
 
 
 def test_notification_subject_is_none_for_sms(sample_service):
@@ -351,10 +351,6 @@ def test_user_can_use_webauthn_if_platform_admin(sample_user, is_platform_admin)
 def test_user_can_use_webauthn_if_they_login_with_it(sample_user, auth_type, can_use_webauthn):
     sample_user.auth_type = auth_type
     assert sample_user.can_use_webauthn == can_use_webauthn
-
-
-def test_user_can_use_webauthn_if_in_broadcast_org(sample_broadcast_service):
-    assert sample_broadcast_service.users[0].can_use_webauthn
 
 
 def test_user_can_use_webauthn_if_in_notify_team(notify_service):

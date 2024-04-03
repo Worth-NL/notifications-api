@@ -205,14 +205,25 @@ def verify_user_code(user_id):
 
     code = get_user_code(user_to_verify, data["code"], data["code_type"])
     if user_to_verify.failed_login_count >= current_app.config.get("MAX_FAILED_LOGIN_COUNT"):
+        current_app.logger.warning(
+            "Too many login attempts for %s: %s attempts >= limit of %s",
+            user_id,
+            user_to_verify.failed_login_count,
+            current_app.config.get("MAX_FAILED_LOGIN_COUNT"),
+        )
         raise InvalidRequest("Code not found", status_code=404)
+
     if not code:
         # only relevant from sms
         increment_failed_login_count(user_to_verify)
         raise InvalidRequest("Code not found", status_code=404)
-    if datetime.utcnow() > code.expiry_datetime or code.code_used:
+
+    expired = datetime.utcnow() > code.expiry_datetime
+    used = code.code_used
+    if expired or used:
         # sms and email
         increment_failed_login_count(user_to_verify)
+        current_app.logger.warning("Rejecting 2fa code for %s because expired=%s, used=%s", user_id, expired, used)
         raise InvalidRequest("Code has expired", status_code=400)
 
     user_to_verify.current_session_id = str(uuid.uuid4())
@@ -226,9 +237,7 @@ def verify_user_code(user_id):
     return jsonify({}), 204
 
 
-# TODO: Remove the "verify" endpoint once admin no longer points at it
 @user_blueprint.route("/<uuid:user_id>/complete/webauthn-login", methods=["POST"])
-@user_blueprint.route("/<uuid:user_id>/verify/webauthn-login", methods=["POST"])
 def complete_login_after_webauthn_authentication_attempt(user_id):
     """
     complete login after a webauthn authentication. There's nothing webauthn specific in this code
@@ -486,18 +495,6 @@ def fetch_user_by_email():
     email = email_data_request_schema.load(request.get_json())
 
     fetched_user = get_user_by_email(email["email"])
-    result = fetched_user.serialize()
-    return jsonify(data=result)
-
-
-# TODO: Deprecate this GET endpoint
-@user_blueprint.route("/email", methods=["GET"])
-def get_by_email():
-    email = request.args.get("email")
-    if not email:
-        error = "Invalid request. Email query string param required"
-        raise InvalidRequest(error, status_code=400)
-    fetched_user = get_user_by_email(email)
     result = fetched_user.serialize()
     return jsonify(data=result)
 

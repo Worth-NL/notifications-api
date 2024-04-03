@@ -370,6 +370,63 @@ def test_update_should_update_a_template(client, sample_user):
     assert sample_user.id in template_created_by_users
 
 
+@pytest.mark.parametrize(
+    "post_data",
+    (
+        {},
+        {"letter_welsh_subject": "", "letter_welsh_content": ""},
+        {"letter_welsh_subject": None, "letter_welsh_content": None},
+        pytest.param(
+            {"letter_welsh_subject": "", "letter_welsh_content": None},
+            marks=pytest.mark.xfail(
+                raises=AssertionError,
+                reason=(
+                    "if `letter_languages` is not present, `letter_welsh_subject` and `letter_welsh_content` "
+                    "data types must match (either null or string)"
+                ),
+            ),
+        ),
+        {
+            "letter_languages": "welsh_then_english",
+            "letter_welsh_subject": "subject",
+            "letter_welsh_content": "content",
+        },
+        pytest.param(
+            {"letter_languages": "welsh_then_english", "letter_welsh_subject": None, "letter_welsh_content": None},
+            marks=pytest.mark.xfail(
+                raises=AssertionError, reason="if welsh_then_english, welsh subject and content must be provided"
+            ),
+        ),
+        {"letter_languages": "english", "letter_welsh_subject": None, "letter_welsh_content": None},
+        pytest.param(
+            {"letter_languages": "english", "letter_welsh_subject": "subject", "letter_welsh_content": "content"},
+            marks=pytest.mark.xfail(raises=AssertionError, reason="if english, then welsh data must be nulled out"),
+        ),
+    ),
+)
+def test_update_template_language(client, sample_user, post_data):
+    service = create_service(service_permissions=[LETTER_TYPE])
+    template = create_template(service, template_type="letter", postage="second")
+
+    assert template.created_by == service.created_by
+    assert template.created_by != sample_user
+
+    data = json.dumps(post_data)
+    auth_header = create_admin_authorization_header()
+
+    update_response = client.post(
+        "/service/{}/template/{}".format(service.id, template.id),
+        headers=[("Content-Type", "application/json"), auth_header],
+        data=data,
+    )
+
+    assert update_response.status_code == 200
+    update_json_resp = json.loads(update_response.get_data(as_text=True))
+    assert update_json_resp["data"]["letter_languages"] == post_data.get("letter_languages", "english")
+    assert update_json_resp["data"]["letter_welsh_subject"] == post_data.get("letter_welsh_subject", None)
+    assert update_json_resp["data"]["letter_welsh_content"] == post_data.get("letter_welsh_content", None)
+
+
 def test_should_be_able_to_archive_template(client, sample_template):
     data = {
         "name": sample_template.name,
@@ -544,6 +601,7 @@ def test_should_get_return_all_fields_by_default(
         "id",
         "is_precompiled_letter",
         "letter_attachment",
+        "letter_languages",
         "name",
         "postage",
         "process_type",
@@ -557,6 +615,8 @@ def test_should_get_return_all_fields_by_default(
         "template_type",
         "updated_at",
         "version",
+        "letter_welsh_content",
+        "letter_welsh_subject",
     }
 
 
@@ -867,11 +927,36 @@ def test_create_a_template_with_reply_to(admin_request, sample_user):
     assert th.service_letter_contact_id == letter_contact.id
 
 
+def test_create_template_bilingual_letter(admin_request, sample_service_full_permissions, sample_user):
+    letter_contact = create_letter_contact(sample_service_full_permissions, "Edinburgh, ED1 1AA")
+    json_resp = admin_request.post(
+        "template.create_template",
+        service_id=sample_service_full_permissions.id,
+        _data={
+            "name": "my template",
+            "template_type": "letter",
+            "subject": "subject",
+            "content": "content",
+            "postage": "second",
+            "service": str(sample_service_full_permissions.id),
+            "created_by": str(sample_user.id),
+            "reply_to": str(letter_contact.id),
+            "letter_languages": "welsh_then_english",
+            "letter_welsh_subject": "welsh subject",
+            "letter_welsh_content": "welsh body",
+        },
+        _expected_status=201,
+    )
+
+    t = Template.query.get(json_resp["data"]["id"])
+    assert t.letter_languages == "welsh_then_english"
+    assert t.letter_welsh_subject == "welsh subject"
+    assert t.letter_welsh_content == "welsh body"
+
+
 def test_create_a_template_with_foreign_service_reply_to(admin_request, sample_user):
     service = create_service(service_permissions=["letter"])
-    service2 = create_service(
-        service_name="test service", email_from="test@example.com", service_permissions=["letter"]
-    )
+    service2 = create_service(service_name="test service", service_permissions=["letter"])
     letter_contact = create_letter_contact(service2, "Edinburgh, ED1 1AA")
     data = {
         "name": "my template",
@@ -934,6 +1019,28 @@ def test_create_template_validates_against_json_schema(
     assert response["errors"] == expected_errors
 
 
+def test_create_template_validates_qr_code_too_long(
+    admin_request,
+    sample_service_full_permissions,
+):
+    response = admin_request.post(
+        "template.create_template",
+        service_id=sample_service_full_permissions.id,
+        _data={
+            "name": "my template",
+            "template_type": "letter",
+            "subject": "subject",
+            "content": "qr: " + ("too long " * 100),
+            "postage": "second",
+            "service": str(sample_service_full_permissions.id),
+            "created_by": "30587644-9083-44d8-a114-98887f07f1e3",
+        },
+        _expected_status=400,
+    )
+
+    assert response == {"result": "error", "message": {"content": ["qr-code-too-long"]}}
+
+
 @pytest.mark.parametrize(
     "template_default, service_default",
     [("template address", "service address"), (None, "service address"), ("template address", None), (None, None)],
@@ -980,6 +1087,32 @@ def test_update_template_reply_to(client, sample_letter_template):
     assert th.service_letter_contact_id == letter_contact.id
 
 
+def test_update_template_reply_to_does_not_overwrite_letter_attachment(admin_request, sample_letter_template):
+    letter_contact = create_letter_contact(sample_letter_template.service, "Edinburgh, ED1 1AA")
+
+    attachment = create_letter_attachment(created_by_id=sample_letter_template.created_by_id)
+    sample_letter_template.letter_attachment_id = attachment.id
+    dao_update_template(sample_letter_template)
+
+    data = {"reply_to": str(letter_contact.id)}
+
+    assert sample_letter_template.letter_attachment_id == attachment.id
+
+    admin_request.post(
+        "template.update_template",
+        service_id=sample_letter_template.service_id,
+        template_id=sample_letter_template.id,
+        _data=data,
+    )
+    previous = TemplateHistory.query.filter_by(id=sample_letter_template.id, version=2).one()
+    assert previous.letter_attachment_id == attachment.id
+    assert previous.service_letter_contact_id is None
+
+    latest = TemplateHistory.query.filter_by(id=sample_letter_template.id, version=3).one()
+    assert latest.service_letter_contact_id == letter_contact.id
+    assert latest.letter_attachment_id == attachment.id
+
+
 def test_update_template_reply_to_set_to_blank(client, notify_db_session):
     auth_header = create_admin_authorization_header()
     service = create_service(service_permissions=["letter"])
@@ -1020,9 +1153,7 @@ def test_update_template_validates_postage(admin_request, sample_service_full_pe
 def test_update_template_with_foreign_service_reply_to(client, sample_letter_template):
     auth_header = create_admin_authorization_header()
 
-    service2 = create_service(
-        service_name="test service", email_from="test@example.com", service_permissions=["letter"]
-    )
+    service2 = create_service(service_name="test service", service_permissions=["letter"])
     letter_contact = create_letter_contact(service2, "Edinburgh, ED1 1AA")
 
     data = {
@@ -1116,6 +1247,19 @@ def test_update_redact_template_400s_if_no_created_by(admin_request, sample_temp
     assert sample_template.template_redacted.updated_at == original_updated_time
 
 
+def test_update_template_400s_if_static_qr_code_too_long(admin_request, sample_service_full_permissions):
+    sample_template = create_template(sample_service_full_permissions, template_type=LETTER_TYPE, content="before")
+    resp = admin_request.post(
+        "template.update_template",
+        service_id=sample_template.service_id,
+        template_id=sample_template.id,
+        _data={"content": "qr: " + ("too long " * 100)},
+        _expected_status=400,
+    )
+
+    assert resp == {"result": "error", "message": {"content": ["qr-code-too-long"]}}
+
+
 def test_preview_letter_template_by_id_invalid_file_type(sample_letter_notification, admin_request):
     resp = admin_request.get(
         "template.preview_letter_template_by_notification_id",
@@ -1135,6 +1279,7 @@ def test_preview_letter_template_by_id_valid_file_type(
     notify_api,
     sample_letter_notification,
     admin_request,
+    mock_onwards_request_headers,
     file_type,
 ):
     sample_letter_notification.created_at = datetime.utcnow()
@@ -1151,7 +1296,10 @@ def test_preview_letter_template_by_id_valid_file_type(
             mock_post = request_mock.post(
                 "http://localhost/notifications-template-preview/preview.{}".format(file_type),
                 content=content,
-                headers={"X-pdf-page-count": "1"},
+                headers={
+                    "X-pdf-page-count": "1",
+                    "some-onwards": "request-headers",
+                },
                 status_code=200,
             )
 
@@ -1180,7 +1328,11 @@ def test_preview_letter_template_by_id_valid_file_type(
 
 @freeze_time("2012-12-12")
 def test_preview_letter_template_by_id_shows_template_version_used_by_notification(
-    notify_api, sample_letter_notification, sample_letter_template, admin_request
+    notify_api,
+    sample_letter_notification,
+    sample_letter_template,
+    mock_onwards_request_headers,
+    admin_request,
 ):
     sample_letter_notification.created_at = datetime.utcnow()
     assert sample_letter_notification.template_version == 1
@@ -1205,7 +1357,10 @@ def test_preview_letter_template_by_id_shows_template_version_used_by_notificati
             mock_post = request_mock.post(
                 "http://localhost/notifications-template-preview/preview.png",
                 content=content,
-                headers={"X-pdf-page-count": "1"},
+                headers={
+                    "X-pdf-page-count": "1",
+                    "some-onwards": "request-headers",
+                },
                 status_code=200,
             )
 
@@ -1222,7 +1377,11 @@ def test_preview_letter_template_by_id_shows_template_version_used_by_notificati
 
 
 def test_preview_letter_template_by_id_template_preview_500(
-    notify_api, client, admin_request, sample_letter_notification
+    notify_api,
+    client,
+    admin_request,
+    sample_letter_notification,
+    mock_onwards_request_headers,
 ):
     with set_config_values(
         notify_api,
@@ -1239,7 +1398,10 @@ def test_preview_letter_template_by_id_template_preview_500(
             mock_post = request_mock.post(
                 "http://localhost/notifications-template-preview/preview.pdf",
                 content=content,
-                headers={"X-pdf-page-count": "1"},
+                headers={
+                    "X-pdf-page-count": "1",
+                    "some-onwards": "request-headers",
+                },
                 status_code=404,
             )
 
@@ -1357,6 +1519,7 @@ def test_preview_letter_template_precompiled_for_png_shows_overlay_on_pages_with
     admin_request,
     sample_service,
     mocker,
+    mock_onwards_request_headers,
     requested_page,
     message,
     expected_post_url,
@@ -1393,7 +1556,10 @@ def test_preview_letter_template_precompiled_for_png_shows_overlay_on_pages_with
             mock_post = request_mock.post(
                 "http://localhost/notifications-template-preview/{}".format(expected_post_url),
                 content=expected_returned_content,
-                headers={"X-pdf-page-count": "4"},
+                headers={
+                    "X-pdf-page-count": "4",
+                    "some-onwards": "request-headers",
+                },
                 status_code=200,
             )
 
@@ -1425,6 +1591,7 @@ def test_preview_letter_template_precompiled_for_pdf_shows_overlay_on_all_pages_
     admin_request,
     sample_service,
     mocker,
+    mock_onwards_request_headers,
     invalid_pages,
 ):
     template = create_template(
@@ -1459,7 +1626,10 @@ def test_preview_letter_template_precompiled_for_pdf_shows_overlay_on_all_pages_
             mock_post = request_mock.post(
                 "http://localhost/notifications-template-preview/precompiled/overlay.pdf",
                 content=expected_returned_content,
-                headers={"X-pdf-page-count": "4"},
+                headers={
+                    "X-pdf-page-count": "4",
+                    "some-onwards": "request-headers",
+                },
                 status_code=200,
             )
 
@@ -1528,7 +1698,12 @@ def test_preview_letter_template_precompiled_png_file_type_hide_notify_tag_only_
 
 
 def test_preview_letter_template_precompiled_png_template_preview_500_error(
-    notify_api, client, admin_request, sample_service, mocker
+    notify_api,
+    client,
+    admin_request,
+    sample_service,
+    mocker,
+    mock_onwards_request_headers,
 ):
     template = create_template(
         sample_service,
@@ -1561,7 +1736,10 @@ def test_preview_letter_template_precompiled_png_template_preview_500_error(
             mock_post = request_mock.post(
                 "http://localhost/notifications-template-preview/precompiled-preview.png",
                 content=png_content,
-                headers={"X-pdf-page-count": "1"},
+                headers={
+                    "X-pdf-page-count": "1",
+                    "some-onwards": "request-headers",
+                },
                 status_code=500,
             )
 
@@ -1578,7 +1756,12 @@ def test_preview_letter_template_precompiled_png_template_preview_500_error(
 
 
 def test_preview_letter_template_precompiled_png_template_preview_400_error(
-    notify_api, client, admin_request, sample_service, mocker
+    notify_api,
+    client,
+    admin_request,
+    sample_service,
+    mocker,
+    mock_onwards_request_headers,
 ):
     template = create_template(
         sample_service,
@@ -1611,7 +1794,10 @@ def test_preview_letter_template_precompiled_png_template_preview_400_error(
             mock_post = request_mock.post(
                 "http://localhost/notifications-template-preview/precompiled-preview.png",
                 content=png_content,
-                headers={"X-pdf-page-count": "1"},
+                headers={
+                    "X-pdf-page-count": "1",
+                    "some-onwards": "request-headers",
+                },
                 status_code=404,
             )
 
@@ -1628,7 +1814,12 @@ def test_preview_letter_template_precompiled_png_template_preview_400_error(
 
 
 def test_preview_letter_template_precompiled_png_template_preview_pdf_error(
-    notify_api, client, admin_request, sample_service, mocker
+    notify_api,
+    client,
+    admin_request,
+    sample_service,
+    mocker,
+    mock_onwards_request_headers,
 ):
     template = create_template(
         sample_service,
@@ -1662,7 +1853,10 @@ def test_preview_letter_template_precompiled_png_template_preview_pdf_error(
             request_mock.post(
                 "http://localhost/notifications-template-preview/precompiled-preview.png",
                 content=png_content,
-                headers={"X-pdf-page-count": "1"},
+                headers={
+                    "X-pdf-page-count": "1",
+                    "some-onwards": "request-headers",
+                },
                 status_code=404,
             )
 

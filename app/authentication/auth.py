@@ -56,12 +56,12 @@ def requires_no_auth():
     pass
 
 
-def requires_govuk_alerts_auth():
-    requires_internal_auth(current_app.config.get("GOVUK_ALERTS_CLIENT_ID"))
-
-
 def requires_admin_auth():
     requires_internal_auth(current_app.config.get("ADMIN_CLIENT_ID"))
+
+
+def requires_functional_test_auth():
+    requires_internal_auth(current_app.config.get("FUNCTIONAL_TESTS_CLIENT_ID"))
 
 
 def requires_internal_auth(expected_client_id):

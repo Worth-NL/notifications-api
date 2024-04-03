@@ -1,4 +1,3 @@
-import string
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -27,6 +26,7 @@ import app.constants
 from app import ma, models
 from app.dao.permissions_dao import permission_dao
 from app.models import ServicePermission
+from app.notifications.validators import remap_phone_number_validation_messages
 from app.utils import DATETIME_FORMAT_NO_TIMEZONE, get_template_instance
 
 
@@ -36,16 +36,6 @@ def _validate_positive_number(value, msg="Not a positive integer"):
     except ValueError as e:
         raise ValidationError(msg) from e
     if page_int < 1:
-        raise ValidationError(msg)
-
-
-def _validate_datetime_not_more_than_96_hours_in_future(dte, msg="Date cannot be more than 96hrs in the future"):
-    if dte > datetime.utcnow() + timedelta(hours=96):
-        raise ValidationError(msg)
-
-
-def _validate_datetime_not_in_past(dte, msg="Date cannot be in the past"):
-    if dte < datetime.utcnow():
         raise ValidationError(msg)
 
 
@@ -144,7 +134,8 @@ class UserSchema(BaseSchema):
             if value is not None:
                 validate_phone_number(value, international=True)
         except InvalidPhoneError as error:
-            raise ValidationError("Invalid phone number: {}".format(error)) from error
+            error_message = remap_phone_number_validation_messages(str(error))
+            raise ValidationError(f"Invalid phone number: {error_message}") from error
 
 
 class UserUpdateAttributeSchema(BaseSchema):
@@ -184,7 +175,8 @@ class UserUpdateAttributeSchema(BaseSchema):
             if value is not None:
                 validate_phone_number(value, international=True)
         except InvalidPhoneError as error:
-            raise ValidationError("Invalid phone number: {}".format(error)) from error
+            error_message = remap_phone_number_validation_messages(str(error))
+            raise ValidationError(f"Invalid phone number: {error_message}") from error
 
     @validates_schema(pass_original=True)
     def check_unknown_fields(self, data, original_data, **kwargs):
@@ -233,6 +225,18 @@ class ServiceSchema(BaseSchema, UUIDsAsStringsMixin):
     go_live_at = field_for(models.Service, "go_live_at", format=DATETIME_FORMAT_NO_TIMEZONE)
     allowed_broadcast_provider = fields.Method(dump_only=True, serialize="_get_allowed_broadcast_provider")
     broadcast_channel = fields.Method(dump_only=True, serialize="_get_broadcast_channel")
+    name = fields.String(required=True)
+    custom_email_sender_name = fields.String(allow_none=True)
+    # this can only be set via custom_email_sender_name or name
+    email_sender_local_part = fields.String(dump_only=True)
+    service_callback_api = fields.Method("service_delivery_status_callback_api")
+
+    def service_delivery_status_callback_api(self, service):
+        return [
+            callback.id
+            for callback in service.service_callback_api
+            if callback.callback_type == app.constants.DELIVERY_STATUS_CALLBACK_TYPE
+        ]
 
     def _get_allowed_broadcast_provider(self, service):
         return service.allowed_broadcast_provider
@@ -288,6 +292,10 @@ class ServiceSchema(BaseSchema, UUIDsAsStringsMixin):
             "updated_at",
             "users",
             "version",
+            "_name",
+            "_normalised_service_name",
+            "_custom_email_sender_name",
+            "_email_sender_local_part",
         )
 
     @validates("permissions")
@@ -300,13 +308,6 @@ class ServiceSchema(BaseSchema, UUIDsAsStringsMixin):
         if len(set(permissions)) != len(permissions):
             duplicates = list(set([x for x in permissions if permissions.count(x) > 1]))
             raise ValidationError("Duplicate Service Permission: {}".format(duplicates))
-
-    @validates("email_from")
-    def validate_email_from(self, value):
-        if not all(char in string.ascii_lowercase + string.digits + "." for char in value):
-            raise ValidationError(
-                "Unacceptable characters: `email_from` may only contain letters, numbers and full stops."
-            )
 
     @pre_load()
     def format_for_data_model(self, in_data, **kwargs):
@@ -328,6 +329,17 @@ class DetailedServiceSchema(BaseSchema):
     go_live_at = FlexibleDateTime()
     created_at = FlexibleDateTime()
     updated_at = FlexibleDateTime()
+    name = fields.String()
+    custom_email_sender_name = fields.String(required=False)
+    email_sender_local_part = fields.String()
+    service_callback_api = fields.Method("service_delivery_status_callback_api")
+
+    def service_delivery_status_callback_api(self, service):
+        return [
+            callback.id
+            for callback in service.service_callback_api
+            if callback.callback_type == app.constants.DELIVERY_STATUS_CALLBACK_TYPE
+        ]
 
     class Meta(BaseSchema.Meta):
         model = models.Service
@@ -339,9 +351,12 @@ class DetailedServiceSchema(BaseSchema):
             "contact_list",
             "created_by",
             "crown",
+            "_name",
+            "_normalised_service_name",
+            "_custom_email_sender_name",
+            "_email_sender_local_part",
             "email_branding",
             "email_message_limit",
-            "email_from",
             "guest_list",
             "inbound_api",
             "inbound_number",
@@ -381,6 +396,7 @@ class BaseTemplateSchema(BaseSchema):
     reply_to = fields.Method("get_reply_to", allow_none=True)
     reply_to_text = fields.Method("get_reply_to_text", allow_none=True)
     letter_attachment = fields.Method("get_letter_attachment", allow_none=True)
+    letter_languages = fields.Method("get_letter_languages", "load_letter_languages", allow_none=True)
 
     def get_reply_to(self, template):
         return template.reply_to
@@ -390,6 +406,12 @@ class BaseTemplateSchema(BaseSchema):
 
     def get_letter_attachment(self, template):
         return template.letter_attachment.serialize() if template.letter_attachment_id else None
+
+    def get_letter_languages(self, template):
+        return template.letter_languages
+
+    def load_letter_languages(self, value):
+        return app.constants.LetterLanguageOptions(value) if value else None
 
     class Meta(BaseSchema.Meta):
         model = models.Template
@@ -439,6 +461,9 @@ class TemplateSchemaNoDetail(TemplateSchema):
             "template_redacted",
             "updated_at",
             "version",
+            "letter_welsh_subject",
+            "letter_welsh_content",
+            "letter_languages",
         )
 
     @pre_dump
@@ -453,6 +478,7 @@ class TemplateHistorySchema(BaseSchema):
     reply_to = fields.Method("get_reply_to", allow_none=True)
     reply_to_text = fields.Method("get_reply_to_text", allow_none=True)
     process_type = field_for(models.Template, "process_type")
+    is_precompiled_letter = fields.Method("get_is_precompiled_letter")
     letter_attachment = fields.Method("get_letter_attachment", allow_none=True)
 
     created_by = fields.Nested(UserSchema, only=["id", "name", "email_address"], dump_only=True)
@@ -467,6 +493,9 @@ class TemplateHistorySchema(BaseSchema):
 
     def get_letter_attachment(self, template):
         return template.letter_attachment.serialize() if template.letter_attachment_id else None
+
+    def get_is_precompiled_letter(self, template):
+        return template.is_precompiled_letter
 
     class Meta(BaseSchema.Meta):
         model = models.TemplateHistory
@@ -514,8 +543,11 @@ class JobSchema(BaseSchema):
 
     @validates("scheduled_for")
     def validate_scheduled_for(self, value):
-        _validate_datetime_not_in_past(value)
-        _validate_datetime_not_more_than_96_hours_in_future(value)
+        if value < datetime.utcnow():
+            raise ValidationError("Date cannot be in the past")
+
+        if value > datetime.utcnow() + timedelta(days=7):
+            raise ValidationError("Date cannot be more than 7 days in the future")
 
     class Meta(BaseSchema.Meta):
         model = models.Job
@@ -543,7 +575,8 @@ class SmsNotificationSchema(NotificationSchema):
         try:
             validate_phone_number(value, international=True)
         except InvalidPhoneError as error:
-            raise ValidationError("Invalid phone number: {}".format(error)) from error
+            error_message = remap_phone_number_validation_messages(str(error))
+            raise ValidationError(f"Invalid phone number: {error_message}") from error
 
     @post_load
     def format_phone_number(self, item, **kwargs):
@@ -587,6 +620,9 @@ class NotificationWithTemplateSchema(BaseSchema):
             "is_precompiled_letter",
             "letter_attachment",
             "reply_to_text",
+            "letter_languages",
+            "letter_welsh_subject",
+            "letter_welsh_content",
         ],
         dump_only=True,
     )
@@ -764,7 +800,8 @@ class ServiceHistorySchema(ma.Schema):
     sms_message_limit = fields.Integer()
     letter_message_limit = fields.Integer()
     restricted = fields.Boolean()
-    email_from = fields.String()
+    custom_email_sender_name = fields.String()
+    email_sender_local_part = fields.String()
     created_by_id = fields.UUID()
     version = fields.Integer()
 

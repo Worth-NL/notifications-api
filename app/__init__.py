@@ -21,8 +21,8 @@ from gds_metrics import GDSMetrics
 from gds_metrics.metrics import Gauge, Histogram
 from notifications_utils import logging, request_helper
 from notifications_utils.celery import NotifyCelery
-from notifications_utils.clients.encryption.encryption_client import Encryption
 from notifications_utils.clients.redis.redis_client import RedisClient
+from notifications_utils.clients.signing.signing_client import Signing
 from notifications_utils.clients.statsd.statsd_client import StatsdClient
 from notifications_utils.clients.zendesk.zendesk_client import ZendeskClient
 from sqlalchemy import event
@@ -47,7 +47,7 @@ mmg_client = MMGClient()
 aws_ses_client = AwsSesClient()
 aws_ses_stub_client = AwsSesStubClient()
 dvla_client = DVLAClient()
-encryption = Encryption()
+signing = Signing()
 zendesk_client = ZendeskClient()
 statsd_client = StatsdClient()
 redis_store = RedisClient()
@@ -74,6 +74,9 @@ def create_app(application):
     application.config.from_object(configs[notify_environment])
 
     application.config["NOTIFY_APP_NAME"] = application.name
+    application.config["SQLALCHEMY_ENGINE_OPTIONS"]["connect_args"]["application_name"] = os.environ.get(
+        "NOTIFY_APP_NAME", "api"
+    )
     init_app(application)
 
     # Metrics intentionally high up to give the most accurate timing and reliability that the metric is recorded
@@ -97,7 +100,7 @@ def create_app(application):
     notification_provider_clients.init_app(sms_clients=[firetext_client, mmg_client], email_clients=email_clients)
 
     notify_celery.init_app(application)
-    encryption.init_app(application)
+    signing.init_app(application)
     redis_store.init_app(application)
     document_download_client.init_app(application)
 
@@ -117,19 +120,22 @@ def create_app(application):
     return application
 
 
+def _should_register_functional_testing_blueprint(environment):
+    return environment in {"development", "test", "preview"}
+
+
 def register_blueprint(application):
     from app.authentication.auth import (
         requires_admin_auth,
         requires_auth,
-        requires_govuk_alerts_auth,
+        requires_functional_test_auth,
         requires_no_auth,
     )
     from app.billing.rest import billing_blueprint
-    from app.broadcast_message.rest import broadcast_message_blueprint
     from app.complaint.complaint_rest import complaint_blueprint
     from app.email_branding.rest import email_branding_blueprint
     from app.events.rest import events as events_blueprint
-    from app.govuk_alerts.rest import govuk_alerts_blueprint
+    from app.functional_tests import test_blueprint
     from app.inbound_number.rest import inbound_number_blueprint
     from app.inbound_sms.rest import inbound_sms as inbound_sms_blueprint
     from app.job.rest import job_blueprint
@@ -137,7 +143,7 @@ def register_blueprint(application):
     from app.letter_branding.letter_branding_rest import (
         letter_branding_blueprint,
     )
-    from app.letters.rest import letter_job
+    from app.letters.rest import letter_job, letter_rates_blueprint
     from app.notifications.notifications_letter_callback import (
         letter_callback_blueprint,
     )
@@ -161,6 +167,7 @@ def register_blueprint(application):
     from app.service_invite.rest import (
         service_invite as service_invite_blueprint,
     )
+    from app.sms.rest import sms_rate_blueprint
     from app.status.healthcheck import status as status_blueprint
     from app.template.rest import template_blueprint
     from app.template_folder.rest import template_folder_blueprint
@@ -232,6 +239,9 @@ def register_blueprint(application):
     letter_job.before_request(requires_admin_auth)
     application.register_blueprint(letter_job)
 
+    letter_rates_blueprint.before_request(requires_admin_auth)
+    application.register_blueprint(letter_rates_blueprint)
+
     letter_callback_blueprint.before_request(requires_no_auth)
     application.register_blueprint(letter_callback_blueprint)
 
@@ -262,22 +272,22 @@ def register_blueprint(application):
     upload_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(upload_blueprint)
 
-    broadcast_message_blueprint.before_request(requires_admin_auth)
-    application.register_blueprint(broadcast_message_blueprint)
-
-    govuk_alerts_blueprint.before_request(requires_govuk_alerts_auth)
-    application.register_blueprint(govuk_alerts_blueprint)
-
     platform_admin_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(platform_admin_blueprint, url_prefix="/platform-admin")
 
     letter_attachment_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(letter_attachment_blueprint)
 
+    sms_rate_blueprint.before_request(requires_admin_auth)
+    application.register_blueprint(sms_rate_blueprint)
+
+    if _should_register_functional_testing_blueprint(application.config["NOTIFY_ENVIRONMENT"]):
+        test_blueprint.before_request(requires_functional_test_auth)
+        application.register_blueprint(test_blueprint)
+
 
 def register_v2_blueprints(application):
     from app.authentication.auth import requires_auth
-    from app.v2.broadcast.post_broadcast import v2_broadcast_blueprint
     from app.v2.inbound_sms.get_inbound_sms import v2_inbound_sms_blueprint
     from app.v2.notifications import (  # noqa
         get_notifications,
@@ -302,9 +312,6 @@ def register_v2_blueprints(application):
 
     v2_inbound_sms_blueprint.before_request(requires_auth)
     application.register_blueprint(v2_inbound_sms_blueprint)
-
-    v2_broadcast_blueprint.before_request(requires_auth)
-    application.register_blueprint(v2_broadcast_blueprint)
 
 
 def init_app(app):
@@ -351,7 +358,6 @@ def create_random_identifier():
 
 
 def setup_sqlalchemy_events(app):
-
     TOTAL_DB_CONNECTIONS = Gauge(
         "db_connection_total_connected",
         "How many db connections are currently held (potentially idle) by the server",

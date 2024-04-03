@@ -2,7 +2,7 @@ name: Docker
 
 on:
   push:
-    branches: ["main"]
+    branches: ["*"]
     tags: ["*"]
 
 env:
@@ -62,5 +62,5 @@ jobs:
           file: ./docker/Dockerfile
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          push: true
+          push: false
           # TODO: add a git tag and associated docker tag for it on merge

@@ -1,7 +1,7 @@
 {%- set app_vars = {
   'notify-api': {
     'NOTIFY_APP_NAME': 'api',
-    'disk_quota': '2G',
+    'disk_quota': '10G',
     'sqlalchemy_pool_size': 15,
     'additional_env_vars': {
       'STATSD_HOST': None
@@ -22,7 +22,7 @@
 
   'notify-api-sms-receipts': {
     'NOTIFY_APP_NAME': 'api',
-    'disk_quota': '2G',
+    'disk_quota': '4G',
     'additional_env_vars': {
       'STATSD_HOST': None
     },
@@ -53,13 +53,26 @@
     'memory': '512M',
     'instances': {
       'preview': 0,
-      'staging': 1,
-      'production': 1
+      'staging': 0,
+      'production': 0
+    },
+  },
+  'notify-delivery-worker-ecs-fixup': {
+    'disk_quota': '10G',
+    'memory': '4G',
+    'additional_env_vars': {
+      'NOTIFICATION_QUEUE_PREFIX': ('production-' if environment == 'production' else (NOTIFICATION_QUEUE_PREFIX + '-ecs')),
+      'CELERYD_PREFETCH_MULTIPLIER': 1,
+    },
+    'instances': {
+      'preview': 0,
+      'staging': 0,
+      'production': 0
     },
   },
   'notify-delivery-worker-jobs': {'memory': '2G'},
-  'notify-delivery-worker-research': {},
-  'notify-delivery-worker-sender': {'disk_quota': '2G', 'memory': '4G'},
+  'notify-delivery-worker-research': {'disk_quota': '10G'},
+  'notify-delivery-worker-sender': {'disk_quota': '4G', 'memory': '4G'},
   'notify-delivery-worker-sender-letters': {},
   'notify-delivery-worker-periodic': {},
   'notify-delivery-worker-reporting': {
@@ -78,8 +91,8 @@
     }
   },
   'notify-delivery-worker-receipts': {},
-  'notify-delivery-worker-service-callbacks': {'disk_quota': '2G'},
-  'notify-delivery-worker-save-api-notifications': {'disk_quota': '2G'},
+  'notify-delivery-worker-service-callbacks': {'disk_quota': '4G'},
+  'notify-delivery-worker-save-api-notifications': {'disk_quota': '4G'},
 } -%}
 
 {%- set app = app_vars[CF_APP] -%}
@@ -93,8 +106,9 @@ applications:
     {% if instance_count is not none %}
     instances: {{ instance_count }}
     {%- endif %}
-    memory: {{ app.get('memory', '1G') }}
-    disk_quota: {{ app.get('disk_quota', '1G')}}
+    memory: {{ app.get('memory', '1.5G') }}
+    disk_quota: {{ app.get('disk_quota', '2G')}}
+    stack: cflinuxfs3
 
     routes:
       {%- for route in app.get('routes', {}).get(environment, []) %}
@@ -105,12 +119,7 @@ applications:
     health-check-invocation-timeout: {{ app.get('health-check-invocation-timeout', 1) }}
 
     services:
-      - notify-db
-      - notify-redis
       - logit-ssl-syslog-drain
-      {% if CF_APP == 'notify-api' %}
-      - notify-splunk
-      {% endif %}
 
     env:
       NOTIFY_APP_NAME: {{ app.get('NOTIFY_APP_NAME', CF_APP.replace('notify-', '')) }}
@@ -123,19 +132,15 @@ applications:
       ADMIN_BASE_URL: '{{ ADMIN_BASE_URL }}'
       INTERNAL_CLIENT_API_KEYS: '{{ INTERNAL_CLIENT_API_KEYS | tojson }}'
       API_HOST_NAME: '{{ API_HOST_NAME }}'
-      API_HOST_NAME_INTERNAL: '{{ API_HOST_NAME }}'
+      API_HOST_NAME_INTERNAL: '{{ API_HOST_NAME_INTERNAL }}'
       DANGEROUS_SALT: '{{ DANGEROUS_SALT }}'
       SECRET_KEY: '{{ SECRET_KEY }}'
       ROUTE_SECRET_KEY_1: '{{ ROUTE_SECRET_KEY_1 }}'
       ROUTE_SECRET_KEY_2: '{{ ROUTE_SECRET_KEY_2 }}'
       CRONITOR_KEYS: '{{ CRONITOR_KEYS | tojson }}'
       METRICS_BASIC_AUTH_TOKEN: {{ METRICS_BASIC_AUTH_TOKEN }}
-      {% if SQLALCHEMY_DATABASE_URI is defined %}
       SQLALCHEMY_DATABASE_URI: '{{ SQLALCHEMY_DATABASE_URI }}'
-      {% endif %}
-      {% if REDIS_URL is defined %}
       REDIS_URL: '{{ REDIS_URL }}'
-      {% endif %}
 
       HIGH_VOLUME_SERVICE: '{{ HIGH_VOLUME_SERVICE | tojson }}'
 
@@ -163,12 +168,9 @@ applications:
       TEMPLATE_PREVIEW_API_HOST: '{{ TEMPLATE_PREVIEW_API_HOST }}'
       TEMPLATE_PREVIEW_API_KEY: '{{ TEMPLATE_PREVIEW_API_KEY }}'
 
-      DVLA_API_ENABLED: '{{ DVLA_API_ENABLED }}'
-
       DVLA_EMAIL_ADDRESSES: '{{ DVLA_EMAIL_ADDRESSES | tojson  }}'
 
       DVLA_API_TLS_CIPHERS: '{{ DVLA_API_TLS_CIPHERS }}'
-      DVLA_API_POSTAGE_TYPE_EXCLUDE_LIST: '{{ DVLA_API_POSTAGE_TYPE_EXCLUDE_LIST | tojson  }}'
 
       SENTRY_ENABLED: '{{ NOTIFICATIONS_API_SENTRY_ENABLED }}'
       SENTRY_DSN: '{{ NOTIFICATIONS_API_SENTRY_DSN }}'

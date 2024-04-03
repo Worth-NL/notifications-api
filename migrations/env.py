@@ -1,9 +1,15 @@
+from collections.abc import Callable, Iterable, Mapping
+import psycopg2
+import struct
+import time
+from contextlib import contextmanager
 from logging.config import fileConfig
 from pathlib import Path
 
 from alembic import context
 from flask import current_app
 from sqlalchemy import engine_from_config, pool
+import sqlalchemy
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -64,15 +70,37 @@ def run_migrations_online():
 
     """
     engine = engine_from_config(
-        config.get_section(config.config_ini_section), prefix="sqlalchemy.", poolclass=pool.NullPool
+        config.get_section(config.config_ini_section),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
     )
 
     connection = engine.connect()
-    context.configure(
-        connection=connection, target_metadata=target_metadata, compare_type=True, include_object=include_object
-    )
-
     try:
+        context.configure(
+            connection=connection,
+            compare_type=True,
+            include_object=include_object,
+            target_metadata=target_metadata,
+            transaction_per_migration=True,
+        )
+
+        # take a *session-level* advisory lock to prevent multiple migration
+        # processes attempting to run concurrently. being a session-level lock,
+        # it should safely cover our few migrations that need to perform multiple
+        # transactions.
+        # advisory lock ids are 64b (signed) integers, so use the null-padded,
+        # big-endian representation of the string "alembic"
+        lock_id = struct.unpack(">q", struct.pack("8s", b"alembic"))[0]
+        connection.execute("SELECT pg_advisory_lock(%s)", lock_id)
+
+        # abort any migrations if a lock (other than the above advisory lock)
+        # cannot be acquired after one second.
+        #
+        # if we see issues with this lock timeout failing, we should try running
+        # again when there are no locks on that table, perhaps at a quieter time.
+        connection.execute("SET lock_timeout = 1000")
+
         with context.begin_transaction():
             context.run_migrations()
 
@@ -87,7 +115,31 @@ def run_migrations_online():
         connection.close()
 
 
+def retry_on_lock_error(
+    *,
+    func: Callable,
+    args: Iterable = [],
+    kwargs: Mapping = {},
+    max_retries: int = 1,
+    delay_secs: int = 0,
+):
+    for i in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except sqlalchemy.exc.OperationalError as e:
+            # on the last attempt raise so we get a full stack trace
+            if i + 1 == max_retries:
+                raise
+
+            if not isinstance(e.orig, psycopg2.errors.LockNotAvailable):
+                raise
+
+            print("Retrying due to LockNotAvailable error")
+            print(e)
+            time.sleep(delay_secs)
+
+
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    run_migrations_online()
+    retry_on_lock_error(func=run_migrations_online, max_retries=10, delay_secs=10)

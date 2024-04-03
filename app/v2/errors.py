@@ -2,7 +2,7 @@ import json
 
 from flask import current_app, jsonify, request
 from jsonschema import ValidationError as JsonSchemaValidationError
-from notifications_utils.recipients import InvalidEmailError
+from notifications_utils.recipients import InvalidEmailError, InvalidPhoneError
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm.exc import NoResultFound
 
@@ -55,12 +55,45 @@ class PDFNotReadyError(BadRequestError):
         super().__init__(message="PDF not available yet, try again later", status_code=400)
 
 
+class QrCodeTooLongError(ValidationError):
+    message = "Cannot create a usable QR code - the link is too long"
+
+    def __init__(self, fields=None, message=None, status_code=400, *, num_bytes, max_bytes, data):
+        super().__init__(fields=fields, message=message, status_code=status_code)
+        self.num_bytes = num_bytes
+        self.max_bytes = max_bytes
+        self.data = data
+
+    def to_dict_v2(self):
+        """
+        Version 2 of the public api error response.
+        """
+        return {
+            "status_code": self.status_code,
+            "errors": [
+                {
+                    "error": "ValidationError",
+                    "message": self.message,
+                    "data": self.data,
+                    "num_bytes": self.num_bytes,
+                    "max_bytes": self.max_bytes,
+                }
+            ],
+        }
+
+
 def register_errors(blueprint):
     @blueprint.errorhandler(InvalidEmailError)
     def invalid_format(error):
-        # Please not that InvalidEmailError is re-raised for InvalidEmail or InvalidPhone,
+        # Please note that InvalidEmailError is re-raised for InvalidEmail or InvalidPhone,
         # work should be done in the utils app to tidy up these errors.
+        if isinstance(error, InvalidPhoneError):
+            from app.notifications.validators import remap_phone_number_validation_messages
+
+            error = InvalidPhoneError(remap_phone_number_validation_messages(str(error)))
+
         current_app.logger.info(error)
+
         return jsonify(status_code=400, errors=[{"error": error.__class__.__name__, "message": str(error)}]), 400
 
     @blueprint.errorhandler(InvalidRequest)

@@ -9,6 +9,7 @@ from flask import current_app, json
 from app.constants import (
     EMAIL_TYPE,
     INTERNATIONAL_SMS_TYPE,
+    LETTER_TYPE,
     NOTIFICATION_CREATED,
     SMS_TYPE,
 )
@@ -242,7 +243,6 @@ def test_should_cache_template_lookups_in_memory(mocker, api_client_request, sam
 
 
 def test_should_cache_template_and_service_in_redis(mocker, api_client_request, sample_template):
-
     from app.schemas import service_schema, template_schema
 
     mock_redis_get = mocker.patch(
@@ -292,7 +292,6 @@ def test_should_cache_template_and_service_in_redis(mocker, api_client_request, 
 
 
 def test_should_return_template_if_found_in_redis(mocker, api_client_request, sample_template):
-
     from app.schemas import service_schema, template_schema
 
     service_dict = service_schema.dump(sample_template.service)
@@ -406,6 +405,46 @@ def test_post_notification_with_too_long_reference_returns_400(
         ]
 
 
+def test_post_notification_errors_with_too_much_qr_code_data(
+    api_client_request,
+    sample_service_full_permissions,
+):
+    letter_template = create_template(
+        sample_service_full_permissions, template_type=LETTER_TYPE, postage="second", content="qr: ((qrcode))"
+    )
+
+    data = {
+        "personalisation": {
+            "address_line_1": "The king",
+            "address_line_2": "Buckingham Palace",
+            "postcode": "SW1 1AA",
+            "qrcode": "too much data" * 50,
+        },
+        "template_id": letter_template.id,
+        "reference": "qr code",
+    }
+
+    error_resp = api_client_request.post(
+        letter_template.service_id,
+        "v2_notifications.post_notification",
+        notification_type=LETTER_TYPE,
+        _data=data,
+        _expected_status=400,
+        headers=[("Content-Type", "application/json")],
+    )
+
+    assert error_resp["status_code"] == 400
+    assert error_resp["errors"] == [
+        {
+            "error": "ValidationError",
+            "message": "Cannot create a usable QR code - the link is too long",
+            "data": "too much data" * 50,
+            "max_bytes": 504,
+            "num_bytes": 650,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "notification_type, key_send_to, send_to",
     [("sms", "phone_number", "+447700900855"), ("email", "email_address", "sample@email.com")],
@@ -463,7 +502,8 @@ def test_post_email_notification_returns_201(
     assert resp_json["content"]["body"] == sample_email_template_with_placeholders.content.replace("((name))", "Bob")
     assert resp_json["content"]["subject"] == sample_email_template_with_placeholders.subject.replace("((name))", "Bob")
     assert resp_json["content"]["from_email"] == "{}@{}".format(
-        sample_email_template_with_placeholders.service.email_from, current_app.config["NOTIFY_EMAIL_DOMAIN"]
+        sample_email_template_with_placeholders.service.email_sender_local_part,
+        current_app.config["NOTIFY_EMAIL_DOMAIN"],
     )
     assert "v2/notifications/{}".format(notification.id) in resp_json["uri"]
     assert resp_json["template"]["id"] == str(sample_email_template_with_placeholders.id)
@@ -479,19 +519,23 @@ def test_post_email_notification_returns_201(
 
 
 @pytest.mark.parametrize(
-    "personalisation, expected_status, expect_error_message, expect_upload, expected_confirmation, expected_retention",
     (
-        ({"doc": "just some text"}, 201, None, False, None, None),
-        ({"doc": {"file": False}}, 400, None, False, None, None),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK"}}, 201, None, True, True, "26 weeks"),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": None}}, 201, None, True, True, "26 weeks"),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": True}}, 201, None, True, True, "26 weeks"),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": False}}, 201, None, True, True, "26 weeks"),
+        "personalisation, expected_status, expect_error_message, expect_upload, "
+        "expected_confirmation, expected_retention, expected_filename"
+    ),
+    (
+        ({"doc": "just some text"}, 201, None, False, None, None, None),
+        ({"doc": {"file": False}}, 400, None, False, None, None, None),
+        ({"doc": {"file": "YSxiLGMKMSwyLDMK"}}, 201, None, True, True, "26 weeks", None),
+        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": None}}, 201, None, True, True, "26 weeks", None),
+        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": True}}, 201, None, True, True, "26 weeks", None),
+        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": False}}, 201, None, True, True, "26 weeks", None),
         (
             {"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": "bad"}},
             400,
             "Unsupported value for is_csv: bad. Use a boolean true or false value.",
             False,
+            None,
             None,
             None,
         ),
@@ -502,6 +546,7 @@ def test_post_email_notification_returns_201(
             True,
             True,
             "26 weeks",
+            None,
         ),
         (
             {"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": True, "confirm_email_before_download": True}},
@@ -510,6 +555,7 @@ def test_post_email_notification_returns_201(
             True,
             True,
             "26 weeks",
+            None,
         ),
         (
             {"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": True, "confirm_email_before_download": False}},
@@ -518,6 +564,7 @@ def test_post_email_notification_returns_201(
             True,
             False,
             "26 weeks",
+            None,
         ),
         (
             {"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": True, "confirm_email_before_download": "potato"}},
@@ -526,15 +573,25 @@ def test_post_email_notification_returns_201(
             False,
             None,
             None,
+            None,
         ),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": None}}, 201, None, True, True, "26 weeks"),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": "1 week"}}, 201, None, True, True, "1 week"),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": "70 weeks"}}, 201, None, True, True, "70 weeks"),
+        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": None}}, 201, None, True, True, "26 weeks", None),
+        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": "1 week"}}, 201, None, True, True, "1 week", None),
+        (
+            {"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": "70 weeks"}},
+            201,
+            None,
+            True,
+            True,
+            "70 weeks",
+            None,
+        ),
         (
             {"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": "9999 weeks"}},
             400,
             "Unsupported value for retention_period: 9999 weeks",
             False,
+            None,
             None,
             None,
         ),
@@ -545,6 +602,7 @@ def test_post_email_notification_returns_201(
             False,
             None,
             None,
+            None,
         ),
         (
             {"doc": {"file": "YSxiLGMKMSwyLDMK", "retention_period": False}},
@@ -553,10 +611,38 @@ def test_post_email_notification_returns_201(
             False,
             None,
             None,
+            None,
         ),
-        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "other": "attribute"}}, 400, None, False, None, None),
-        ({"doc": {"potato": "YSxiLGMKMSwyLDMK"}}, 201, None, False, None, None),
-        ({"doc": {"potato": "YSxiLGMKMSwyLDMK", "is_csv": "cucumber"}}, 201, None, False, None, None),
+        ({"doc": {"file": "YSxiLGMKMSwyLDMK", "other": "attribute"}}, 400, None, False, None, None, None),
+        ({"doc": {"potato": "YSxiLGMKMSwyLDMK"}}, 201, None, False, None, None, None),
+        ({"doc": {"potato": "YSxiLGMKMSwyLDMK", "is_csv": "cucumber"}}, 201, None, False, None, None, None),
+        (
+            {"doc": {"file": "YSxiLGMKMSwyLDMK", "filename": "file.csv"}},
+            201,
+            None,
+            False,
+            None,
+            None,
+            "file.csv",
+        ),
+        (
+            {"doc": {"file": "YSxiLGMKMSwyLDMK", "filename": "file"}},
+            400,
+            "`filename` must end with a file extension. For example, filename.csv",
+            False,
+            None,
+            None,
+            None,
+        ),
+        (
+            {"doc": {"file": "YSxiLGMKMSwyLDMK", "is_csv": True, "filename": "file.csv"}},
+            400,
+            "Do not set a value for `is_csv` if `filename` is set.",
+            False,
+            None,
+            None,
+            None,
+        ),
     ),
 )
 def test_post_email_notification_validates_personalisation_send_a_file_values(
@@ -568,6 +654,7 @@ def test_post_email_notification_validates_personalisation_send_a_file_values(
     expect_upload,
     expected_confirmation,
     expected_retention,
+    expected_filename,
 ):
     mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
     document_download_mock = mocker.patch("app.v2.notifications.post_notifications.document_download_client")
@@ -612,6 +699,7 @@ def test_post_email_notification_validates_personalisation_send_a_file_values(
                 mocker.ANY,
                 confirmation_email=template.service.users[0].email_address if expected_confirmation else None,
                 retention_period=expected_retention,
+                filename=expected_filename,
             )
         ]
 
@@ -989,6 +1077,7 @@ def test_post_notification_with_document_upload(
             extra.get("is_csv"),
             confirmation_email=confirmation_email,
             retention_period=expect_retention_period,
+            filename=None,
         ),
         call(
             str(service.id),
@@ -996,6 +1085,7 @@ def test_post_notification_with_document_upload(
             extra.get("is_csv"),
             confirmation_email=confirmation_email,
             retention_period=expect_retention_period,
+            filename=None,
         ),
     ]
 

@@ -1,6 +1,8 @@
 import os
 from functools import partial
 
+from sentry_sdk.integrations.celery import CeleryIntegration
+
 
 def sentry_sampler(sampling_context, sample_rate: float = 0.0):
     if sampling_context["parent_sampled"]:
@@ -24,8 +26,7 @@ def init_performance_monitoring():
         send_pii = True if not_production else False
         send_request_bodies = "medium" if not_production else "never"
 
-        # Disable transaction tracing in production for now - we've seen issues with memory/performance.
-        traces_sampler = partial(sentry_sampler, sample_rate=trace_sample_rate) if not_production else None
+        traces_sampler = partial(sentry_sampler, sample_rate=trace_sample_rate)
 
         try:
             from app.version import __git_commit__
@@ -41,6 +42,10 @@ def init_performance_monitoring():
             send_default_pii=send_pii,
             request_bodies=send_request_bodies,
             traces_sampler=traces_sampler,
+            # We explicitly enable the celery integration here so that we can toggle `monitor_beat_tasks` on (default
+            # is off). This doesn't stop a number of other integrations being automatically enabled, eg Flask, Redis,
+            # SQLAlchemy.
+            integrations=[CeleryIntegration(monitor_beat_tasks=True)],
             release=release,
         )
 

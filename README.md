@@ -11,7 +11,7 @@ Contains:
 
 ### Python version
 
-We run python 3.9 both locally and in production.
+We run python 3.11 both locally and in production.
 
 ### psycopg2
 
@@ -51,15 +51,13 @@ notify-pass credentials/mmg
 
 ### Postgres
 
-Install [Postgres.app](http://postgresapp.com/).
+This app requires Postgres to run.
 
-Currently the API works with PostgreSQL 11. After installation, open the Postgres app, open the sidebar, and update or replace the default server with a compatible version.
+If you are using [notifications-local](https://github.com/alphagov/notifications-local), the correct Postgres version will be provided automatically by the docker-compose file.
 
-**Note:** you may need to add the following directory to your PATH in order to bootstrap the app.
+If you are running this app manually, you will need to manage Postgres yourself. Install [Postgres.app](http://postgresapp.com/). Check the docker-compose file above to find the correct Postgres version to use.
 
-```
-export PATH=${PATH}:/Applications/Postgres.app/Contents/Versions/11/bin/
-```
+When our unit tests are run in Concourse, Postgres is based into the container via the concourse_tests step of docker/Dockerfile.
 
 ### Redis
 

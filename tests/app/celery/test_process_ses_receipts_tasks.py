@@ -3,7 +3,7 @@ from datetime import datetime
 
 from freezegun import freeze_time
 
-from app import encryption, statsd_client
+from app import signing, statsd_client
 from app.celery.process_ses_receipts_tasks import process_ses_results
 from app.celery.research_mode_tasks import (
     ses_hard_bounce_callback,
@@ -130,7 +130,6 @@ def test_ses_callback_should_not_retry_if_notification_is_old(client, notify_db_
 def test_ses_callback_should_update_multiple_notification_status_sent(
     client, notify_db_session, sample_email_template, mocker
 ):
-
     send_mock = mocker.patch("app.celery.process_ses_receipts_tasks.check_and_queue_callback_task")
     create_notification(
         template=sample_email_template,
@@ -209,7 +208,7 @@ def test_ses_callback_should_send_on_complaint_to_user_callback_api(sample_email
     assert process_ses_results(response)
 
     assert send_mock.call_count == 1
-    assert encryption.decrypt(send_mock.call_args[0][0][0]) == {
+    assert signing.decode(send_mock.call_args[0][0][0]) == {
         "complaint_date": "2018-06-05T13:59:58.000000Z",
         "complaint_id": str(Complaint.query.one().id),
         "notification_id": str(notification.id),

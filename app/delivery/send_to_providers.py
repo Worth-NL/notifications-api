@@ -87,6 +87,8 @@ def send_sms_to_provider(notification):
             else:
                 notification.billable_units = template.fragment_count
                 update_notification_to_sending(notification, provider)
+                if notification.international:
+                    statsd_client.incr(f"international-sms.{NOTIFICATION_SENT}.{notification.phone_prefix}")
 
         delta_seconds = (datetime.utcnow() - created_at).total_seconds()
         statsd_client.timing("sms.total-time", delta_seconds)
@@ -126,8 +128,9 @@ def send_email_to_provider(notification):
             update_notification_to_sending(notification, provider)
             send_email_response(notification.reference, notification.to)
         else:
-            from_address = '"{}" <{}@{}>'.format(
-                service.name, service.email_from, current_app.config["NOTIFY_EMAIL_DOMAIN"]
+            email_sender_name = service.custom_email_sender_name or service.name
+            from_address = (
+                f'"{email_sender_name}" <{service.email_sender_local_part}@{current_app.config["NOTIFY_EMAIL_DOMAIN"]}>'
             )
 
             reference = provider.send_email(
@@ -187,16 +190,15 @@ def get_logo_url(base_url, logo_file):
     base_url = parse.urlparse(base_url)
     # netloc = base_url.netloc
 
-    # if base_url.netloc.startswith("localhost"):
-    #     netloc = "notify.tools"
-    # elif base_url.netloc.startswith("www"):
-    #     # strip "www."
-    #     netloc = base_url.netloc[4:]
+    if base_url.hostname.split(".")[-1] == "localhost":
+        netloc = "notify.tools"
+    elif base_url.netloc.startswith("www"):
+        # strip "www."
+        netloc = base_url.netloc[4:]
 
     logo_url = parse.ParseResult(
         scheme=base_url.scheme,
-        # netloc="static-logos." + netloc,
-        netloc=current_app.config["LOGO_CDN_DOMAIN"],
+        netloc="static-logos." + netloc,
         path=logo_file,
         params=base_url.params,
         query=base_url.query,

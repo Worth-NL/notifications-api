@@ -2,11 +2,13 @@ import pytest
 from marshmallow import ValidationError
 from sqlalchemy import desc
 
+from app.constants import COMPLAINT_CALLBACK_TYPE, DELIVERY_STATUS_CALLBACK_TYPE
 from app.dao.provider_details_dao import (
     dao_update_provider_details,
     get_provider_details_by_identifier,
 )
-from app.models import ProviderDetailsHistory
+from app.dao.service_callback_api_dao import save_service_callback_api
+from app.models import ProviderDetailsHistory, ServiceCallbackApi
 from tests.app.db import create_api_key
 
 
@@ -38,10 +40,22 @@ def test_notification_schema_adds_api_key_name(sample_notification):
     assert data["key_name"] == "Test key"
 
 
+def test_notification_schema_includes_templates_bilingual_related_fields(sample_letter_notification):
+    from app.schemas import notification_with_template_schema
+
+    sample_letter_notification.template.letter_languages = "welsh_then_english"
+    sample_letter_notification.template.letter_welsh_subject = "Bore da"
+    sample_letter_notification.template.letter_welsh_content = "Cymraeg da"
+
+    data = notification_with_template_schema.dump(sample_letter_notification)
+    assert data["template"]["letter_languages"] == "welsh_then_english"
+    assert data["template"]["letter_welsh_subject"] == "Bore da"
+    assert data["template"]["letter_welsh_content"] == "Cymraeg da"
+
+
 @pytest.mark.parametrize(
     "schema_name",
     [
-        "notification_with_template_schema",
         "notification_schema",
         "notification_with_template_schema",
         "notification_with_personalisation_schema",
@@ -137,3 +151,29 @@ def test_provider_details_history_schema_returns_user_details(
     data = provider_details_schema.dump(current_sms_provider_in_history)
 
     assert sorted(data["created_by"].keys()) == sorted(["id", "email_address", "name"])
+
+
+def test_service_schema_only_returns_delivery_status_callback_api(sample_service):
+    from app.schemas import service_schema
+
+    service_delivery_callback_api = ServiceCallbackApi(
+        service_id=sample_service.id,
+        url="https://some_service/delivery_callback_endpoint",
+        bearer_token="delivery_unique_string",
+        updated_by_id=sample_service.users[0].id,
+        callback_type=DELIVERY_STATUS_CALLBACK_TYPE,
+    )
+    save_service_callback_api(service_delivery_callback_api)
+
+    service_complaint_callback_api = ServiceCallbackApi(
+        service_id=sample_service.id,
+        url="https://some_service/complaint_callback_endpoint",
+        bearer_token="complaint_unique_string",
+        updated_by_id=sample_service.users[0].id,
+        callback_type=COMPLAINT_CALLBACK_TYPE,
+    )
+    save_service_callback_api(service_complaint_callback_api)
+
+    data = service_schema.dump(sample_service)
+
+    assert data["service_callback_api"] == [str(service_delivery_callback_api.id)]

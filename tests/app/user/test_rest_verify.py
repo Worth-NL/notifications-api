@@ -94,7 +94,7 @@ def test_user_verify_code_rejects_good_code_if_too_many_failed_logins(
 
 @freeze_time("2020-04-01 12:00")
 @pytest.mark.parametrize("code_type", [EMAIL_TYPE, SMS_TYPE])
-def test_user_verify_code_expired_code_and_increments_failed_login_count(code_type, admin_request, sample_user):
+def test_user_verify_code_expired_code_and_increments_failed_login_count(code_type, admin_request, sample_user, caplog):
     magic_code = str(uuid.uuid4())
     verify_code = create_user_code(sample_user, magic_code, code_type)
     verify_code.expiry_datetime = datetime(2020, 4, 1, 11, 59)
@@ -107,6 +107,7 @@ def test_user_verify_code_expired_code_and_increments_failed_login_count(code_ty
     assert sample_user.logged_in_at is None
     assert sample_user.current_session_id is None
     assert sample_user.failed_login_count == 1
+    assert f"Rejecting 2fa code for {sample_user.id} because expired=True, used=False" in caplog.messages
 
 
 @freeze_time("2016-01-01 10:00:00.000000")
@@ -278,7 +279,7 @@ def test_send_sms_code_returns_204_when_too_many_codes_already_created(client, s
     (
         (
             {},
-            "http://localhost",
+            "{hostnames.admin}",
         ),
         (
             {"admin_base_url": "https://example.com"},
@@ -293,6 +294,7 @@ def test_send_new_user_email_verification(
     email_verification_template,
     post_data,
     expected_url_starts_with,
+    hostnames,
 ):
     mocked = mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
     auth_header = create_admin_authorization_header()
@@ -308,7 +310,7 @@ def test_send_new_user_email_verification(
     mocked.assert_called_once_with(([str(notification.id)]), queue="notify-internal-tasks")
     assert notification.reply_to_text == notify_service.get_default_reply_to_email_address()
     assert notification.personalisation["name"] == "Test User"
-    assert notification.personalisation["url"].startswith(expected_url_starts_with)
+    assert notification.personalisation["url"].startswith(expected_url_starts_with.format(hostnames=hostnames))
 
 
 def test_send_email_verification_returns_404_for_bad_input_data(client, notify_db_session, mocker):
@@ -328,7 +330,9 @@ def test_send_email_verification_returns_404_for_bad_input_data(client, notify_d
     assert mocked.call_count == 0
 
 
-def test_user_verify_user_code_returns_404_when_code_is_right_but_user_account_is_locked(client, sample_sms_code):
+def test_user_verify_user_code_returns_404_when_code_is_right_but_user_account_is_locked(
+    client, sample_sms_code, caplog
+):
     sample_sms_code.user.failed_login_count = 10
     data = json.dumps({"code_type": sample_sms_code.code_type, "code": sample_sms_code.txt_code})
     resp = client.post(
@@ -339,6 +343,7 @@ def test_user_verify_user_code_returns_404_when_code_is_right_but_user_account_i
     assert resp.status_code == 404
     assert sample_sms_code.user.failed_login_count == 10
     assert not sample_sms_code.code_used
+    assert f"Too many login attempts for {sample_sms_code.user.id}: 10 attempts >= limit of 10" in caplog.messages
 
 
 def test_user_verify_user_code_valid_code_resets_failed_login_count(client, sample_sms_code):
@@ -381,11 +386,11 @@ def test_reset_failed_login_count_returns_404_when_user_does_not_exist(client):
     (
         (
             {},
-            "http://localhost:6012/email-auth/%2E",
+            "{hostnames.admin}/email-auth/%2E",
         ),
         (
             {"to": None},
-            "http://localhost:6012/email-auth/%2E",
+            "{hostnames.admin}/email-auth/%2E",
         ),
         (
             {"to": None, "email_auth_link_host": "https://example.com"},
@@ -394,7 +399,7 @@ def test_reset_failed_login_count_returns_404_when_user_does_not_exist(client):
     ),
 )
 def test_send_user_email_code(
-    admin_request, mocker, sample_user, email_2fa_code_template, data, expected_auth_url, auth_type
+    admin_request, mocker, sample_user, email_2fa_code_template, data, expected_auth_url, auth_type, hostnames
 ):
     deliver_email = mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
     sample_user.auth_type = auth_type
@@ -407,7 +412,7 @@ def test_send_user_email_code(
     assert noti.to == sample_user.email_address
     assert str(noti.template_id) == current_app.config["EMAIL_2FA_TEMPLATE_ID"]
     assert noti.personalisation["name"] == "Test User"
-    assert noti.personalisation["url"].startswith(expected_auth_url)
+    assert noti.personalisation["url"].startswith(expected_auth_url.format(hostnames=hostnames))
     deliver_email.assert_called_once_with([str(noti.id)], queue="notify-internal-tasks")
 
 

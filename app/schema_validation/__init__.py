@@ -12,6 +12,8 @@ from notifications_utils.recipients import (
     validate_phone_number,
 )
 
+from app.notifications.validators import remap_phone_number_validation_messages
+
 format_checker = FormatChecker()
 
 
@@ -25,7 +27,10 @@ def validate_uuid(instance):
 @format_checker.checks("phone_number", raises=InvalidPhoneError)
 def validate_schema_phone_number(instance):
     if isinstance(instance, str):
-        validate_phone_number(instance, international=True)
+        try:
+            validate_phone_number(instance, international=True)
+        except InvalidPhoneError as error:
+            raise InvalidPhoneError(remap_phone_number_validation_messages(str(error))) from error
     return True
 
 
@@ -77,6 +82,18 @@ def validate_schema_retention_period(instance):
     )
 
 
+@format_checker.checks("send_a_file_filename", raises=ValidationError)
+def validate_send_a_file_filename(instance):
+    if instance is None:
+        return True
+
+    if isinstance(instance, str):
+        if "." in instance:
+            return True
+
+    raise ValidationError("`filename` must end with a file extension. For example, filename.csv")
+
+
 @format_checker.checks("send_a_file_is_csv", raises=ValidationError)
 def send_a_file_is_csv(instance):
     if instance is None or isinstance(instance, bool):
@@ -120,7 +137,7 @@ def build_error_message(errors):
     fields = []
     for e in errors:
         field = (
-            "{} {}".format(e.path[0], e.schema["validationMessage"])
+            "{} {}".format(e.path[0] if e.path else "", e.schema["validationMessage"]).strip()
             if "validationMessage" in e.schema
             else __format_message(e)
         )

@@ -85,6 +85,7 @@ def test_cancel_letter_job_updates_notifications_and_job_to_cancelled(sample_let
         "app.job.rest.can_letter_job_be_cancelled", return_value=(True, None)
     )
     mock_dao_cancel_letter_job = mocker.patch("app.job.rest.dao_cancel_letter_job", return_value=1)
+    mock_update_redis = mocker.patch("app.job.rest.adjust_daily_service_limits_for_cancelled_letters")
 
     response = admin_request.post(
         "job.cancel_letter_job",
@@ -95,6 +96,7 @@ def test_cancel_letter_job_updates_notifications_and_job_to_cancelled(sample_let
     mock_get_job.assert_called_once_with(job.service_id, str(job.id))
     mock_can_letter_job_be_cancelled.assert_called_once_with(job)
     mock_dao_cancel_letter_job.assert_called_once_with(job)
+    mock_update_redis.assert_called_once_with(job.service_id, 1, datetime(2019, 6, 13, 13, 0))
 
     assert response == 1
 
@@ -113,6 +115,7 @@ def test_cancel_letter_job_does_not_call_cancel_if_can_letter_job_be_cancelled_r
         "app.job.rest.can_letter_job_be_cancelled", return_value=(False, error_message)
     )
     mock_dao_cancel_letter_job = mocker.patch("app.job.rest.dao_cancel_letter_job")
+    mock_update_redis = mocker.patch("app.job.rest.adjust_daily_service_limits_for_cancelled_letters")
 
     response = admin_request.post(
         "job.cancel_letter_job", service_id=job.service_id, job_id=job.id, _expected_status=400
@@ -120,6 +123,7 @@ def test_cancel_letter_job_does_not_call_cancel_if_can_letter_job_be_cancelled_r
 
     mock_get_job.assert_called_once_with(job.service_id, str(job.id))
     mock_can_letter_job_be_cancelled.assert_called_once_with(job)
+    assert not mock_update_redis.called
     assert mock_dao_cancel_letter_job.call_count == 0
 
     assert response["message"] == "Sorry, it's too late, letters have already been sent."
@@ -349,8 +353,8 @@ def test_create_job_returns_403_if_letter_template_type_and_service_in_trial(
 
 
 @freeze_time("2016-01-01 11:09:00.061258")
-def test_should_not_create_scheduled_job_more_then_96_hours_in_the_future(client, sample_template, mocker, fake_uuid):
-    scheduled_date = (datetime.utcnow() + timedelta(hours=96, minutes=1)).isoformat()
+def test_should_not_create_scheduled_job_more_then_7_days_in_the_future(client, sample_template, mocker, fake_uuid):
+    scheduled_date = (datetime.utcnow() + timedelta(days=7, minutes=1)).isoformat()
     mocker.patch("app.celery.tasks.process_job.apply_async")
     mocker.patch(
         "app.job.rest.get_job_metadata_from_s3",
@@ -378,7 +382,7 @@ def test_should_not_create_scheduled_job_more_then_96_hours_in_the_future(client
     resp_json = json.loads(response.get_data(as_text=True))
     assert resp_json["result"] == "error"
     assert "scheduled_for" in resp_json["message"]
-    assert resp_json["message"]["scheduled_for"] == ["Date cannot be more than 96hrs in the future"]
+    assert resp_json["message"]["scheduled_for"] == ["Date cannot be more than 7 days in the future"]
 
 
 @freeze_time("2016-01-01 11:09:00.061258")
@@ -874,6 +878,7 @@ def test_get_all_notifications_for_job_returns_csv_format(admin_request, sample_
         "row_number",
         "recipient",
         "client_reference",
+        "api_key_name",
     }
 
 
@@ -914,7 +919,6 @@ def test_get_jobs_should_retrieve_from_ft_notification_status_for_old_jobs(admin
 
 @freeze_time("2017-07-17 07:17")
 def test_get_scheduled_job_stats_when_no_scheduled_jobs(admin_request, sample_template):
-
     # This sets up a bunch of regular, non-scheduled jobs
     _setup_jobs(sample_template)
 
@@ -929,7 +933,6 @@ def test_get_scheduled_job_stats_when_no_scheduled_jobs(admin_request, sample_te
 
 @freeze_time("2017-07-17 07:17")
 def test_get_scheduled_job_stats(admin_request):
-
     service_1 = create_service(service_name="service 1")
     service_1_template = create_template(service=service_1)
     service_2 = create_service(service_name="service 2")
@@ -947,12 +950,18 @@ def test_get_scheduled_job_stats(admin_request):
     # Should be counted – service 2
     create_job(service_2_template, job_status="scheduled", scheduled_for="2017-07-17 11:00")
 
-    assert admin_request.get("job.get_scheduled_job_stats", service_id=service_1.id,) == {
+    assert admin_request.get(
+        "job.get_scheduled_job_stats",
+        service_id=service_1.id,
+    ) == {
         "count": 3,
         "soonest_scheduled_for": "2017-07-17T09:00:00+00:00",
     }
 
-    assert admin_request.get("job.get_scheduled_job_stats", service_id=service_2.id,) == {
+    assert admin_request.get(
+        "job.get_scheduled_job_stats",
+        service_id=service_2.id,
+    ) == {
         "count": 1,
         "soonest_scheduled_for": "2017-07-17T11:00:00+00:00",
     }

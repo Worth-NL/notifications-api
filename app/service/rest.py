@@ -28,7 +28,6 @@ from app.dao.api_key_dao import (
     get_unsigned_secret,
     save_model_api_key,
 )
-from app.dao.broadcast_service_dao import set_broadcast_service_type
 from app.dao.dao_utils import dao_rollback, transaction
 from app.dao.date_util import get_financial_year
 from app.dao.fact_notification_status_dao import (
@@ -101,7 +100,7 @@ from app.dao.services_dao import (
 from app.dao.templates_dao import dao_get_template_by_id
 from app.dao.users_dao import get_user_by_id
 from app.errors import InvalidRequest, register_errors
-from app.letters.utils import letter_print_day
+from app.letters.utils import adjust_daily_service_limits_for_cancelled_letters, letter_print_day
 from app.models import (
     EmailBranding,
     LetterBranding,
@@ -129,9 +128,6 @@ from app.service.send_notification import (
 )
 from app.service.send_pdf_letter_schema import send_pdf_letter_request
 from app.service.sender import send_notification_to_service_users
-from app.service.service_broadcast_settings_schema import (
-    service_broadcast_settings_schema,
-)
 from app.service.service_contact_list_schema import (
     create_service_contact_list_schema,
 )
@@ -165,16 +161,13 @@ def handle_integrity_error(exc):
     """
     if any(
         'duplicate key value violates unique constraint "{}"'.format(constraint) in str(exc)
-        for constraint in {"services_name_key", "services_email_from_key"}
+        for constraint in {"services_name_key", "services_normalised_service_name_key"}
     ):
+        duplicate_name = exc.params.get("name") or exc.params.get("normalised_service_name")
         return (
             jsonify(
                 result="error",
-                message={
-                    "name": [
-                        "Duplicate service name '{}'".format(exc.params.get("name", exc.params.get("email_from", "")))
-                    ]
-                },
+                message={"name": [f"Duplicate service name '{duplicate_name}'"]},
             ),
             400,
         )
@@ -280,6 +273,7 @@ def update_service(service_id):
     fetched_service = dao_fetch_service_by_id(service_id)
     # Capture the status change here as Marshmallow changes this later
     service_going_live = fetched_service.restricted and not req_json.get("restricted", True)
+
     current_data = dict(service_schema.dump(fetched_service).items())
     current_data.update(request.get_json())
 
@@ -291,6 +285,7 @@ def update_service(service_id):
     if "letter_branding" in req_json:
         letter_branding_id = req_json["letter_branding"]
         service.letter_branding = None if not letter_branding_id else LetterBranding.query.get(letter_branding_id)
+
     dao_update_service(service)
 
     if service_going_live:
@@ -499,7 +494,6 @@ def get_all_notifications_for_service(service_id):
 
 @service_blueprint.route("/<uuid:service_id>/notifications/<uuid:notification_id>", methods=["GET"])
 def get_notification_for_service(service_id, notification_id):
-
     notification = notifications_dao.get_notification_with_personalisation(
         service_id,
         notification_id,
@@ -538,6 +532,7 @@ def cancel_notification_for_service(service_id, notification_id):
         notification_id,
         NOTIFICATION_CANCELLED,
     )
+    adjust_daily_service_limits_for_cancelled_letters(service_id, 1, notification.created_at)
 
     return jsonify(notification_with_template_schema.dump(updated_notification)), 200
 
@@ -633,7 +628,6 @@ def get_detailed_services(start_date, end_date, only_active=False, include_from_
             include_from_test_key=include_from_test_key, only_active=only_active
         )
     else:
-
         stats = fetch_stats_for_all_services_by_date_range(
             start_date=start_date,
             end_date=end_date,
@@ -992,13 +986,12 @@ def check_if_reply_to_address_already_in_use(service_id, email_address):
     existing_reply_to_addresses = dao_get_reply_to_by_service_id(service_id)
     if email_address in [i.email_address for i in existing_reply_to_addresses]:
         raise InvalidRequest(
-            "Your service already uses ‘{}’ as an email reply-to address.".format(email_address), status_code=409
+            f"‘{email_address}’ is already a reply-to email address for this service.", status_code=409
         )
 
 
 @service_blueprint.route("/<uuid:service_id>/returned-letter-statistics", methods=["GET"])
 def returned_letter_statistics(service_id):
-
     most_recent = fetch_most_recent_returned_letter(service_id)
 
     if not most_recent:
@@ -1106,28 +1099,3 @@ def create_contact_list(service_id):
     save_service_contact_list(list_to_save)
 
     return jsonify(list_to_save.serialize()), 201
-
-
-@service_blueprint.route("/<uuid:service_id>/set-as-broadcast-service", methods=["POST"])
-def set_as_broadcast_service(service_id):
-    """
-    This route does the following
-    - adds a service broadcast settings to define which channel broadcasts should go out on
-    - removes all current service permissions and adds the broadcast service permission
-    - sets the services `count_as_live` to false
-    - adds the service to the broadcast organisation
-    - puts the service into training mode or live mode
-    - removes all permissions from current users and invited users
-    """
-    data = validate(request.get_json(), service_broadcast_settings_schema)
-    service = dao_fetch_service_by_id(service_id)
-
-    set_broadcast_service_type(
-        service,
-        service_mode=data["service_mode"],
-        broadcast_channel=data["broadcast_channel"],
-        provider_restriction=data["provider_restriction"],
-    )
-
-    data = service_schema.dump(service)
-    return jsonify(data=data)

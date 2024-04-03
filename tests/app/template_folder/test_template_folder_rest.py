@@ -10,6 +10,7 @@ from tests.app.db import (
     create_template_folder,
     create_user,
 )
+from tests.utils import QueryRecorder
 
 
 def test_get_folders_for_service(admin_request, notify_db_session):
@@ -69,6 +70,30 @@ def test_get_folders_returns_users_with_permission(admin_request, sample_service
     assert len(users_with_permission) == 2
     assert str(user_1.id) in users_with_permission
     assert str(user_2.id) in users_with_permission
+
+
+def test_get_folders_returns_users_with_permission_does_not_do_n_plus_1_sql_queries(
+    admin_request, sample_service, notify_db_session
+):
+    users = [create_user(email=f"user-{_}@gov.uk") for _ in range(10)]
+    template_folders = [create_template_folder(sample_service) for _ in range(25)]
+    sample_service.users = users
+
+    service_users = [dao_get_service_user(user.id, sample_service.id) for user in users]
+    for service_user in service_users:
+        service_user.folders = template_folders
+
+    service_id = sample_service.id
+    notify_db_session.commit()
+
+    with QueryRecorder() as query_recorder:
+        resp = admin_request.get("template_folder.get_template_folders_for_service", service_id=service_id)
+
+    users_with_permission = resp["template_folders"][0]["users_with_permission"]
+
+    assert len(users_with_permission) == 10
+    assert all([str(user.id) in users_with_permission for user in users])
+    assert len(query_recorder.queries) == 3
 
 
 @pytest.mark.parametrize("has_parent", [True, False])

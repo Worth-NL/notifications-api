@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import groupby
 from operator import attrgetter
@@ -21,7 +22,7 @@ from sqlalchemy.sql import functions
 from sqlalchemy.sql.expression import case
 from werkzeug.datastructures import MultiDict
 
-from app import create_uuid, db, statsd_client
+from app import create_uuid, db
 from app.clients.sms.firetext import (
     get_message_status_and_reason_from_firetext_code,
 )
@@ -267,8 +268,11 @@ def get_notifications_for_service(
 
     query = Notification.query.filter(*filters)
     query = _filter_query(query, filter_dict)
+
     if personalisation:
         query = query.options(joinedload("template"))
+
+    query = query.options(joinedload("api_key"))
 
     return query.order_by(desc(Notification.created_at)).paginate(
         page=page,
@@ -473,21 +477,28 @@ def is_delivery_slow_for_providers(
     sent in the last `created_within_minutes` minutes took over
     `delivered_within_minutes` minutes to be delivered
     """
-    providers_slow_delivery_ratios = get_ratio_of_messages_delivered_slowly_per_provider(
+    providers_slow_delivery_reports = get_slow_text_message_delivery_reports_by_provider(
         created_within_minutes, delivered_within_minutes
     )
 
     slow_providers = {}
-    for provider, ratio in providers_slow_delivery_ratios.items():
-        slow_providers[provider] = ratio >= threshold
-        # TODO: when we are happy with the new metrics in generate_sms_delivery_stats then this
-        # can be removed as it will be redundant
-        statsd_client.gauge(f"slow-delivery.{provider}.ratio", ratio)
+    for report in providers_slow_delivery_reports:
+        slow_providers[report.provider] = report.slow_ratio >= threshold
 
     return slow_providers
 
 
-def get_ratio_of_messages_delivered_slowly_per_provider(created_within_minutes, delivered_within_minutes):
+@dataclass
+class SlowProviderDeliveryReport:
+    provider: str
+    slow_ratio: float
+    slow_notifications: int
+    total_notifications: int
+
+
+def get_slow_text_message_delivery_reports_by_provider(
+    created_within_minutes, delivered_within_minutes
+) -> list[SlowProviderDeliveryReport]:
     """
     Returns a dict of providers with the ratio of their messages sent in the
     last `created_within_minutes` minutes that took over
@@ -531,14 +542,21 @@ def get_ratio_of_messages_delivered_slowly_per_provider(created_within_minutes, 
         .group_by(ProviderDetails.identifier, "slow")
     )
 
-    providers_slow_delivery_ratios = {}
+    providers_slow_delivery_reports = []
     for provider, rows in groupby(slow_notification_counts, key=attrgetter("identifier")):
         rows = list(rows)
         total_notifications = sum(row.count for row in rows)
         slow_notifications = sum(row.count for row in rows if row.slow)
-        providers_slow_delivery_ratios[provider] = slow_notifications / total_notifications
+        providers_slow_delivery_reports.append(
+            SlowProviderDeliveryReport(
+                provider=provider,
+                slow_ratio=slow_notifications / total_notifications,
+                slow_notifications=slow_notifications,
+                total_notifications=total_notifications,
+            )
+        )
 
-    return providers_slow_delivery_ratios
+    return providers_slow_delivery_reports
 
 
 @autocommit
@@ -565,7 +583,6 @@ def dao_get_notifications_by_recipient_or_reference(
     page_size=None,
     error_out=True,
 ):
-
     if notification_type == SMS_TYPE:
         normalised = try_validate_and_format_phone_number(search_term)
 
@@ -687,9 +704,8 @@ def notifications_not_yet_sent(should_be_sending_after_seconds, notification_typ
 def dao_get_letters_to_be_printed(print_run_deadline_local, postage, query_limit=10000):
     """
     Return all letters created before the print run deadline that have not yet been sent. This yields in batches of 10k
-    to prevent the query taking too long and eating up too much memory. As each 10k batch is yielded, the
-    get_key_and_size_of_letters_to_be_sent_to_print function will go and fetch the s3 data, andhese  start sending off
-    tasks to the notify-ftp app to send them.
+    to prevent the query taking too long and eating up too much memory. As each 10k batch is yielded, we'll start
+    sending off to the DVLA via https
 
     CAUTION! Modify this query with caution. Modifying filters etc is fine, but if we join onto another table, then
     there may be undefined behaviour. Essentially we need each ORM object returned for each row to be unique,
@@ -771,11 +787,11 @@ def letters_missing_from_sending_bucket(seconds_to_subtract):
 
 
 def dao_precompiled_letters_still_pending_virus_check():
-    ninety_minutes_ago = datetime.utcnow() - timedelta(seconds=5400)
+    ten_minutes_ago = datetime.utcnow() - timedelta(seconds=600)
 
     notifications = (
         Notification.query.filter(
-            Notification.created_at < ninety_minutes_ago, Notification.status == NOTIFICATION_PENDING_VIRUS_CHECK
+            Notification.created_at < ten_minutes_ago, Notification.status == NOTIFICATION_PENDING_VIRUS_CHECK
         )
         .order_by(Notification.created_at)
         .all()

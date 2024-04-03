@@ -1,7 +1,7 @@
 import datetime
 import enum
-import itertools
 import uuid
+from typing import Union
 
 from flask import current_app, url_for
 from notifications_utils.insensitive_dict import InsensitiveDict
@@ -16,8 +16,8 @@ from notifications_utils.recipients import (
     validate_email_address,
     validate_phone_number,
 )
+from notifications_utils.safe_string import make_string_safe_for_email_local_part
 from notifications_utils.template import (
-    BroadcastMessageTemplate,
     LetterPrintTemplate,
     PlainTextEmailTemplate,
     SMSMessageTemplate,
@@ -38,7 +38,7 @@ from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm.collections import attribute_mapped_collection
 from sqlalchemy.schema import Sequence
 
-from app import db, encryption
+from app import db, signing
 from app.constants import (
     ALL_BROADCAST_PROVIDERS,
     BRANDING_ORG,
@@ -67,6 +67,7 @@ from app.constants import (
     SMS_TYPE,
     TEMPLATE_TYPES,
     VERIFY_CODE_TYPES,
+    LetterLanguageOptions,
     OrganisationUserPermissionTypes,
 )
 from app.hashing import check_hash, hashpw
@@ -81,23 +82,6 @@ from app.utils import (
 
 def filter_null_value_fields(obj):
     return dict(filter(lambda x: x[1] is not None, obj.items()))
-
-
-class HistoryModel:
-    @classmethod
-    def from_original(cls, original):
-        history = cls()
-        history.update_from_original(original)
-        return history
-
-    def update_from_original(self, original):
-        for c in self.__table__.columns:
-            # in some cases, columns may have different names to their underlying db column -  so only copy those
-            # that we can, and leave it up to subclasses to deal with any oddities/properties etc.
-            if hasattr(original, c.name):
-                setattr(self, c.name, getattr(original, c.name))
-            else:
-                current_app.logger.debug("%s has no column %s to copy from", original, c.name)
 
 
 guest_list_recipient_types = db.Enum(*GUEST_LIST_RECIPIENT_TYPE, name="recipient_type")
@@ -531,7 +515,13 @@ class Service(db.Model, Versioned):
     __tablename__ = "services"
 
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = db.Column(db.String(255), nullable=False, unique=True)
+    _name = db.Column("name", db.String(255), nullable=False, unique=True)
+
+    # this isn't intended to be accessed, just used for checking service name uniqueness. See `email_sender_local_part`
+    _normalised_service_name = db.Column("normalised_service_name", db.String, nullable=False, unique=True)
+    _custom_email_sender_name = db.Column("custom_email_sender_name", db.String(255), nullable=True)
+    _email_sender_local_part = db.Column("email_sender_local_part", db.String(255), nullable=False)
+
     created_at = db.Column(db.DateTime, index=False, unique=False, nullable=False, default=datetime.datetime.utcnow)
     updated_at = db.Column(db.DateTime, index=False, unique=False, nullable=True, onupdate=datetime.datetime.utcnow)
     active = db.Column(db.Boolean, index=False, unique=False, nullable=False, default=True)
@@ -539,7 +529,6 @@ class Service(db.Model, Versioned):
     sms_message_limit = db.Column(db.BigInteger, index=False, unique=False, nullable=False, default=999_999_999)
     email_message_limit = db.Column(db.BigInteger, index=False, unique=False, nullable=False, default=999_999_999)
     restricted = db.Column(db.Boolean, index=False, unique=False, nullable=False)
-    email_from = db.Column(db.Text, index=False, unique=True, nullable=False)
     created_by_id = db.Column(UUID(as_uuid=True), db.ForeignKey("users.id"), index=True, nullable=False)
     created_by = db.relationship("User", foreign_keys=[created_by_id])
     prefix_sms = db.Column(db.Boolean, nullable=False, default=True)
@@ -583,6 +572,43 @@ class Service(db.Model, Versioned):
 
     allowed_broadcast_provider = association_proxy("service_broadcast_settings", "provider")
     broadcast_channel = association_proxy("service_broadcast_settings", "channel")
+
+    @hybrid_property  # a hybrid_property enables us to still use it in queries
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = value
+        self._normalised_service_name = make_string_safe_for_email_local_part(value)
+
+        # if the service hasn't set their own sender, update their sender to reflect normalised_service_name
+        if not self.custom_email_sender_name:
+            self._email_sender_local_part = self._normalised_service_name
+
+    @hybrid_property  # a hybrid_property enables us to still use it in queries
+    def custom_email_sender_name(self):
+        return self._custom_email_sender_name
+
+    @custom_email_sender_name.setter
+    def custom_email_sender_name(self, value):
+        self._custom_email_sender_name = value
+        # if value is None, then we're clearing custom sender name, so set the local part based on service name
+        self._email_sender_local_part = make_string_safe_for_email_local_part(value or self.name)
+
+    @hybrid_property
+    def email_sender_local_part(self):
+        return self._email_sender_local_part
+
+    @email_sender_local_part.setter
+    def email_sender_local_part(self, value):
+        # we can't allow this to be set manually.
+        # Imagine we've updated just `custom_email_sender_name` via a serialised json blob. When that is set, it will
+        # also update the value of email_sender_local_part. We don't want to then undo that good work by setting to the
+        # old value (that was also passed through in the json to `service_schema.load``).
+        raise NotImplementedError(
+            "email_sender_local_part can only be written to via `custom_email_sender_name` or `name`"
+        )
 
     @classmethod
     def from_json(cls, data):
@@ -824,13 +850,13 @@ class ServiceInboundApi(db.Model, Versioned):
     @property
     def bearer_token(self):
         if self._bearer_token:
-            return encryption.decrypt(self._bearer_token)
+            return signing.decode(self._bearer_token)
         return None
 
     @bearer_token.setter
     def bearer_token(self, bearer_token):
         if bearer_token:
-            self._bearer_token = encryption.encrypt(str(bearer_token))
+            self._bearer_token = signing.encode(str(bearer_token))
 
     def serialize(self):
         return {
@@ -861,13 +887,13 @@ class ServiceCallbackApi(db.Model, Versioned):
     @property
     def bearer_token(self):
         if self._bearer_token:
-            return encryption.decrypt(self._bearer_token)
+            return signing.decode(self._bearer_token)
         return None
 
     @bearer_token.setter
     def bearer_token(self, bearer_token):
         if bearer_token:
-            self._bearer_token = encryption.encrypt(str(bearer_token))
+            self._bearer_token = signing.encode(str(bearer_token))
 
     def serialize(self):
         return {
@@ -908,13 +934,13 @@ class ApiKey(db.Model, Versioned):
     @property
     def secret(self):
         if self._secret:
-            return encryption.decrypt(self._secret)
+            return signing.decode(self._secret)
         return None
 
     @secret.setter
     def secret(self, secret):
         if secret:
-            self._secret = encryption.encrypt(str(secret))
+            self._secret = signing.encode(str(secret))
 
 
 class KeyTypes(db.Model):
@@ -980,6 +1006,13 @@ template_folder_map = db.Table(
 )
 
 
+def letter_languages_default(context):
+    if context.get_current_parameters()["template_type"] == LETTER_TYPE:
+        return LetterLanguageOptions.english
+    else:
+        return None
+
+
 class TemplateBase(db.Model):
     __abstract__ = True
 
@@ -989,6 +1022,8 @@ class TemplateBase(db.Model):
 
         super().__init__(**kwargs)
 
+    # WARNING: if we add a new column here, we must add it to templates_dao.py dao_update_template_reply_to
+    # TODO: remove dao_update_template_reply_to and make `dao_update_template` just work
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = db.Column(db.String(255), nullable=False)
     template_type = db.Column(template_types, nullable=False)
@@ -1000,6 +1035,16 @@ class TemplateBase(db.Model):
     subject = db.Column(db.Text)
     postage = db.Column(db.String, nullable=True)
     broadcast_data = db.Column(JSONB(none_as_null=True), nullable=True)
+
+    letter_welsh_content = db.Column(db.Text)
+    letter_welsh_subject = db.Column(db.Text)
+    letter_languages = db.Column(
+        db.Enum(LetterLanguageOptions, name="letter_language_options"),
+        index=False,
+        unique=False,
+        nullable=True,
+        default=letter_languages_default,
+    )
 
     @declared_attr
     def service_id(cls):
@@ -1043,6 +1088,10 @@ class TemplateBase(db.Model):
                 "template_type = 'letter' OR letter_attachment_id IS NULL",
                 name=f"ck_{cls.__tablename__}_letter_attachments",
             ),
+            CheckConstraint(
+                "(template_type != 'letter' AND letter_languages IS NULL) OR"
+                " (template_type = 'letter' AND letter_languages IS NOT NULL)"
+            ),
         )
 
     @property
@@ -1085,7 +1134,7 @@ class TemplateBase(db.Model):
         if self.template_type == SMS_TYPE:
             return SMSMessageTemplate(self.__dict__)
         if self.template_type == BROADCAST_TYPE:
-            return BroadcastMessageTemplate(self.__dict__)
+            return SMSMessageTemplate(self.__dict__ | {"template_type": "sms"})
         if self.template_type == LETTER_TYPE:
             return LetterPrintTemplate(
                 self.__dict__,
@@ -1211,7 +1260,7 @@ class ProviderDetails(db.Model):
     supports_international = db.Column(db.Boolean, nullable=False, default=False)
 
 
-class ProviderDetailsHistory(db.Model, HistoryModel):
+class ProviderDetailsHistory(db.Model):
     __tablename__ = "provider_details_history"
 
     id = db.Column(UUID(as_uuid=True), primary_key=True, nullable=False)
@@ -1225,6 +1274,15 @@ class ProviderDetailsHistory(db.Model, HistoryModel):
     created_by_id = db.Column(UUID(as_uuid=True), db.ForeignKey("users.id"), index=True, nullable=True)
     created_by = db.relationship("User")
     supports_international = db.Column(db.Boolean, nullable=False, default=False)
+
+    @classmethod
+    def from_original(cls, original):
+        history = cls()
+        for c in history.__table__.columns:
+            if hasattr(original, c.name):
+                setattr(history, c.name, getattr(original, c.name))
+
+        return history
 
 
 class JobStatus(db.Model):
@@ -1394,12 +1452,12 @@ class Notification(db.Model):
     @property
     def personalisation(self):
         if self._personalisation:
-            return encryption.decrypt(self._personalisation)
+            return signing.decode(self._personalisation)
         return {}
 
     @personalisation.setter
     def personalisation(self, personalisation):
-        self._personalisation = encryption.encrypt(personalisation or {})
+        self._personalisation = signing.encode(personalisation or {})
 
     def completed_at(self):
         if self.status in NOTIFICATION_STATUS_TYPES_COMPLETED:
@@ -1408,55 +1466,29 @@ class Notification(db.Model):
         return None
 
     @staticmethod
-    def substitute_status(status_or_statuses):
+    def substitute_status(status_or_statuses: Union[str, list[str]]) -> list[str]:
         """
         static function that takes a status or list of statuses and substitutes our new failure types if it finds
         the deprecated one
-
-        > IN
-        'failed'
-
-        < OUT
-        ['technical-failure', 'temporary-failure', 'permanent-failure']
-
-        -
-
-        > IN
-        ['failed', 'created', 'accepted']
-
-        < OUT
-        ['technical-failure', 'temporary-failure', 'permanent-failure', 'created', 'sending']
-
-
-        -
-
-        > IN
-        'delivered'
-
-        < OUT
-        ['received']
-
-        :param status_or_statuses: a single status or list of statuses
-        :return: a single status or list with the current failure statuses substituted for 'failure'
         """
-
-        def _substitute_status_str(_status):
-            return (
-                NOTIFICATION_STATUS_TYPES_FAILED
-                if _status == NOTIFICATION_FAILED
-                else [NOTIFICATION_CREATED, NOTIFICATION_SENDING]
-                if _status == NOTIFICATION_STATUS_LETTER_ACCEPTED
-                else NOTIFICATION_DELIVERED
-                if _status == NOTIFICATION_STATUS_LETTER_RECEIVED
-                else [_status]
-            )
-
-        def _substitute_status_seq(_statuses):
-            return list(set(itertools.chain.from_iterable(_substitute_status_str(status) for status in _statuses)))
-
         if isinstance(status_or_statuses, str):
-            return _substitute_status_str(status_or_statuses)
-        return _substitute_status_seq(status_or_statuses)
+            status_or_statuses = [status_or_statuses]
+
+        def _substitute_status(_status: str) -> list[str]:
+            if _status == NOTIFICATION_FAILED:
+                return NOTIFICATION_STATUS_TYPES_FAILED
+            elif _status == NOTIFICATION_STATUS_LETTER_ACCEPTED:
+                return [NOTIFICATION_CREATED, NOTIFICATION_SENDING]
+            elif _status == NOTIFICATION_STATUS_LETTER_RECEIVED:
+                return [NOTIFICATION_DELIVERED]
+
+            return [_status]
+
+        unique_substituted_statuses = {
+            substitute for status in status_or_statuses for substitute in _substitute_status(status)
+        }
+
+        return list(unique_substituted_statuses)
 
     @property
     def content(self):
@@ -1546,6 +1578,7 @@ class Notification(db.Model):
             "created_at": created_at_in_bst.strftime("%Y-%m-%d %H:%M:%S"),
             "created_by_name": self.get_created_by_name(),
             "created_by_email_address": self.get_created_by_email_address(),
+            "api_key_name": self.api_key.name if self.api_key else None,
         }
 
         return serialized
@@ -1598,7 +1631,7 @@ class Notification(db.Model):
         return serialized
 
 
-class NotificationHistory(db.Model, HistoryModel):
+class NotificationHistory(db.Model):
     __tablename__ = "notification_history"
 
     id = db.Column(UUID(as_uuid=True), primary_key=True)
@@ -1647,17 +1680,8 @@ class NotificationHistory(db.Model, HistoryModel):
         Index(
             "ix_notification_history_service_id_composite", "service_id", "key_type", "notification_type", "created_at"
         ),
+        Index("ix_notification_history_created_at", "created_at", postgresql_concurrently=True),
     )
-
-    @classmethod
-    def from_original(cls, notification):
-        history = super().from_original(notification)
-        history.status = notification.status
-        return history
-
-    def update_from_original(self, original):
-        super().update_from_original(original)
-        self.status = original.status
 
 
 class LetterCostThreshold(enum.Enum):
@@ -1781,6 +1805,12 @@ class Rate(db.Model):
         the_string += " {}".format(self.valid_from)
         return the_string
 
+    def serialize(self):
+        return {
+            "rate": self.rate,
+            "valid_from": self.valid_from.isoformat(),
+        }
+
 
 class InboundSms(db.Model):
     __tablename__ = "inbound_sms"
@@ -1799,11 +1829,11 @@ class InboundSms(db.Model):
 
     @property
     def content(self):
-        return encryption.decrypt(self._content)
+        return signing.decode(self._content)
 
     @content.setter
     def content(self, content):
-        self._content = encryption.encrypt(content)
+        self._content = signing.encode(content)
 
     def serialize(self):
         return {
@@ -1816,7 +1846,7 @@ class InboundSms(db.Model):
         }
 
 
-class InboundSmsHistory(db.Model, HistoryModel):
+class InboundSmsHistory(db.Model):
     __tablename__ = "inbound_sms_history"
     id = db.Column(UUID(as_uuid=True), primary_key=True)
     created_at = db.Column(db.DateTime, index=True, unique=False, nullable=False)
@@ -1838,6 +1868,14 @@ class LetterRate(db.Model):
     rate = db.Column(db.Numeric(), nullable=False)
     crown = db.Column(db.Boolean, nullable=False)
     post_class = db.Column(db.String, nullable=False)
+
+    def serialize(self):
+        return {
+            "sheet_count": self.sheet_count,
+            "start_date": self.start_date.isoformat(),
+            "rate": self.rate,
+            "post_class": self.post_class,
+        }
 
 
 class ServiceEmailReplyTo(db.Model):
@@ -2195,12 +2233,12 @@ class BroadcastMessage(db.Model):
     @property
     def personalisation(self):
         if self._personalisation:
-            return encryption.decrypt(self._personalisation)
+            return signing.decode(self._personalisation)
         return {}
 
     @personalisation.setter
     def personalisation(self, personalisation):
-        self._personalisation = encryption.encrypt(personalisation or {})
+        self._personalisation = signing.encode(personalisation or {})
 
     def serialize(self):
         return {
@@ -2308,32 +2346,6 @@ class BroadcastEvent(db.Model):
             (provider_message for provider_message in self.provider_messages if provider_message.provider == provider),
             None,
         )
-
-    def get_earlier_provider_messages(self, provider):
-        """
-        Get the previous message for a provider. These are different per provider, as the identifiers are different.
-        Return the full provider_message object rather than just an identifier, since the different providers expect
-        reference to contain different things - let the cbc_proxy work out what information is relevant.
-        """
-        from app.dao.broadcast_message_dao import (
-            get_earlier_events_for_broadcast_event,
-        )
-
-        earlier_events = [event for event in get_earlier_events_for_broadcast_event(self.id)]
-        ret = []
-        for event in earlier_events:
-            provider_message = event.get_provider_message(provider)
-            if provider_message is None:
-                # TODO: We should figure out what to do if a previous message hasn't been sent out yet.
-                # We don't want to not cancel a message just because it's stuck in a queue somewhere.
-                # This exception should probably be named, and then should be caught further up and handled
-                # appropriately.
-                raise Exception(
-                    f"Cannot get earlier message references for event {self.id}, previous event {event.id} has not "
-                    + f' been sent to provider "{provider}" yet'
-                )
-            ret.append(provider_message)
-        return ret
 
     def serialize(self):
         return {

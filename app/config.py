@@ -5,13 +5,6 @@ from datetime import timedelta
 from celery.schedules import crontab
 from kombu import Exchange, Queue
 
-if os.environ.get("VCAP_SERVICES"):
-    # on cloudfoundry, config is a json blob in VCAP_SERVICES - unpack it, and populate
-    # standard environment variables from it
-    from app.cloudfoundry_config import extract_cloudfoundry_config
-
-    extract_cloudfoundry_config()
-
 
 class QueueNames(object):
     PERIODIC = "periodic-tasks"
@@ -24,11 +17,11 @@ class QueueNames(object):
     JOBS = "job-tasks"
     RETRY = "retry-tasks"
     NOTIFY = "notify-internal-tasks"
-    PROCESS_FTP = "process-ftp-tasks"
     CREATE_LETTERS_PDF = "create-letters-pdf-tasks"
     CALLBACKS = "service-callbacks"
     CALLBACKS_RETRY = "service-callbacks-retry"
     LETTERS = "letter-tasks"
+    SES_CALLBACKS = "ses-callbacks"
     SMS_CALLBACKS = "sms-callbacks"
     ANTIVIRUS = "antivirus-tasks"
     SANITISE_LETTERS = "sanitise-letter-tasks"
@@ -54,6 +47,7 @@ class QueueNames(object):
             QueueNames.CALLBACKS,
             QueueNames.CALLBACKS_RETRY,
             QueueNames.LETTERS,
+            QueueNames.SES_CALLBACKS,
             QueueNames.SMS_CALLBACKS,
             QueueNames.SAVE_API_EMAIL,
             QueueNames.SAVE_API_SMS,
@@ -90,7 +84,7 @@ class Config(object):
 
     # secrets that internal apps, such as the admin app or document download, must use to authenticate with the API
     ADMIN_CLIENT_ID = "notify-admin"
-    GOVUK_ALERTS_CLIENT_ID = "govuk-alerts"
+    FUNCTIONAL_TESTS_CLIENT_ID = "notify-functional-tests"
 
     INTERNAL_CLIENT_API_KEYS = json.loads(os.environ.get("INTERNAL_CLIENT_API_KEYS", "{}"))
 
@@ -113,7 +107,7 @@ class Config(object):
 
     # URL of redis instance
     REDIS_URL = os.getenv("REDIS_URL")
-    REDIS_ENABLED = True
+    REDIS_ENABLED = False if os.environ.get("REDIS_ENABLED") == "0" else True
     EXPIRE_CACHE_TEN_MINUTES = 600
     EXPIRE_CACHE_EIGHT_DAYS = 8 * 24 * 60 * 60
 
@@ -123,6 +117,9 @@ class Config(object):
     # Logging
     DEBUG = False
     NOTIFY_LOG_PATH = os.getenv("NOTIFY_LOG_PATH")
+
+    NOTIFY_RUNTIME_PLATFORM = os.getenv("NOTIFY_RUNTIME_PLATFORM", "paas")
+    NOTIFY_REQUEST_LOG_LEVEL = os.getenv("NOTIFY_REQUEST_LOG_LEVEL", "INFO")
 
     # Cronitor
     CRONITOR_ENABLED = False
@@ -154,10 +151,6 @@ class Config(object):
     MAX_VERIFY_CODE_COUNT = 5
     MAX_FAILED_LOGIN_COUNT = 10
 
-    # be careful increasing this size without being sure that we won't see slowness in pysftp
-    MAX_LETTER_PDF_ZIP_FILESIZE = 40 * 1024 * 1024  # 40mb
-    MAX_LETTER_PDF_COUNT_PER_ZIP = 500
-
     CHECK_PROXY_HEADER = False
 
     # these should always add up to 100%
@@ -181,11 +174,15 @@ class Config(object):
     MOU_SIGNER_RECEIPT_TEMPLATE_ID = "4fd2e43c-309b-4e50-8fb8-1955852d9d71"
     MOU_SIGNED_ON_BEHALF_SIGNER_RECEIPT_TEMPLATE_ID = "c20206d5-bf03-4002-9a90-37d5032d9e84"
     MOU_SIGNED_ON_BEHALF_ON_BEHALF_RECEIPT_TEMPLATE_ID = "522b6657-5ca5-4368-a294-6b527703bd0b"
-    ORGANISATION_HAS_NEW_GO_LIVE_REQUEST_TEMPLATE_ID = "5c7cfc0f-c3f4-4bd6-9a84-5a144aad5425"
+    GO_LIVE_NEW_REQUEST_FOR_ORG_USERS_TEMPLATE_ID = "5c7cfc0f-c3f4-4bd6-9a84-5a144aad5425"
+    GO_LIVE_REQUEST_NEXT_STEPS_FOR_ORG_USER_TEMPLATE_ID = "62f12a62-742b-4458-9336-741521b131c7"
+    GO_LIVE_REQUEST_REJECTED_BY_ORG_USER_TEMPLATE_ID = "507d0796-9e23-4ad7-b83b-5efbd9496866"
     NOTIFY_INTERNATIONAL_SMS_SENDER = "07984404008"
     LETTERS_VOLUME_EMAIL_TEMPLATE_ID = "11fad854-fd38-4a7c-bd17-805fb13dfc12"
     NHS_EMAIL_BRANDING_ID = "a7dc4e56-660b-4db7-8cff-12c37b12b5ea"
     NHS_LETTER_BRANDING_ID = "2cd354bb-6b85-eda3-c0ad-6b613150459f"
+    REQUEST_INVITE_TO_SERVICE_TEMPLATE_ID = "77677459-f862-44ee-96d9-b8cb2323d407"
+    RECEIPT_FOR_REQUEST_INVITE_TO_SERVICE_TEMPLATE_ID = "38bcd263-6ce8-431f-979d-8e637c1f0576"
     # we only need real email in Live environment (production)
     DVLA_EMAIL_ADDRESSES = json.loads(os.environ.get("DVLA_EMAIL_ADDRESSES", "[]"))
 
@@ -198,6 +195,7 @@ class Config(object):
             "queue_name_prefix": NOTIFICATION_QUEUE_PREFIX,
             "is_secure": True,
         },
+        "result_expires": 0,
         "timezone": "UTC",
         "imports": [
             "app.celery.tasks",
@@ -313,7 +311,7 @@ class Config(object):
             },
             "check-if-letters-still-pending-virus-check": {
                 "task": "check-if-letters-still-pending-virus-check",
-                "schedule": crontab(day_of_week="mon-fri", hour="9,15", minute=0),
+                "schedule": crontab(minute="*/10"),
                 "options": {"queue": QueueNames.PERIODIC},
             },
             "check-for-services-with-high-failure-rates-or-sending-to-tv-numbers": {
@@ -330,8 +328,7 @@ class Config(object):
             # difference to the truncate date which translates to the filename to process
             # We schedule it for 16:50 and 17:50 UTC. This task is then responsible for determining if the local time
             # is 17:50, and if so, actually kicking off letter collation.
-            # If updating the cron schedule, you should update the task as well - at least while we're still processing
-            # letters by FTP. With the API changes we should have more flexibility.
+            # If updating the cron schedule, you should update the task as well.
             "check-time-to-collate-letters": {
                 "task": "check-time-to-collate-letters",
                 "schedule": crontab(hour="16,17", minute=50),
@@ -340,21 +337,6 @@ class Config(object):
             "raise-alert-if-no-letter-ack-file": {
                 "task": "raise-alert-if-no-letter-ack-file",
                 "schedule": crontab(hour=22, minute=45),
-                "options": {"queue": QueueNames.PERIODIC},
-            },
-            "trigger-link-tests": {
-                "task": "trigger-link-tests",
-                "schedule": timedelta(minutes=15),
-                "options": {"queue": QueueNames.PERIODIC},
-            },
-            "auto-expire-broadcast-messages": {
-                "task": "auto-expire-broadcast-messages",
-                "schedule": timedelta(minutes=5),
-                "options": {"queue": QueueNames.PERIODIC},
-            },
-            "remove-yesterdays-planned-tests-on-govuk-alerts": {
-                "task": "remove-yesterdays-planned-tests-on-govuk-alerts",
-                "schedule": crontab(hour=00, minute=00),
                 "options": {"queue": QueueNames.PERIODIC},
             },
             "delete-old-records-from-events-table": {
@@ -447,8 +429,6 @@ class Config(object):
     # as defined in api db migration 0331_add_broadcast_org.py
     BROADCAST_ORGANISATION_ID = "38e4bf69-93b0-445d-acee-53ea53fe02df"
 
-    DVLA_API_ENABLED = os.environ.get("DVLA_API_ENABLED") == "1"
-    DVLA_API_POSTAGE_TYPE_EXCLUDE_LIST = json.loads(os.environ.get("DVLA_API_POSTAGE_TYPE_EXCLUDE_LIST", "[]"))
     DVLA_API_BASE_URL = os.environ.get("DVLA_API_BASE_URL", "https://uat.driver-vehicle-licensing.api.gov.uk")
     DVLA_API_TLS_CIPHERS = os.environ.get("DVLA_API_TLS_CIPHERS")
 
@@ -490,7 +470,7 @@ class Development(Config):
 
     INTERNAL_CLIENT_API_KEYS = {
         Config.ADMIN_CLIENT_ID: ["dev-notify-secret-key"],
-        Config.GOVUK_ALERTS_CLIENT_ID: ["govuk-alerts-secret-key"],
+        Config.FUNCTIONAL_TESTS_CLIENT_ID: ["functional-tests-secret-key"],
     }
 
     SECRET_KEY = "dev-notify-secret-key"
@@ -539,9 +519,9 @@ class Test(Development):
     S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "test-transient-uploaded-letters"
     S3_BUCKET_LETTER_SANITISE = "test-letters-sanitise"
 
-    # this is overriden in jenkins and on cloudfoundry
-    SQLALCHEMY_DATABASE_URI = os.getenv("SQLALCHEMY_DATABASE_URI", "postgresql://localhost/test_notification_api")
-    SQLALCHEMY_RECORD_QUERIES = False
+    # when testing, the SQLALCHEMY_DATABASE_URI is used for the postgres server's location
+    # but the database name is set in the _notify_db fixture
+    SQLALCHEMY_RECORD_QUERIES = True
 
     CELERY = {**Config.CELERY, "broker_url": "you-forgot-to-mock-celery-in-your-tests://"}
 
@@ -596,7 +576,7 @@ class Staging(Config):
     S3_BUCKET_LETTER_SANITISE = "staging-letters-sanitise"
     FROM_NUMBER = "stage"
     API_RATE_LIMIT_ENABLED = True
-    CHECK_PROXY_HEADER = True
+    CHECK_PROXY_HEADER = False if os.environ.get("CHECK_PROXY_HEADER") == "0" else True
     DVLA_API_TLS_CIPHERS = os.environ.get("DVLA_API_TLS_CIPHERS", "must-supply-tls-ciphers")
 
 
@@ -614,7 +594,7 @@ class Production(Config):
     S3_BUCKET_LETTER_SANITISE = "production-letters-sanitise"
     FROM_NUMBER = "GOVUK"
     API_RATE_LIMIT_ENABLED = True
-    CHECK_PROXY_HEADER = True
+    CHECK_PROXY_HEADER = False if os.environ.get("CHECK_PROXY_HEADER") == "0" else True
     SES_STUB_URL = None
 
     CRONITOR_ENABLED = True

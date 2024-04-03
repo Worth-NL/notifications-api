@@ -332,34 +332,6 @@ def test_archive_user_when_user_cannot_be_archived(mocker, admin_request, sample
     assert json_resp["message"] == msg
 
 
-def test_get_user_by_email(admin_request, sample_service):
-    sample_user = sample_service.users[0]
-
-    json_resp = admin_request.get("user.get_by_email", email=sample_user.email_address)
-
-    expected_permissions = default_service_permissions
-    fetched = json_resp["data"]
-
-    assert str(sample_user.id) == fetched["id"]
-    assert sample_user.name == fetched["name"]
-    assert sample_user.mobile_number == fetched["mobile_number"]
-    assert sample_user.email_address == fetched["email_address"]
-    assert sample_user.state == fetched["state"]
-    assert sorted(expected_permissions) == sorted(fetched["permissions"][str(sample_service.id)])
-
-
-def test_get_user_by_email_not_found_returns_404(admin_request, sample_user):
-    json_resp = admin_request.get("user.get_by_email", email="no_user@digital.gov.uk", _expected_status=404)
-    assert json_resp["result"] == "error"
-    assert json_resp["message"] == "No result found"
-
-
-def test_get_user_by_email_bad_url_returns_404(admin_request, sample_user):
-    json_resp = admin_request.get("user.get_by_email", _expected_status=400)
-    assert json_resp["result"] == "error"
-    assert json_resp["message"] == "Invalid request. Email query string param required"
-
-
 def test_fetch_user_by_email(admin_request, notify_db_session):
     user = create_user(email="foo@bar.com")
 
@@ -666,7 +638,7 @@ def test_send_user_reset_password_should_send_reset_password_link(
             {
                 "email": "notify@digital.cabinet-office.gov.uk",
             },
-            ("http://localhost:6012/new-password/"),
+            ("{hostnames.admin}/new-password/"),
         ),
         (
             {
@@ -685,6 +657,7 @@ def test_send_user_reset_password_should_use_provided_base_url(
     mocker,
     data,
     expected_url,
+    hostnames,
 ):
     mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
 
@@ -694,7 +667,7 @@ def test_send_user_reset_password_should_use_provided_base_url(
         _expected_status=204,
     )
 
-    assert Notification.query.first().personalisation["url"].startswith(expected_url)
+    assert Notification.query.first().personalisation["url"].startswith(expected_url.format(hostnames=hostnames))
 
 
 @freeze_time("2016-01-01 11:09:00.061258")

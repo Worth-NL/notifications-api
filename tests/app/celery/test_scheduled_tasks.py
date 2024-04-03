@@ -19,7 +19,7 @@ from redis.exceptions import LockError
 
 from app.celery import scheduled_tasks
 from app.celery.scheduled_tasks import (
-    auto_expire_broadcast_messages,
+    _check_slow_text_message_delivery_reports_and_raise_error_if_needed,
     change_dvla_api_key,
     change_dvla_password,
     check_for_low_available_inbound_sms_numbers,
@@ -33,11 +33,10 @@ from app.celery.scheduled_tasks import (
     delete_verify_codes,
     generate_sms_delivery_stats,
     populate_annual_billing,
-    remove_yesterdays_planned_tests_on_govuk_alerts,
     replay_created_notifications,
+    run_populate_annual_billing,
     run_scheduled_jobs,
     switch_current_sms_provider_on_slow_delivery,
-    trigger_link_tests,
     weekly_dwp_report,
     zendesk_new_email_branding_report,
 )
@@ -56,11 +55,11 @@ from app.constants import (
 )
 from app.dao.annual_billing_dao import set_default_free_allowance_for_service
 from app.dao.jobs_dao import dao_get_job_by_id
+from app.dao.notifications_dao import SlowProviderDeliveryReport
 from app.dao.provider_details_dao import get_provider_details_by_identifier
-from app.models import BroadcastStatusType, Event, InboundNumber
+from app.models import Event, InboundNumber
 from tests.app import load_example_csv
 from tests.app.db import (
-    create_broadcast_message,
     create_email_branding,
     create_job,
     create_notification,
@@ -69,19 +68,6 @@ from tests.app.db import (
     create_user,
 )
 from tests.conftest import set_config
-
-
-def _create_slow_delivery_notification(template, provider="mmg"):
-    now = datetime.utcnow()
-    five_minutes_from_now = now + timedelta(minutes=5)
-
-    create_notification(
-        template=template,
-        status="delivered",
-        sent_by=provider,
-        updated_at=five_minutes_from_now,
-        sent_at=now,
-    )
 
 
 def test_should_call_delete_codes_on_delete_verify_codes_task(notify_db_session, mocker):
@@ -172,14 +158,35 @@ def test_switch_current_sms_provider_on_slow_delivery_does_nothing_if_no_need(
     assert mock_reduce.called is False
 
 
-def test_generate_sms_delivery_stats(mocker):
+@pytest.mark.parametrize(
+    "environment, expect_check_slow_delivery",
+    (
+        (
+            "preview",
+            False,
+        ),
+        (
+            "production",
+            True,
+        ),
+    ),
+)
+def test_generate_sms_delivery_stats(environment, expect_check_slow_delivery, mocker, notify_api):
+    slow_delivery_reports = [
+        SlowProviderDeliveryReport(provider="mmg", slow_ratio=0.4, slow_notifications=40, total_notifications=100),
+        SlowProviderDeliveryReport(provider="firetext", slow_ratio=0.8, slow_notifications=80, total_notifications=100),
+    ]
     mocker.patch(
-        "app.celery.scheduled_tasks.get_ratio_of_messages_delivered_slowly_per_provider",
-        return_value={"mmg": 0.4, "firetext": 0.8},
+        "app.celery.scheduled_tasks.get_slow_text_message_delivery_reports_by_provider",
+        return_value=slow_delivery_reports,
     )
     mock_statsd = mocker.patch("app.celery.scheduled_tasks.statsd_client.gauge")
+    mock_check_slow_delivery = mocker.patch(
+        "app.celery.scheduled_tasks._check_slow_text_message_delivery_reports_and_raise_error_if_needed"
+    )
 
-    generate_sms_delivery_stats()
+    with set_config(notify_api, "NOTIFY_ENVIRONMENT", environment):
+        generate_sms_delivery_stats()
 
     calls = [
         call("slow-delivery.mmg.delivered-within-minutes.1.ratio", 0.4),
@@ -188,8 +195,65 @@ def test_generate_sms_delivery_stats(mocker):
         call("slow-delivery.firetext.delivered-within-minutes.1.ratio", 0.8),
         call("slow-delivery.firetext.delivered-within-minutes.5.ratio", 0.8),
         call("slow-delivery.firetext.delivered-within-minutes.10.ratio", 0.8),
+        call("slow-delivery.sms.delivered-within-minutes.1.ratio", 0.6),
+        call("slow-delivery.sms.delivered-within-minutes.5.ratio", 0.6),
+        call("slow-delivery.sms.delivered-within-minutes.10.ratio", 0.6),
     ]
     mock_statsd.assert_has_calls(calls, any_order=True)
+
+    assert mock_check_slow_delivery.call_args_list == (
+        [mocker.call(slow_delivery_reports)] if expect_check_slow_delivery else []
+    )
+
+
+@pytest.mark.parametrize("consecutive_failures,should_log", ((1, False), (9, False), (10, True)))
+def test_check_slow_text_message_delivery_reports_and_raise_error_if_needed(
+    mocker, caplog, notify_api, consecutive_failures, should_log
+):
+    mock_incr = mocker.patch("app.celery.scheduled_tasks.redis_store.incr")
+    mock_set = mocker.patch("app.celery.scheduled_tasks.redis_store.set")
+    mock_incr.return_value = 1
+
+    with set_config(notify_api, "REDIS_ENABLED", True):
+        # Below 10% threshold, should not trigger logs and should set redis cache key to 0
+        for _ in range(consecutive_failures):
+            mock_incr.return_value = consecutive_failures
+            mock_set.reset_mock()
+            _check_slow_text_message_delivery_reports_and_raise_error_if_needed(
+                [
+                    SlowProviderDeliveryReport(
+                        provider="mmg", slow_ratio=0.10, slow_notifications=10, total_notifications=100
+                    ),
+                    SlowProviderDeliveryReport(
+                        provider="firetext", slow_ratio=0.09, slow_notifications=9, total_notifications=100
+                    ),
+                ]
+            )
+            assert (
+                "Over 10% of text messages sent in the last 25 minutes have taken over 5 minutes to deliver."
+                not in caplog.messages
+            )
+            assert mock_set.call_args_list == [mocker.call("slow-sms-delivery:number-of-times-over-threshold", 0)]
+
+        # At 10%+, should increment redis and log an error when it's the fifth consecutive call.
+        for _ in range(consecutive_failures):
+            mock_incr.reset_mock()
+            mock_incr.return_value = consecutive_failures
+            _check_slow_text_message_delivery_reports_and_raise_error_if_needed(
+                [
+                    SlowProviderDeliveryReport(
+                        provider="mmg", slow_ratio=0.10, slow_notifications=10, total_notifications=100
+                    ),
+                    SlowProviderDeliveryReport(
+                        provider="firetext", slow_ratio=0.10, slow_notifications=10, total_notifications=100
+                    ),
+                ]
+            )
+            assert (
+                "Over 10% of text messages sent in the last 25 minutes have taken over 5 minutes to deliver."
+                in caplog.messages
+            ) is should_log
+            assert mock_incr.call_args_list == [mocker.call("slow-sms-delivery:number-of-times-over-threshold")]
 
 
 def test_check_job_status_task_calls_process_incomplete_jobs(mocker, sample_template):
@@ -418,10 +482,16 @@ def test_check_if_letters_still_pending_virus_check_restarts_scan_for_stuck_lett
     create_notification(
         template=sample_letter_template,
         status=NOTIFICATION_PENDING_VIRUS_CHECK,
-        created_at=datetime.utcnow() - timedelta(seconds=5401),
+        created_at=datetime.utcnow() - timedelta(seconds=601),
         reference="one",
     )
-    expected_filename = "NOTIFY.ONE.D.2.C.20190530122959.PDF"
+    create_notification(
+        template=sample_letter_template,
+        status=NOTIFICATION_PENDING_VIRUS_CHECK,
+        created_at=datetime.utcnow() - timedelta(seconds=599),
+        reference="still has time to send",
+    )
+    expected_filename = "NOTIFY.ONE.D.2.C.20190530134959.PDF"
 
     check_if_letters_still_pending_virus_check()
 
@@ -449,23 +519,25 @@ def test_check_if_letters_still_pending_virus_check_raises_zendesk_if_files_cant
     create_notification(
         template=sample_letter_template,
         status=NOTIFICATION_PENDING_VIRUS_CHECK,
-        created_at=datetime.utcnow() - timedelta(seconds=5400),
+        created_at=datetime.utcnow() - timedelta(seconds=600),
+        reference="ignore as still has time",
     )
     create_notification(
         template=sample_letter_template,
         status=NOTIFICATION_DELIVERED,
-        created_at=datetime.utcnow() - timedelta(seconds=6000),
+        created_at=datetime.utcnow() - timedelta(seconds=1000),
+        reference="ignore as status in delivered",
     )
     notification_1 = create_notification(
         template=sample_letter_template,
         status=NOTIFICATION_PENDING_VIRUS_CHECK,
-        created_at=datetime.utcnow() - timedelta(seconds=5401),
+        created_at=datetime.utcnow() - timedelta(seconds=601),
         reference="one",
     )
     notification_2 = create_notification(
         template=sample_letter_template,
         status=NOTIFICATION_PENDING_VIRUS_CHECK,
-        created_at=datetime.utcnow() - timedelta(seconds=70000),
+        created_at=datetime.utcnow() - timedelta(seconds=1000),
         reference="two",
     )
 
@@ -474,8 +546,8 @@ def test_check_if_letters_still_pending_virus_check_raises_zendesk_if_files_cant
     assert mock_file_exists.call_count == 2
     mock_file_exists.assert_has_calls(
         [
-            call("test-letters-scan", "NOTIFY.ONE.D.2.C.20190530122959.PDF"),
-            call("test-letters-scan", "NOTIFY.TWO.D.2.C.20190529183320.PDF"),
+            call("test-letters-scan", "NOTIFY.ONE.D.2.C.20190530134959.PDF"),
+            call("test-letters-scan", "NOTIFY.TWO.D.2.C.20190530134320.PDF"),
         ],
         any_order=True,
     )
@@ -521,7 +593,7 @@ def test_check_if_letters_still_in_created_during_bst(mocker, sample_letter_temp
         message=(
             "2 letters were created before 17.30 yesterday and still have 'created' status. "
             "Follow runbook to resolve: "
-            "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-Letters-still-in-created."
+            "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-letters-still-in-created."
         ),
         subject="[test] Letters still in 'created' status",
         ticket_type="incident",
@@ -557,7 +629,7 @@ def test_check_if_letters_still_in_created_during_utc(mocker, sample_letter_temp
         message=(
             "2 letters were created before 17.30 yesterday and still have 'created' status. "
             "Follow runbook to resolve: "
-            "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-Letters-still-in-created."
+            "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-letters-still-in-created."
         ),
         subject="[test] Letters still in 'created' status",
         ticket_type="incident",
@@ -585,7 +657,7 @@ def test_check_for_missing_rows_in_completed_jobs_ignores_old_and_new_jobs(
         "app.celery.tasks.s3.get_job_and_metadata_from_s3",
         return_value=(load_example_csv("multiple_email"), {"sender_id": None}),
     )
-    mocker.patch("app.encryption.encrypt", return_value="something_encrypted")
+    mocker.patch("app.signing.encode", return_value="something_encoded")
     process_row = mocker.patch("app.celery.scheduled_tasks.process_row")
 
     job = create_job(
@@ -607,7 +679,7 @@ def test_check_for_missing_rows_in_completed_jobs(mocker, sample_email_template)
         "app.celery.tasks.s3.get_job_and_metadata_from_s3",
         return_value=(load_example_csv("multiple_email"), {"sender_id": None}),
     )
-    mocker.patch("app.encryption.encrypt", return_value="something_encrypted")
+    mocker.patch("app.signing.encode", return_value="something_encoded")
     process_row = mocker.patch("app.celery.scheduled_tasks.process_row")
 
     job = create_job(
@@ -630,7 +702,7 @@ def test_check_for_missing_rows_in_completed_jobs_calls_save_email(mocker, sampl
         return_value=(load_example_csv("multiple_email"), {"sender_id": None}),
     )
     save_email_task = mocker.patch("app.celery.tasks.save_email.apply_async")
-    mocker.patch("app.encryption.encrypt", return_value="something_encrypted")
+    mocker.patch("app.signing.encode", return_value="something_encoded")
     mocker.patch("app.celery.tasks.create_uuid", return_value="uuid")
 
     job = create_job(
@@ -647,7 +719,7 @@ def test_check_for_missing_rows_in_completed_jobs_calls_save_email(mocker, sampl
         (
             str(job.service_id),
             "uuid",
-            "something_encrypted",
+            "something_encoded",
         ),
         {},
         queue="database-tasks",
@@ -724,7 +796,7 @@ def test_check_for_services_with_high_failure_rates_or_sending_to_tv_numbers(
         "app.celery.scheduled_tasks.dao_find_services_sending_to_tv_numbers", return_value=sms_to_tv_numbers
     )
 
-    zendesk_actions = "\nYou can find instructions for this ticket in our manual:\nhttps://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#Deal-with-services-with-high-failure-rates-or-sending-sms-to-tv-numbers"  # noqa
+    zendesk_actions = "\nYou can find instructions for this ticket in our manual:\nhttps://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-services-with-high-failure-rates-or-sending-sms-to-tv-numbers"  # noqa
 
     with caplog.at_level("WARNING"):
         check_for_services_with_high_failure_rates_or_sending_to_tv_numbers()
@@ -740,74 +812,6 @@ def test_check_for_services_with_high_failure_rates_or_sending_to_tv_numbers(
         notify_ticket_type=NotifyTicketType.TECHNICAL,
     )
     mock_send_ticket_to_zendesk.assert_called_once()
-
-
-def test_trigger_link_tests_calls_for_all_providers(mocker, notify_api):
-    mock_trigger_link_test = mocker.patch(
-        "app.celery.scheduled_tasks.trigger_link_test",
-    )
-
-    with set_config(notify_api, "ENABLED_CBCS", ["ee", "vodafone"]):
-        trigger_link_tests()
-
-    assert mock_trigger_link_test.apply_async.call_args_list == [
-        call(kwargs={"provider": "ee"}, queue="broadcast-tasks"),
-        call(kwargs={"provider": "vodafone"}, queue="broadcast-tasks"),
-    ]
-
-
-def test_trigger_link_does_nothing_if_cbc_proxy_disabled(mocker, notify_api):
-    mock_trigger_link_test = mocker.patch(
-        "app.celery.scheduled_tasks.trigger_link_test",
-    )
-
-    with set_config(notify_api, "ENABLED_CBCS", ["ee", "vodafone"]), set_config(notify_api, "CBC_PROXY_ENABLED", False):
-        trigger_link_tests()
-
-    assert mock_trigger_link_test.called is False
-
-
-@freeze_time("2021-07-19 15:50")
-@pytest.mark.parametrize(
-    "status, finishes_at, final_status, should_call_publish_task",
-    [
-        (BroadcastStatusType.BROADCASTING, "2021-07-19 16:00", BroadcastStatusType.BROADCASTING, False),
-        (BroadcastStatusType.BROADCASTING, "2021-07-19 15:40", BroadcastStatusType.COMPLETED, True),
-        (BroadcastStatusType.BROADCASTING, None, BroadcastStatusType.BROADCASTING, False),
-        (BroadcastStatusType.PENDING_APPROVAL, None, BroadcastStatusType.PENDING_APPROVAL, False),
-        (BroadcastStatusType.CANCELLED, "2021-07-19 15:40", BroadcastStatusType.CANCELLED, False),
-    ],
-)
-def test_auto_expire_broadcast_messages(
-    mocker,
-    status,
-    finishes_at,
-    final_status,
-    sample_template,
-    should_call_publish_task,
-):
-    message = create_broadcast_message(
-        status=status,
-        finishes_at=finishes_at,
-        template=sample_template,
-    )
-    mock_celery = mocker.patch("app.celery.scheduled_tasks.notify_celery.send_task")
-
-    auto_expire_broadcast_messages()
-    assert message.status == final_status
-
-    if should_call_publish_task:
-        mock_celery.assert_called_once_with(name=TaskNames.PUBLISH_GOVUK_ALERTS, queue=QueueNames.GOVUK_ALERTS)
-    else:
-        assert not mock_celery.called
-
-
-def test_remove_yesterdays_planned_tests_on_govuk_alerts(mocker):
-    mock_celery = mocker.patch("app.celery.scheduled_tasks.notify_celery.send_task")
-
-    remove_yesterdays_planned_tests_on_govuk_alerts()
-
-    mock_celery.assert_called_once_with(name=TaskNames.PUBLISH_GOVUK_ALERTS, queue=QueueNames.GOVUK_ALERTS)
 
 
 def test_delete_old_records_from_events_table(notify_db_session):
@@ -827,7 +831,7 @@ def test_delete_old_records_from_events_table(notify_db_session):
 
 
 @freeze_time("2022-11-01 00:30:00", tick=True)
-def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_user):
+def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_user, hostnames):
     org_1 = create_organisation(organisation_id=uuid.UUID("113d51e7-f204-44d0-99c6-020f3542a527"), name="org-1")
     org_2 = create_organisation(organisation_id=uuid.UUID("d6bc2309-9f79-4779-b864-46c2892db90e"), name="org-2")
     email_brand_1 = create_email_branding(
@@ -879,25 +883,25 @@ def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_use
         "<h2>New email branding to review</h2>\n<p>Uploaded since Monday 31 October 2022:</p>",
         (
             "<p>"
-            '<a href="http://localhost:6012/organisations/'
+            f'<a href="{hostnames.admin}/organisations/'
             '113d51e7-f204-44d0-99c6-020f3542a527/settings/email-branding">org-1</a> (no default):'
             "</p>"
             "<ul>"
             "<li>"
-            '<a href="http://localhost:6012/email-branding/bc5b45e0-af3c-4e3d-a14c-253a56b77480">brand-1</a>'
+            f'<a href="{hostnames.admin}/email-branding/bc5b45e0-af3c-4e3d-a14c-253a56b77480">brand-1</a>'
             "</li>"
             "<li>"
-            '<a href="http://localhost:6012/email-branding/c9c265b3-14ec-42f1-8ae9-4749ffc6f5b0">brand-2</a>'
+            f'<a href="{hostnames.admin}/email-branding/c9c265b3-14ec-42f1-8ae9-4749ffc6f5b0">brand-2</a>'
             "</li>"
             "</ul>"
             "<hr>"
             "<p>"
-            '<a href="http://localhost:6012/organisations/'
+            f'<a href="{hostnames.admin}/organisations/'
             'd6bc2309-9f79-4779-b864-46c2892db90e/settings/email-branding">org-2</a>:'
             "</p>"
             "<ul>"
             "<li>"
-            '<a href="http://localhost:6012/email-branding/c9c265b3-14ec-42f1-8ae9-4749ffc6f5b0">brand-2</a>'
+            f'<a href="{hostnames.admin}/email-branding/c9c265b3-14ec-42f1-8ae9-4749ffc6f5b0">brand-2</a>'
             "</li>"
             "</ul>"
         ),
@@ -905,7 +909,7 @@ def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_use
             "<p>These new brands are not associated with any organisation and do not need reviewing:</p>"
             "<ul>"
             "<li>"
-            '<a href="http://localhost:6012/email-branding/1b7deb1f-ff1f-4d00-a7a7-05b0b57a185e">brand-3</a>'
+            f'<a href="{hostnames.admin}/email-branding/1b7deb1f-ff1f-4d00-a7a7-05b0b57a185e">brand-3</a>'
             "</li>"
             "</ul>"
         ),
@@ -914,7 +918,9 @@ def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_use
 
 
 @freeze_time("2022-11-01 00:30:00")
-def test_zendesk_new_email_branding_report_for_unassigned_branding_only(notify_db_session, mocker, notify_user):
+def test_zendesk_new_email_branding_report_for_unassigned_branding_only(
+    notify_db_session, mocker, notify_user, hostnames
+):
     create_organisation(organisation_id=uuid.UUID("113d51e7-f204-44d0-99c6-020f3542a527"), name="org-1")
     create_organisation(organisation_id=uuid.UUID("d6bc2309-9f79-4779-b864-46c2892db90e"), name="org-2")
     create_email_branding(
@@ -936,11 +942,11 @@ def test_zendesk_new_email_branding_report_for_unassigned_branding_only(notify_d
         "<p>These new brands are not associated with any organisation and do not need reviewing:</p>"
         "<ul>"
         "<li>"
-        '<a href="http://localhost:6012/email-branding/bc5b45e0-af3c-4e3d-a14c-253a56b77480">brand-1</a>'
+        f'<a href="{hostnames.admin}/email-branding/bc5b45e0-af3c-4e3d-a14c-253a56b77480">brand-1</a>'
         "</li><li>"
-        '<a href="http://localhost:6012/email-branding/c9c265b3-14ec-42f1-8ae9-4749ffc6f5b0">brand-2</a>'
+        f'<a href="{hostnames.admin}/email-branding/c9c265b3-14ec-42f1-8ae9-4749ffc6f5b0">brand-2</a>'
         "</li><li>"
-        '<a href="http://localhost:6012/email-branding/1b7deb1f-ff1f-4d00-a7a7-05b0b57a185e">brand-3</a>'
+        f'<a href="{hostnames.admin}/email-branding/1b7deb1f-ff1f-4d00-a7a7-05b0b57a185e">brand-3</a>'
         "</li>"
         "</ul>"
     )
@@ -1042,7 +1048,7 @@ def test_check_for_low_available_inbound_sms_numbers_logs_zendesk_ticket_if_too_
                 "There are only 5 inbound SMS numbers currently available for services.\n\n"
                 "Request more from our provider (MMG) and load them into the database.\n\n"
                 "Follow the guidance here: "
-                "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#Add-new-inbound-SMS-numbers"
+                "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#add-new-inbound-sms-numbers"
             ),
             ticket_type=mock_ticket.TYPE_TASK,
             notify_ticket_type=NotifyTicketType.TECHNICAL,
@@ -1231,3 +1237,12 @@ def test_populate_annual_billing_missing_services_only(mocker, sample_service):
     mock_set.reset_mock()
     populate_annual_billing(2023, False)
     assert mock_set.call_args_list == [mocker.call(sample_service, 2023)]
+
+
+@freeze_time("2022-03-01")
+def test_run_populate_annual_billing_uses_correct_year(mocker, notify_api):
+    populate_annual_billing = mocker.patch("app.celery.scheduled_tasks.populate_annual_billing")
+
+    run_populate_annual_billing()
+
+    populate_annual_billing.assert_called_once_with(year=2021, missing_services_only=True)

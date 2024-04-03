@@ -302,7 +302,7 @@ def test_should_send_sms_with_downgraded_content(notify_db_session, mocker):
     # ó isn't in GSM, but it is in the welsh alphabet so will still be sent
     msg = "a é ī o u 🍇 foo\tbar\u200bbaz((misc))…"
     placeholder = "∆∆∆abc"
-    gsm_message = "?ódz Housing Service: a é i o u ? foo barbaz???abc..."
+    gsm_message = "Lódz Housing Service: a é i o u ? foo barbaz???abc..."
     service = create_service(service_name="Łódź Housing Service")
     template = create_template(service, content=msg)
     db_notification = create_notification(template=template, personalisation={"misc": placeholder})
@@ -411,7 +411,6 @@ def test_get_html_email_renderer_should_return_for_normal_service(sample_service
     "branding_type, govuk_banner", [(BRANDING_ORG, False), (BRANDING_BOTH, True), (BRANDING_ORG_BANNER, False)]
 )
 def test_get_html_email_renderer_with_branding_details(branding_type, govuk_banner, notify_db_session, sample_service):
-
     email_branding = EmailBranding(
         brand_type=branding_type,
         colour="#000000",
@@ -446,7 +445,7 @@ def test_get_html_email_renderer_with_branding_details_and_render_govuk_banner_o
     assert options == {"govuk_banner": True, "brand_banner": False}
 
 
-def test_get_html_email_renderer_prepends_logo_path(notify_api):
+def test_get_html_email_renderer_prepends_logo_path(notify_api, hostnames):
     Service = namedtuple("Service", ["email_branding"])
     EmailBranding = namedtuple("EmailBranding", ["brand_type", "colour", "name", "logo", "text", "alt_text"])
 
@@ -679,6 +678,22 @@ def test_send_email_to_provider_uses_reply_to_from_notification(sample_email_tem
 
     app.aws_ses_client.send_email.assert_called_once_with(
         ANY, ANY, ANY, body=ANY, html_body=ANY, reply_to_address="test@test.com"
+    )
+
+
+def test_send_email_to_provider_uses_custom_email_sender_name_if_set(sample_email_notification, mocker):
+    sample_email_notification.service.custom_email_sender_name = "Custom Sender Name"
+    mocker.patch("app.aws_ses_client.send_email", return_value="reference")
+
+    send_to_providers.send_email_to_provider(sample_email_notification)
+
+    app.aws_ses_client.send_email.assert_called_once_with(
+        '"Custom Sender Name" <custom.sender.name@test.notify.com>',
+        ANY,
+        ANY,
+        body=ANY,
+        html_body=ANY,
+        reply_to_address=ANY,
     )
 
 

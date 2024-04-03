@@ -3,17 +3,18 @@ from io import BytesIO
 
 import botocore
 from flask import Blueprint, current_app, jsonify, request
+from flask.ctx import has_request_context
 from notifications_utils import SMS_CHAR_COUNT_LIMIT
 from notifications_utils.pdf import extract_page_from_pdf
 from notifications_utils.template import (
-    BroadcastMessageTemplate,
+    LetterPreviewTemplate,
     SMSMessageTemplate,
 )
 from pypdf.errors import PdfReadError
 from requests import post as requests_post
 from sqlalchemy.orm.exc import NoResultFound
 
-from app.constants import BROADCAST_TYPE, LETTER_TYPE, SECOND_CLASS, SMS_TYPE
+from app.constants import BROADCAST_TYPE, LETTER_TYPE, QR_CODE_TOO_LONG, SECOND_CLASS, SMS_TYPE
 from app.dao.notifications_dao import get_notification_by_id
 from app.dao.services_dao import dao_fetch_service_by_id
 from app.dao.template_folder_dao import (
@@ -52,13 +53,15 @@ register_errors(template_blueprint)
 
 
 def _content_count_greater_than_limit(content, template_type):
-    if template_type == SMS_TYPE:
-        template = SMSMessageTemplate({"content": content, "template_type": template_type})
-        return template.is_message_too_long()
-    if template_type == BROADCAST_TYPE:
-        template = BroadcastMessageTemplate({"content": content, "template_type": template_type})
+    if template_type in {SMS_TYPE, BROADCAST_TYPE}:
+        template = SMSMessageTemplate({"content": content, "template_type": SMS_TYPE})
         return template.is_message_too_long()
     return False
+
+
+def _qr_code_too_long(subject: str, content: str):
+    template = LetterPreviewTemplate({"subject": subject, "content": content, "template_type": "letter"})
+    return template.has_qr_code_with_too_much_data()
 
 
 def validate_parent_folder(template_json):
@@ -97,6 +100,11 @@ def create_template(service_id):
         message = "Content has a character count greater than the limit of {}".format(SMS_CHAR_COUNT_LIMIT)
         errors = {"content": [message]}
         raise InvalidRequest(errors, status_code=400)
+
+    if new_template.template_type == LETTER_TYPE and _qr_code_too_long(
+        subject=new_template.subject, content=new_template.content
+    ):
+        raise InvalidRequest({"content": [QR_CODE_TOO_LONG]}, status_code=400)
 
     check_reply_to(service_id, new_template.reply_to, new_template.template_type)
 
@@ -144,6 +152,11 @@ def update_template(service_id, template_id):
         message = "Content has a character count greater than the limit of {}".format(SMS_CHAR_COUNT_LIMIT)
         errors = {"content": [message]}
         raise InvalidRequest(errors, status_code=400)
+
+    if fetched_template.template_type == LETTER_TYPE and _qr_code_too_long(
+        subject=updated_template["subject"], content=updated_template["content"]
+    ):
+        raise InvalidRequest({"content": [QR_CODE_TOO_LONG]}, status_code=400)
 
     update_dict = template_schema.load(updated_template)
     if update_dict.archived:
@@ -214,7 +227,17 @@ def get_template_versions(service_id, template_id):
 def _template_has_not_changed(current_data, updated_template):
     return all(
         current_data[key] == updated_template[key]
-        for key in ("name", "content", "subject", "archived", "process_type", "postage")
+        for key in (
+            "name",
+            "content",
+            "subject",
+            "archived",
+            "process_type",
+            "postage",
+            "letter_welsh_subject",
+            "letter_welsh_content",
+            "letter_languages",
+        )
     )
 
 
@@ -244,7 +267,6 @@ def preview_letter_template_by_notification_id(service_id, notification_id, file
 
     if template.is_precompiled_letter:
         try:
-
             pdf_file, metadata = get_letter_pdf_and_metadata(notification)
 
         except botocore.exceptions.ClientError as e:
@@ -291,7 +313,6 @@ def preview_letter_template_by_notification_id(service_id, notification_id, file
         else:
             response_content = content
     else:
-
         template_for_letter_print = {
             "id": str(notification.template_id),
             "subject": template.subject,
@@ -319,14 +340,14 @@ def preview_letter_template_by_notification_id(service_id, notification_id, file
 
 
 def _get_png_preview_or_overlaid_pdf(url, data, notification_id, json=True):
+    headers = {"Authorization": "Token {}".format(current_app.config["TEMPLATE_PREVIEW_API_KEY"])}
+    if has_request_context() and hasattr(request, "get_onwards_request_headers"):
+        headers.update(request.get_onwards_request_headers())
+
     if json:
-        resp = requests_post(
-            url, json=data, headers={"Authorization": "Token {}".format(current_app.config["TEMPLATE_PREVIEW_API_KEY"])}
-        )
+        resp = requests_post(url, json=data, headers=headers)
     else:
-        resp = requests_post(
-            url, data=data, headers={"Authorization": "Token {}".format(current_app.config["TEMPLATE_PREVIEW_API_KEY"])}
-        )
+        resp = requests_post(url, data=data, headers=headers)
 
     if resp.status_code != 200:
         raise InvalidRequest(

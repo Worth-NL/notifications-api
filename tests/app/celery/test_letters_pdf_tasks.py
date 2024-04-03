@@ -1,6 +1,5 @@
-import uuid
 from collections import namedtuple
-from datetime import datetime, timedelta
+from datetime import datetime
 from unittest.mock import ANY, call
 
 import boto3
@@ -13,14 +12,12 @@ from freezegun import freeze_time
 from moto import mock_s3
 from sqlalchemy.orm.exc import NoResultFound
 
-from app import encryption
+from app import signing
 from app.celery.letters_pdf_tasks import (
     _move_invalid_letter_and_update_status,
     check_time_to_collate_letters,
     collate_letter_pdfs_to_be_sent,
-    get_key_and_size_of_letters_to_be_sent_to_print,
     get_pdf_for_templated_letter,
-    group_letters,
     process_sanitised_letter,
     process_virus_scan_error,
     process_virus_scan_failed,
@@ -53,11 +50,8 @@ from tests.app.db import (
     create_letter_attachment,
     create_letter_branding,
     create_notification,
-    create_organisation,
     create_service,
-    create_template,
 )
-from tests.conftest import set_config_values
 
 
 def test_should_have_decorated_tasks_functions():
@@ -84,8 +78,11 @@ def test_get_pdf_for_templated_letter_happy_path(mocker, sample_letter_notificat
         "letter_contact_block": sample_letter_notification.reply_to_text,
         "template": {
             "service": str(sample_letter_notification.service_id),
+            "letter_languages": sample_letter_notification.template.letter_languages,
             "subject": sample_letter_notification.template.subject,
             "content": sample_letter_notification.template.content,
+            "letter_welsh_subject": sample_letter_notification.template.letter_welsh_subject,
+            "letter_welsh_content": sample_letter_notification.template.letter_welsh_content,
             "template_type": sample_letter_notification.template.template_type,
             "letter_attachment": None,
         },
@@ -100,7 +97,7 @@ def test_get_pdf_for_templated_letter_happy_path(mocker, sample_letter_notificat
         name=TaskNames.CREATE_PDF_FOR_TEMPLATED_LETTER, args=(ANY,), queue=QueueNames.SANITISE_LETTERS
     )
 
-    actual_data = encryption.decrypt(mock_celery.call_args.kwargs["args"][0])
+    actual_data = signing.decode(mock_celery.call_args.kwargs["args"][0])
     assert letter_data == actual_data
 
     mock_generate_letter_pdf_filename.assert_called_once_with(
@@ -119,7 +116,7 @@ def test_get_pdf_for_templated_letter_with_letter_attachment(mocker, sample_lett
     mocker.patch("app.celery.letters_pdf_tasks.generate_letter_pdf_filename", return_value="LETTER.PDF")
     get_pdf_for_templated_letter(sample_letter_notification.id)
 
-    actual_data = encryption.decrypt(mock_celery.call_args.kwargs["args"][0])
+    actual_data = signing.decode(mock_celery.call_args.kwargs["args"][0])
 
     assert actual_data["template"]["letter_attachment"] == attachment.serialize()
 
@@ -211,139 +208,7 @@ def test_update_validation_failed_for_templated_letter_with_too_many_pages(
     )
 
 
-@mock_s3
-@freeze_time("2020-02-17 18:00:00")
-def test_get_key_and_size_of_letters_to_be_sent_to_print(
-    notify_api,
-    sample_letter_template,
-    sample_organisation,
-):
-    pdf_bucket = current_app.config["S3_BUCKET_LETTERS_PDF"]
-    s3 = boto3.client("s3", region_name="eu-west-1")
-    s3.create_bucket(Bucket=pdf_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF0.D.2.C.20200217160000.PDF", Body=b"1"),
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"22"),
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-16/NOTIFY.REF2.D.2.C.20200215180000.PDF", Body=b"333"),
-
-    sample_letter_template.service.organisation = sample_organisation
-
-    # second class
-    create_notification(
-        template=sample_letter_template,
-        status="created",
-        reference="ref0",
-        created_at=(datetime.now() - timedelta(hours=2)),
-    )
-    create_notification(
-        template=sample_letter_template,
-        status="created",
-        reference="ref1",
-        created_at=(datetime.now() - timedelta(hours=3)),
-    )
-    create_notification(
-        template=sample_letter_template,
-        status="created",
-        reference="ref2",
-        created_at=(datetime.now() - timedelta(days=2)),
-    )
-
-    # notifications we don't expect to get sent to print as they are in the wrong status
-    for status in ["delivered", "validation-failed", "cancelled", "sending"]:
-        create_notification(
-            template=sample_letter_template,
-            status=status,
-            reference="ref3",
-            created_at=(datetime.now() - timedelta(days=2)),
-        )
-
-    # notification we don't expect to get sent as instead will make into this evenings print run
-    create_notification(
-        template=sample_letter_template,
-        status="created",
-        reference="ref4",
-        created_at=(datetime.now() - timedelta(minutes=1)),
-    )
-
-    # test notification we don't expect to get sent
-    create_notification(
-        template=sample_letter_template,
-        status="created",
-        reference="ref4",
-        created_at=(datetime.now() - timedelta(days=1)),
-        key_type=KEY_TYPE_TEST,
-    )
-
-    results = list(
-        get_key_and_size_of_letters_to_be_sent_to_print(datetime.now() - timedelta(minutes=30), postage="second")
-    )
-
-    assert len(results) == 3
-
-    assert results == [
-        {
-            "Key": "2020-02-16/NOTIFY.REF2.D.2.C.20200215180000.PDF",
-            "Size": 3,
-            "ServiceId": str(sample_letter_template.service_id),
-            "OrganisationId": str(sample_organisation.id),
-        },
-        {
-            "Key": "2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF",
-            "Size": 2,
-            "ServiceId": str(sample_letter_template.service_id),
-            "OrganisationId": str(sample_organisation.id),
-        },
-        {
-            "Key": "2020-02-17/NOTIFY.REF0.D.2.C.20200217160000.PDF",
-            "Size": 1,
-            "ServiceId": str(sample_letter_template.service_id),
-            "OrganisationId": str(sample_organisation.id),
-        },
-    ]
-
-
-@mock_s3
-@freeze_time("2020-02-17 18:00:00")
-def test_get_key_and_size_of_letters_to_be_sent_to_print_handles_file_not_found(
-    notify_api, sample_letter_template, sample_organisation
-):
-    pdf_bucket = current_app.config["S3_BUCKET_LETTERS_PDF"]
-    s3 = boto3.client("s3", region_name="eu-west-1")
-    s3.create_bucket(Bucket=pdf_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"12"),
-    # no object for ref1
-
-    sample_letter_template.service.organisation = sample_organisation
-
-    create_notification(
-        template=sample_letter_template,
-        status="created",
-        reference="ref0",
-        created_at=(datetime.now() - timedelta(hours=2)),
-    )
-
-    create_notification(
-        template=sample_letter_template,
-        status="created",
-        reference="ref1",
-        created_at=(datetime.now() - timedelta(hours=3)),
-    )
-
-    results = list(
-        get_key_and_size_of_letters_to_be_sent_to_print(datetime.now() - timedelta(minutes=30), postage="second")
-    )
-
-    assert results == [
-        {
-            "Key": "2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF",
-            "Size": 2,
-            "ServiceId": str(sample_letter_template.service_id),
-            "OrganisationId": str(sample_organisation.id),
-        }
-    ]
-
-
 class TestCheckTimeToCollateLetters:
-    @mock_s3
     @pytest.mark.parametrize(
         "frozen_time, expected_time_called_with",
         [
@@ -369,7 +234,6 @@ class TestCheckTimeToCollateLetters:
             mocker.call([expected_time_called_with], queue=QueueNames.PERIODIC)
         ]
 
-    @mock_s3
     @pytest.mark.parametrize(
         "time_to_run_task, should_run",
         [
@@ -436,23 +300,17 @@ class TestCollateLetterPdfsToBeSent:
         with freeze_time(time_now):
             assert schedule.is_due(last_run_at).next == due_in_seconds
 
-    @pytest.mark.parametrize(
-        "api_enabled_env_flag", [True, pytest.param(False, marks=pytest.mark.xfail(raises=AssertionError))]
-    )
-    def test_collate_letter_pdfs_uses_api_on_selected_environments(
+    def test_collate_letter_pdfs_to_be_sent(
         self,
         notify_api,
         notify_db_session,
         mocker,
-        api_enabled_env_flag,
     ):
         mocker.patch("app.celery.letters_pdf_tasks.send_letters_volume_email_to_dvla")
-        mocker.patch("app.celery.letters_pdf_tasks.get_key_and_size_of_letters_to_be_sent_to_print", return_value=[])
         mock_send_via_api = mocker.patch("app.celery.letters_pdf_tasks.send_dvla_letters_via_api")
 
-        with set_config_values(notify_api, {"DVLA_API_ENABLED": api_enabled_env_flag}):
-            with freeze_time("2021-06-01T17:00+00:00"):
-                collate_letter_pdfs_to_be_sent("2021-06-01T16:30:00")
+        with freeze_time("2021-06-01T17:00+00:00"):
+            collate_letter_pdfs_to_be_sent("2021-06-01T16:30:00")
 
         assert mock_send_via_api.call_count == 4
         # Expected to be called with a local (BST) value
@@ -460,202 +318,6 @@ class TestCollateLetterPdfsToBeSent:
         mock_send_via_api.assert_any_call(datetime(2021, 6, 1, 17, 30), "second")
         mock_send_via_api.assert_any_call(datetime(2021, 6, 1, 17, 30), "europe")
         mock_send_via_api.assert_any_call(datetime(2021, 6, 1, 17, 30), "rest-of-world")
-
-    def test_collate_letter_pdfs_uses_api_if_postage_not_on_exclude_list(self, notify_api, notify_db_session, mocker):
-        mocker.patch("app.celery.letters_pdf_tasks.send_letters_volume_email_to_dvla")
-
-        mock_send_via_api = mocker.patch("app.celery.letters_pdf_tasks.send_dvla_letters_via_api")
-        mock_send_via_ftp = mocker.patch("app.celery.letters_pdf_tasks._collate_letter_pdfs_to_be_sent_for_postage")
-
-        with set_config_values(
-            notify_api,
-            {"DVLA_API_ENABLED": True, "DVLA_API_POSTAGE_TYPE_EXCLUDE_LIST": ["first", "second"]},
-        ):
-            with freeze_time("2021-06-01T17:00+00:00"):
-                collate_letter_pdfs_to_be_sent("2021-06-01T16:30:00")
-
-        assert mock_send_via_ftp.call_count == 2
-        mock_send_via_ftp.assert_any_call(datetime(2021, 6, 1, 17, 30), "first")
-        mock_send_via_ftp.assert_any_call(datetime(2021, 6, 1, 17, 30), "second")
-
-        assert mock_send_via_api.call_count == 2
-        mock_send_via_api.assert_any_call(datetime(2021, 6, 1, 17, 30), "europe")
-        mock_send_via_api.assert_any_call(datetime(2021, 6, 1, 17, 30), "rest-of-world")
-
-    @mock_s3
-    def test_collate_letter_pdfs_to_be_sent(self, notify_api, mocker, sample_organisation):
-        with freeze_time("2020-02-17T18:00:00+00:00"):
-            service_1 = create_service(service_name="service 1", service_id="f2fe37b0-1301-11eb-aba9-4c3275916899")
-            service_1.organisation = sample_organisation
-            letter_template_1 = create_template(service_1, template_type=LETTER_TYPE)
-            # second class
-            create_notification(
-                template=letter_template_1,
-                status="created",
-                reference="ref0",
-                created_at=(datetime.now() - timedelta(hours=2)),
-            )
-            create_notification(
-                template=letter_template_1,
-                status="created",
-                reference="ref1",
-                created_at=(datetime.now() - timedelta(hours=3)),
-            )
-            create_notification(
-                template=letter_template_1,
-                status="created",
-                reference="ref2",
-                created_at=(datetime.now() - timedelta(days=2)),
-            )
-
-            # first class
-            create_notification(
-                template=letter_template_1,
-                status="created",
-                reference="first_class",
-                created_at=(datetime.now() - timedelta(hours=4)),
-                postage="first",
-            )
-
-            # international
-            create_notification(
-                template=letter_template_1,
-                status="created",
-                reference="international",
-                created_at=(datetime.now() - timedelta(days=3)),
-                postage="europe",
-            )
-            create_notification(
-                template=letter_template_1,
-                status="created",
-                reference="international",
-                created_at=(datetime.now() - timedelta(days=4)),
-                postage="rest-of-world",
-            )
-
-            # different service second class, belonging to a different organisation
-            org_2_id = uuid.uuid4()
-            organisation_two = create_organisation("Org 2", organisation_id=org_2_id)
-            service_2 = create_service(
-                service_name="service 2",
-                service_id="3a5cea08-29fd-4bb9-b582-8dedd928b149",
-                organisation=organisation_two,
-            )
-            letter_template_2 = create_template(service_2, template_type=LETTER_TYPE)
-            create_notification(
-                template=letter_template_2,
-                status="created",
-                reference="another_service",
-                created_at=(datetime.now() - timedelta(hours=2)),
-            )
-
-        bucket_name = current_app.config["S3_BUCKET_LETTERS_PDF"]
-        s3 = boto3.client("s3", region_name="eu-west-1")
-        s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-
-        filenames = [
-            "2020-02-17/NOTIFY.FIRST_CLASS.D.1.C.20200217140000.PDF",
-            "2020-02-16/NOTIFY.REF2.D.2.C.20200215180000.PDF",
-            "2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF",
-            "2020-02-17/NOTIFY.REF0.D.2.C.20200217160000.PDF",
-            "2020-02-15/NOTIFY.INTERNATIONAL.D.E.C.20200214180000.PDF",
-            "2020-02-14/NOTIFY.INTERNATIONAL.D.N.C.20200213180000.PDF",
-            "2020-02-17/NOTIFY.ANOTHER_SERVICE.D.2.C.20200217160000.PDF",
-        ]
-
-        for filename in filenames:
-            s3.put_object(Bucket=bucket_name, Key=filename, Body=b"f")
-
-        mock_celery = mocker.patch("app.celery.letters_pdf_tasks.notify_celery.send_task")
-        mock_send_email_to_dvla = mocker.patch("app.celery.letters_pdf_tasks.send_letters_volume_email_to_dvla")
-
-        with set_config_values(notify_api, {"MAX_LETTER_PDF_COUNT_PER_ZIP": 2}):
-            collate_letter_pdfs_to_be_sent("2020-02-17T17:30:00")
-
-        mock_send_email_to_dvla.assert_called_once_with(
-            [(1, 1, "europe"), (1, 1, "first"), (1, 1, "rest-of-world"), (4, 4, "second")], datetime(2020, 2, 17).date()
-        )
-
-        assert len(mock_celery.call_args_list) == 6
-        assert mock_celery.call_args_list[0] == call(
-            name="zip-and-send-letter-pdfs",
-            kwargs={
-                "filenames_to_zip": ["2020-02-17/NOTIFY.FIRST_CLASS.D.1.C.20200217140000.PDF"],
-                "upload_filename": (
-                    "NOTIFY.2020-02-17.1.001.sO6RKzPyNrkxrR8OLonl."
-                    f"{letter_template_1.service_id}.{sample_organisation.id}.ZIP"
-                ),
-                # noqa
-            },
-            queue="process-ftp-tasks",
-            compression="zlib",
-        )
-        assert mock_celery.call_args_list[1] == call(
-            name="zip-and-send-letter-pdfs",
-            kwargs={
-                "filenames_to_zip": ["2020-02-17/NOTIFY.ANOTHER_SERVICE.D.2.C.20200217160000.PDF"],
-                "upload_filename": f"NOTIFY.2020-02-17.2.001.bGS-FKKV0QHcOUZgacEu.{service_2.id}.{org_2_id}.ZIP",
-            },
-            queue="process-ftp-tasks",
-            compression="zlib",
-        )
-        assert mock_celery.call_args_list[2] == call(
-            name="zip-and-send-letter-pdfs",
-            kwargs={
-                "filenames_to_zip": [
-                    "2020-02-16/NOTIFY.REF2.D.2.C.20200215180000.PDF",
-                    "2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF",
-                ],
-                "upload_filename": (
-                    "NOTIFY.2020-02-17.2.002.AmmswUYqPToXwlSZiFyK."
-                    f"{letter_template_1.service_id}.{sample_organisation.id}.ZIP"
-                ),
-                # noqa
-            },
-            queue="process-ftp-tasks",
-            compression="zlib",
-        )
-        assert mock_celery.call_args_list[3] == call(
-            name="zip-and-send-letter-pdfs",
-            kwargs={
-                "filenames_to_zip": ["2020-02-17/NOTIFY.REF0.D.2.C.20200217160000.PDF"],
-                "upload_filename": (
-                    "NOTIFY.2020-02-17.2.003.36PwhyI9lFKjzbPiWxwv."
-                    f"{letter_template_1.service_id}.{sample_organisation.id}.ZIP"
-                ),
-                # noqa
-            },
-            queue="process-ftp-tasks",
-            compression="zlib",
-        )
-        assert mock_celery.call_args_list[4] == call(
-            name="zip-and-send-letter-pdfs",
-            kwargs={
-                "filenames_to_zip": ["2020-02-15/NOTIFY.INTERNATIONAL.D.E.C.20200214180000.PDF"],
-                "upload_filename": (
-                    "NOTIFY.2020-02-17.E.001.lDBwqhnG__URJeGz3tH1."
-                    f"{letter_template_1.service_id}.{sample_organisation.id}.ZIP"
-                ),
-                # noqa
-            },
-            queue="process-ftp-tasks",
-            compression="zlib",
-        )
-        assert mock_celery.call_args_list[5] == call(
-            name="zip-and-send-letter-pdfs",
-            kwargs={
-                "filenames_to_zip": [
-                    "2020-02-14/NOTIFY.INTERNATIONAL.D.N.C.20200213180000.PDF",
-                ],
-                "upload_filename": (
-                    "NOTIFY.2020-02-17.N.001.ZE7k_jm7Bg5sYwLswkr4."
-                    f"{letter_template_1.service_id}.{sample_organisation.id}.ZIP"
-                ),
-                # noqa
-            },
-            queue="process-ftp-tasks",
-            compression="zlib",
-        )
 
 
 def test_send_dvla_letters_via_api(sample_letter_template, mocker):
@@ -708,139 +370,6 @@ def test_send_letters_volume_email_to_dvla(notify_api, notify_db_session, mocker
             "international_sheets": 5,
             "date": "17 February 2020",
         }
-
-
-def test_group_letters_splits_on_file_size(notify_api):
-    letters = [
-        # ends under max but next one is too big
-        {"Key": "A.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "B.pdf", "Size": 2, "ServiceId": "123"},
-        # ends on exactly max
-        {"Key": "C.pdf", "Size": 3, "ServiceId": "123"},
-        {"Key": "D.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "E.pdf", "Size": 1, "ServiceId": "123"},
-        # exactly max goes in next file
-        {"Key": "F.pdf", "Size": 5, "ServiceId": "123"},
-        # if it's bigger than the max, still gets included
-        {"Key": "G.pdf", "Size": 6, "ServiceId": "123"},
-        # whatever's left goes in last list
-        {"Key": "H.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "I.pdf", "Size": 1, "ServiceId": "123"},
-    ]
-
-    with set_config_values(notify_api, {"MAX_LETTER_PDF_ZIP_FILESIZE": 5}):
-        x = group_letters(letters)
-
-        assert next(x) == [
-            {"Key": "A.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "B.pdf", "Size": 2, "ServiceId": "123"},
-        ]
-        assert next(x) == [
-            {"Key": "C.pdf", "Size": 3, "ServiceId": "123"},
-            {"Key": "D.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "E.pdf", "Size": 1, "ServiceId": "123"},
-        ]
-        assert next(x) == [{"Key": "F.pdf", "Size": 5, "ServiceId": "123"}]
-        assert next(x) == [{"Key": "G.pdf", "Size": 6, "ServiceId": "123"}]
-        assert next(x) == [
-            {"Key": "H.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "I.pdf", "Size": 1, "ServiceId": "123"},
-        ]
-        # make sure iterator is exhausted
-        assert next(x, None) is None
-
-
-def test_group_letters_splits_on_file_count(notify_api):
-    letters = [
-        {"Key": "A.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "B.pdf", "Size": 2, "ServiceId": "123"},
-        {"Key": "C.pdf", "Size": 3, "ServiceId": "123"},
-        {"Key": "D.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "E.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "F.pdf", "Size": 5, "ServiceId": "123"},
-        {"Key": "G.pdf", "Size": 6, "ServiceId": "123"},
-        {"Key": "H.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "I.pdf", "Size": 1, "ServiceId": "123"},
-    ]
-
-    with set_config_values(notify_api, {"MAX_LETTER_PDF_COUNT_PER_ZIP": 3}):
-        x = group_letters(letters)
-
-        assert next(x) == [
-            {"Key": "A.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "B.pdf", "Size": 2, "ServiceId": "123"},
-            {"Key": "C.pdf", "Size": 3, "ServiceId": "123"},
-        ]
-        assert next(x) == [
-            {"Key": "D.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "E.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "F.pdf", "Size": 5, "ServiceId": "123"},
-        ]
-        assert next(x) == [
-            {"Key": "G.pdf", "Size": 6, "ServiceId": "123"},
-            {"Key": "H.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "I.pdf", "Size": 1, "ServiceId": "123"},
-        ]
-        # make sure iterator is exhausted
-        assert next(x, None) is None
-
-
-def test_group_letters_splits_on_file_size_and_file_count(notify_api):
-    letters = [
-        # ends under max file size but next file is too big
-        {"Key": "A.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "B.pdf", "Size": 2, "ServiceId": "123"},
-        # ends on exactly max number of files and file size
-        {"Key": "C.pdf", "Size": 3, "ServiceId": "123"},
-        {"Key": "D.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "E.pdf", "Size": 1, "ServiceId": "123"},
-        # exactly max file size goes in next file
-        {"Key": "F.pdf", "Size": 5, "ServiceId": "123"},
-        # file size is within max but number of files reaches limit
-        {"Key": "G.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "H.pdf", "Size": 1, "ServiceId": "123"},
-        {"Key": "I.pdf", "Size": 1, "ServiceId": "123"},
-        # whatever's left goes in last list
-        {"Key": "J.pdf", "Size": 1, "ServiceId": "123"},
-    ]
-
-    with set_config_values(notify_api, {"MAX_LETTER_PDF_ZIP_FILESIZE": 5, "MAX_LETTER_PDF_COUNT_PER_ZIP": 3}):
-        x = group_letters(letters)
-
-        assert next(x) == [
-            {"Key": "A.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "B.pdf", "Size": 2, "ServiceId": "123"},
-        ]
-        assert next(x) == [
-            {"Key": "C.pdf", "Size": 3, "ServiceId": "123"},
-            {"Key": "D.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "E.pdf", "Size": 1, "ServiceId": "123"},
-        ]
-        assert next(x) == [{"Key": "F.pdf", "Size": 5, "ServiceId": "123"}]
-        assert next(x) == [
-            {"Key": "G.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "H.pdf", "Size": 1, "ServiceId": "123"},
-            {"Key": "I.pdf", "Size": 1, "ServiceId": "123"},
-        ]
-        assert next(x) == [{"Key": "J.pdf", "Size": 1, "ServiceId": "123"}]
-        # make sure iterator is exhausted
-        assert next(x, None) is None
-
-
-@pytest.mark.parametrize("key", ["A.ZIP", "B.zip"])
-def test_group_letters_ignores_non_pdfs(key):
-    letters = [{"Key": key, "Size": 1}]
-    assert list(group_letters(letters)) == []
-
-
-@pytest.mark.parametrize("key", ["A.PDF", "B.pdf", "C.PdF"])
-def test_group_letters_includes_pdf_files(key):
-    letters = [{"Key": key, "Size": 1, "ServiceId": "123"}]
-    assert list(group_letters(letters)) == [[{"Key": key, "Size": 1, "ServiceId": "123"}]]
-
-
-def test_group_letters_with_no_letters():
-    assert list(group_letters([])) == []
 
 
 def test_move_invalid_letter_and_update_status_logs_error_and_sets_tech_failure_state_if_s3_error(
@@ -1023,7 +552,7 @@ def test_process_sanitised_letter_with_valid_letter(
     sample_letter_notification.created_at = datetime(2018, 7, 1, 12)
     sample_letter_notification.postage = postage
 
-    encrypted_data = encryption.encrypt(
+    encoded_data = signing.encode(
         {
             "page_count": 2,
             "message": None,
@@ -1034,7 +563,7 @@ def test_process_sanitised_letter_with_valid_letter(
             "address": "A. User\nThe house on the corner",
         }
     )
-    process_sanitised_letter(encrypted_data)
+    process_sanitised_letter(encoded_data)
 
     assert sample_letter_notification.status == expected_status
     assert sample_letter_notification.billable_units == 1
@@ -1081,7 +610,7 @@ def test_process_sanitised_letter_sets_postage_international(
     sample_letter_notification.billable_units = 1
     sample_letter_notification.created_at = datetime(2018, 7, 1, 12)
 
-    encrypted_data = encryption.encrypt(
+    encoded_data = signing.encode(
         {
             "page_count": 2,
             "message": None,
@@ -1092,7 +621,7 @@ def test_process_sanitised_letter_sets_postage_international(
             "address": address,
         }
     )
-    process_sanitised_letter(encrypted_data)
+    process_sanitised_letter(encoded_data)
 
     assert sample_letter_notification.status == "created"
     assert sample_letter_notification.billable_units == 1
@@ -1129,7 +658,7 @@ def test_process_sanitised_letter_with_invalid_letter(sample_letter_notification
     sample_letter_notification.billable_units = 1
     sample_letter_notification.created_at = datetime(2018, 7, 1, 12)
 
-    encrypted_data = encryption.encrypt(
+    encoded_data = signing.encode(
         {
             "page_count": 2,
             "message": "content-outside-printable-area",
@@ -1140,7 +669,7 @@ def test_process_sanitised_letter_with_invalid_letter(sample_letter_notification
             "address": None,
         }
     )
-    process_sanitised_letter(encrypted_data)
+    process_sanitised_letter(encoded_data)
 
     assert sample_letter_notification.status == NOTIFICATION_VALIDATION_FAILED
     assert sample_letter_notification.billable_units == 0
@@ -1160,7 +689,7 @@ def test_process_sanitised_letter_when_letter_status_is_not_pending_virus_scan(
     mock_s3 = mocker.patch("app.celery.letters_pdf_tasks.s3")
     sample_letter_notification.status = NOTIFICATION_CREATED
 
-    encrypted_data = encryption.encrypt(
+    encoded_data = signing.encode(
         {
             "page_count": 2,
             "message": None,
@@ -1171,7 +700,7 @@ def test_process_sanitised_letter_when_letter_status_is_not_pending_virus_scan(
             "address": None,
         }
     )
-    process_sanitised_letter(encrypted_data)
+    process_sanitised_letter(encoded_data)
 
     assert not mock_s3.called
 
@@ -1183,7 +712,7 @@ def test_process_sanitised_letter_puts_letter_into_tech_failure_for_boto_errors(
     mocker.patch("app.celery.letters_pdf_tasks.s3.get_s3_object", side_effect=ClientError({}, "operation_name"))
     sample_letter_notification.status = NOTIFICATION_PENDING_VIRUS_CHECK
 
-    encrypted_data = encryption.encrypt(
+    encoded_data = signing.encode(
         {
             "page_count": 2,
             "message": None,
@@ -1196,7 +725,7 @@ def test_process_sanitised_letter_puts_letter_into_tech_failure_for_boto_errors(
     )
 
     with pytest.raises(NotificationTechnicalFailureException):
-        process_sanitised_letter(encrypted_data)
+        process_sanitised_letter(encoded_data)
 
     assert sample_letter_notification.status == NOTIFICATION_TECHNICAL_FAILURE
 
@@ -1209,7 +738,7 @@ def test_process_sanitised_letter_retries_if_there_is_an_exception(
     mock_celery_retry = mocker.patch("app.celery.letters_pdf_tasks.process_sanitised_letter.retry")
 
     sample_letter_notification.status = NOTIFICATION_PENDING_VIRUS_CHECK
-    encrypted_data = encryption.encrypt(
+    encoded_data = signing.encode(
         {
             "page_count": 2,
             "message": None,
@@ -1221,7 +750,7 @@ def test_process_sanitised_letter_retries_if_there_is_an_exception(
         }
     )
 
-    process_sanitised_letter(encrypted_data)
+    process_sanitised_letter(encoded_data)
 
     mock_celery_retry.assert_called_once_with(queue="retry-tasks")
 
@@ -1234,7 +763,7 @@ def test_process_sanitised_letter_puts_letter_into_technical_failure_if_max_retr
     mocker.patch("app.celery.letters_pdf_tasks.process_sanitised_letter.retry", side_effect=MaxRetriesExceededError())
 
     sample_letter_notification.status = NOTIFICATION_PENDING_VIRUS_CHECK
-    encrypted_data = encryption.encrypt(
+    encoded_data = signing.encode(
         {
             "page_count": 2,
             "message": None,
@@ -1247,7 +776,7 @@ def test_process_sanitised_letter_puts_letter_into_technical_failure_if_max_retr
     )
 
     with pytest.raises(NotificationTechnicalFailureException):
-        process_sanitised_letter(encrypted_data)
+        process_sanitised_letter(encoded_data)
 
     assert sample_letter_notification.status == NOTIFICATION_TECHNICAL_FAILURE
 

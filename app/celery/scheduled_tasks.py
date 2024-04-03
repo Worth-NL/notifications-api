@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 import jinja2
+import sentry_sdk
 from flask import current_app
 from notifications_utils.clients.zendesk.zendesk_client import (
     NotifySupportTicket,
@@ -17,9 +18,8 @@ from redis.exceptions import LockError
 from sqlalchemy import and_, between
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import db, dvla_client, notify_celery, statsd_client, zendesk_client
+from app import db, dvla_client, notify_celery, redis_store, statsd_client, zendesk_client
 from app.aws import s3
-from app.celery.broadcast_message_tasks import trigger_link_test
 from app.celery.letters_pdf_tasks import get_pdf_for_templated_letter
 from app.celery.tasks import (
     get_recipient_csv_and_template_and_sender_id,
@@ -35,6 +35,7 @@ from app.constants import (
     JOB_STATUS_IN_PROGRESS,
     JOB_STATUS_PENDING,
     SMS_TYPE,
+    CacheKeys,
 )
 from app.cronitor import cronitor
 from app.dao.annual_billing_dao import set_default_free_allowance_for_service
@@ -53,9 +54,10 @@ from app.dao.jobs_dao import (
     find_missing_row_for_job,
 )
 from app.dao.notifications_dao import (
+    SlowProviderDeliveryReport,
     dao_old_letters_with_created_status,
     dao_precompiled_letters_still_pending_virus_check,
-    get_ratio_of_messages_delivered_slowly_per_provider,
+    get_slow_text_message_delivery_reports_by_provider,
     is_delivery_slow_for_providers,
     letters_missing_from_sending_bucket,
     notifications_not_yet_sent,
@@ -72,8 +74,6 @@ from app.dao.users_dao import delete_codes_older_created_more_than_a_day_ago
 from app.letters.utils import generate_letter_pdf_filename
 from app.models import (
     AnnualBilling,
-    BroadcastMessage,
-    BroadcastStatusType,
     EmailBranding,
     Event,
     Job,
@@ -146,15 +146,83 @@ def switch_current_sms_provider_on_slow_delivery():
                 dao_reduce_sms_provider_priority(provider_name, time_threshold=timedelta(minutes=10))
 
 
+def _check_slow_text_message_delivery_reports_and_raise_error_if_needed(reports: list[SlowProviderDeliveryReport]):
+    total_notifications = sum(report.total_notifications for report in reports)
+    slow_notifications = sum(report.slow_notifications for report in reports)
+    percent_slow_notifications = (slow_notifications / total_notifications) * 100
+
+    # If over 10% of all text messages sent over the period have taken longer than 5 minutes to deliver, let's flag a
+    # sentry error for us to investigate.
+    if percent_slow_notifications >= 10:
+        count = redis_store.incr(CacheKeys.NUMBER_OF_TIMES_OVER_SLOW_SMS_DELIVERY_THRESHOLD)
+
+        # If this is the tenth consecutive time we've seen the threshold breached, then we log an error to Sentry.
+        # This tells us that for at least 10 minutes we've seen delivery take longer than 5 minutes for >10% of
+        # texts sent in the last 15 minutes (yes this is convoluted).
+        #
+        # Every minute, we check all the messages sent in the last 15 minutes. If more than 10% of those took >5
+        # minutes to go from sending->delivered, then we consider that a breach for that minute. This could be triggered
+        # in a number of different ways, for example:
+        #
+        # * 10% of messages taking >5 minutes to deliver, for 10 minutes consecutively.
+        # * 100% of messages taking >5 minutes to deliver, for 3 minutes consecutively. For the following 7 minutes,
+        #   assuming consistent throughput, the average will skew above 10% and continue to breach the threshold. On
+        #   the tenth minute, even if all messages are now delivering quickly, we'll still probably log an error.
+        #
+        # In either case, it's worth investigating.
+        #
+        # By only checking for == 10, we don't log any further errors until we recover and then starting slowing down
+        # again. This should mean that each instance of the error on Sentry actually deserves to be investigated as
+        # a separate issue/potential incident.
+        if count == 10:
+            with sentry_sdk.push_scope() as scope:
+                error_context = {
+                    "Support runbook": (
+                        "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#slow-sms-delivery"
+                    ),
+                    "Slow text messages - #": slow_notifications,
+                    "Slow text messages - %": percent_slow_notifications,
+                    "Total text messages": total_notifications,
+                }
+
+                for report in reports:
+                    error_context[f"provider.{report.provider}.slow_ratio"] = report.slow_ratio
+                    error_context[f"provider.{report.provider}.slow_notifications"] = report.slow_notifications
+                    error_context[f"provider.{report.provider}.total_notifications"] = report.total_notifications
+
+                scope.set_context("Slow SMS delivery", error_context)
+                current_app.logger.error(
+                    "Over 10% of text messages sent in the last 25 minutes have taken over 5 minutes to deliver."
+                )
+
+    else:
+        redis_store.set(CacheKeys.NUMBER_OF_TIMES_OVER_SLOW_SMS_DELIVERY_THRESHOLD, 0)
+
+
 @notify_celery.task(name="generate-sms-delivery-stats")
 def generate_sms_delivery_stats():
     for delivery_interval in (1, 5, 10):
-        providers_slow_delivery_ratios = get_ratio_of_messages_delivered_slowly_per_provider(
+        providers_slow_delivery_reports = get_slow_text_message_delivery_reports_by_provider(
             created_within_minutes=15, delivered_within_minutes=delivery_interval
         )
 
-        for provider, ratio in providers_slow_delivery_ratios.items():
-            statsd_client.gauge(f"slow-delivery.{provider}.delivered-within-minutes.{delivery_interval}.ratio", ratio)
+        for report in providers_slow_delivery_reports:
+            statsd_client.gauge(
+                f"slow-delivery.{report.provider}.delivered-within-minutes.{delivery_interval}.ratio", report.slow_ratio
+            )
+
+        total_notifications = sum(report.total_notifications for report in providers_slow_delivery_reports)
+        slow_notifications = sum(report.slow_notifications for report in providers_slow_delivery_reports)
+        ratio_slow_notifications = slow_notifications / total_notifications
+
+        statsd_client.gauge(
+            f"slow-delivery.sms.delivered-within-minutes.{delivery_interval}.ratio", ratio_slow_notifications
+        )
+
+        # For the 5-minute delivery interval, let's check the percentage of all text messages sent that were slow.
+        # TODO: delete this when we have a way to raise these alerts from eg grafana, prometheus, something else.
+        if delivery_interval == 5 and current_app.is_prod:
+            _check_slow_text_message_delivery_reports_and_raise_error_if_needed(providers_slow_delivery_reports)
 
 
 @notify_celery.task(name="tend-providers-back-to-middle")
@@ -269,7 +337,7 @@ def check_if_letters_still_pending_virus_check():
     if len(letters) > 0:
         letter_ids = [(str(letter.id), letter.reference) for letter in letters]
 
-        msg = f"""{len(letters)} precompiled letters have been pending-virus-check for over 90 minutes.
+        msg = f"""{len(letters)} precompiled letters have been pending-virus-check for over 10 minutes
             We couldn't find them in the scan bucket. We'll need to find out where the files are and kick them off
             again or move them to technical failure.
 
@@ -299,7 +367,7 @@ def check_if_letters_still_in_created():
             f"{len(letters)} letters were created before 17.30 yesterday and still have 'created' status. "
             "Follow runbook to resolve: "
             "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook"
-            "#deal-with-Letters-still-in-created."
+            "#deal-with-letters-still-in-created."
         )
 
         if current_app.should_send_zendesk_alerts:
@@ -382,7 +450,7 @@ def check_for_services_with_high_failure_rates_or_sending_to_tv_numbers():
         if current_app.should_send_zendesk_alerts:
             message += (
                 "\nYou can find instructions for this ticket in our manual:\n"
-                "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#Deal-with-services-with-high-failure-rates-or-sending-sms-to-tv-numbers"  # noqa
+                "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-services-with-high-failure-rates-or-sending-sms-to-tv-numbers"  # noqa
             )  # noqa
             ticket = NotifySupportTicket(
                 subject=f"[{current_app.config['NOTIFY_ENVIRONMENT']}] High failure rates for sms spotted for services",
@@ -391,34 +459,6 @@ def check_for_services_with_high_failure_rates_or_sending_to_tv_numbers():
                 notify_ticket_type=NotifyTicketType.TECHNICAL,
             )
             zendesk_client.send_ticket_to_zendesk(ticket)
-
-
-@notify_celery.task(name="trigger-link-tests")
-def trigger_link_tests():
-    if current_app.config["CBC_PROXY_ENABLED"]:
-        for cbc_name in current_app.config["ENABLED_CBCS"]:
-            trigger_link_test.apply_async(kwargs={"provider": cbc_name}, queue=QueueNames.BROADCASTS)
-
-
-@notify_celery.task(name="auto-expire-broadcast-messages")
-def auto_expire_broadcast_messages():
-    expired_broadcasts = BroadcastMessage.query.filter(
-        BroadcastMessage.finishes_at <= datetime.now(),
-        BroadcastMessage.status == BroadcastStatusType.BROADCASTING,
-    ).all()
-
-    for broadcast in expired_broadcasts:
-        broadcast.status = BroadcastStatusType.COMPLETED
-
-    db.session.commit()
-
-    if expired_broadcasts:
-        notify_celery.send_task(name=TaskNames.PUBLISH_GOVUK_ALERTS, queue=QueueNames.GOVUK_ALERTS)
-
-
-@notify_celery.task(name="remove-yesterdays-planned-tests-on-govuk-alerts")
-def remove_yesterdays_planned_tests_on_govuk_alerts():
-    notify_celery.send_task(name=TaskNames.PUBLISH_GOVUK_ALERTS, queue=QueueNames.GOVUK_ALERTS)
 
 
 @notify_celery.task(name="delete-old-records-from-events-table")
@@ -509,7 +549,7 @@ def check_for_low_available_inbound_sms_numbers():
         f"There are only {num_available_inbound_numbers} inbound SMS numbers currently available for services.\n\n"
         "Request more from our provider (MMG) and load them into the database.\n\n"
         "Follow the guidance here: "
-        "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#Add-new-inbound-SMS-numbers"
+        "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#add-new-inbound-sms-numbers"
     )
 
     ticket = NotifySupportTicket(
@@ -622,4 +662,4 @@ def populate_annual_billing(year, missing_services_only):
 @cronitor("run-populate-annual-billing")
 def run_populate_annual_billing():
     year = get_current_financial_year_start_year()
-    run_populate_annual_billing(year=year, missing_services_only=True)
+    populate_annual_billing(year=year, missing_services_only=True)

@@ -20,7 +20,6 @@ from app.constants import (
     KEY_TYPE_TEST,
     LETTER_TYPE,
     NOTIFICATION_RETURNED_LETTER,
-    SERVICE_PERMISSION_TYPES,
     SMS_TYPE,
     UPLOAD_LETTERS,
 )
@@ -38,7 +37,6 @@ from app.models import (
     Notification,
     Permission,
     Service,
-    ServiceBroadcastSettings,
     ServiceEmailReplyTo,
     ServiceLetterContact,
     ServicePermission,
@@ -135,7 +133,7 @@ def test_get_service_list_by_user_should_return_empty_list_if_no_services(admin_
     assert json_resp["data"] == []
 
 
-def test_get_service_list_should_return_empty_list_if_no_services(admin_request):
+def test_get_service_list_should_return_empty_list_if_no_services(notify_db_session, admin_request):
     json_resp = admin_request.get("service.get_services")
     assert len(json_resp["data"]) == 0
 
@@ -251,9 +249,10 @@ def test_get_service_by_id(admin_request, sample_service):
         "contact_link",
         "count_as_live",
         "created_by",
+        "custom_email_sender_name",
         "email_branding",
-        "email_from",
         "email_message_limit",
+        "email_sender_local_part",
         "go_live_at",
         "go_live_user",
         "has_active_go_live_request",
@@ -276,31 +275,6 @@ def test_get_service_by_id(admin_request, sample_service):
         "volume_letter",
         "volume_sms",
     }
-
-
-@pytest.mark.parametrize(
-    "broadcast_channel,allowed_broadcast_provider",
-    (
-        ("operator", "all"),
-        ("test", "all"),
-        ("severe", "all"),
-        ("government", "all"),
-        ("operator", "o2"),
-        ("test", "ee"),
-        ("severe", "three"),
-        ("government", "vodafone"),
-    ),
-)
-def test_get_service_by_id_for_broadcast_service_returns_broadcast_keys(
-    notify_db_session, admin_request, sample_broadcast_service, broadcast_channel, allowed_broadcast_provider
-):
-    sample_broadcast_service.broadcast_channel = broadcast_channel
-    sample_broadcast_service.allowed_broadcast_provider = allowed_broadcast_provider
-
-    json_resp = admin_request.get("service.get_service_by_id", service_id=sample_broadcast_service.id)
-    assert json_resp["data"]["id"] == str(sample_broadcast_service.id)
-    assert json_resp["data"]["allowed_broadcast_provider"] == allowed_broadcast_provider
-    assert json_resp["data"]["broadcast_channel"] == broadcast_channel
 
 
 @pytest.mark.parametrize("detailed", [True, False])
@@ -397,7 +371,6 @@ def test_create_service(
         "letter_message_limit": 1000,
         "restricted": False,
         "active": False,
-        "email_from": "created.service",
         "created_by": str(sample_user.id),
     }
 
@@ -405,7 +378,7 @@ def test_create_service(
 
     assert json_resp["data"]["id"]
     assert json_resp["data"]["name"] == "created service"
-    assert json_resp["data"]["email_from"] == "created.service"
+    assert json_resp["data"]["email_sender_local_part"] == "created.service"
     assert json_resp["data"]["letter_branding"] is None
     assert json_resp["data"]["count_as_live"] is expected_count_as_live
 
@@ -463,7 +436,6 @@ def test_create_service_with_domain_sets_organisation(
         "letter_message_limit": 1000,
         "restricted": False,
         "active": False,
-        "email_from": "created.service",
         "created_by": str(sample_user.id),
         "service_domain": domain,
     }
@@ -485,7 +457,6 @@ def test_create_service_should_create_annual_billing_for_service(admin_request, 
         "letter_message_limit": 1000,
         "restricted": False,
         "active": False,
-        "email_from": "created.service",
         "created_by": str(sample_user.id),
     }
     assert len(AnnualBilling.query.all()) == 0
@@ -507,7 +478,6 @@ def test_create_service_should_raise_exception_and_not_create_service_if_annual_
         "letter_message_limit": 1000,
         "restricted": False,
         "active": False,
-        "email_from": "created.service",
         "created_by": str(sample_user.id),
     }
     assert len(AnnualBilling.query.all()) == 0
@@ -541,7 +511,6 @@ def test_create_service_inherits_branding_from_organisation(
             "letter_message_limit": 1000,
             "restricted": False,
             "active": False,
-            "email_from": "created.service",
             "created_by": str(sample_user.id),
         },
         _expected_status=201,
@@ -555,7 +524,6 @@ def test_should_not_create_service_with_missing_user_id_field(notify_api, fake_u
     with notify_api.test_request_context():
         with notify_api.test_client() as client:
             data = {
-                "email_from": "service",
                 "name": "created service",
                 "email_message_limit": 1000,
                 "sms_message_limit": 1000,
@@ -577,7 +545,6 @@ def test_should_error_if_created_by_missing(notify_api, sample_user):
     with notify_api.test_request_context():
         with notify_api.test_client() as client:
             data = {
-                "email_from": "service",
                 "name": "created service",
                 "email_message_limit": 1000,
                 "sms_message_limit": 1000,
@@ -599,7 +566,6 @@ def test_should_not_create_service_with_missing_if_user_id_is_not_in_database(no
     with notify_api.test_request_context():
         with notify_api.test_client() as client:
             data = {
-                "email_from": "service",
                 "user_id": fake_uuid,
                 "name": "created service",
                 "email_message_limit": 1000,
@@ -646,7 +612,6 @@ def test_should_not_create_service_with_duplicate_name(notify_api, sample_user, 
                 "letter_message_limit": 1000,
                 "restricted": False,
                 "active": False,
-                "email_from": "sample.service2",
                 "created_by": str(sample_user.id),
             }
             auth_header = create_admin_authorization_header()
@@ -657,10 +622,10 @@ def test_should_not_create_service_with_duplicate_name(notify_api, sample_user, 
             assert "Duplicate service name '{}'".format(sample_service.name) in json_resp["message"]["name"]
 
 
-def test_create_service_should_throw_duplicate_key_constraint_for_existing_email_from(
+def test_create_service_should_throw_duplicate_key_constraint_for_existing_normalised_service_name(
     notify_api, service_factory, sample_user
 ):
-    first_service = service_factory.get("First service", email_from="first.service")
+    first_service = service_factory.get("First service")
     with notify_api.test_request_context():
         with notify_api.test_client() as client:
             service_name = "First SERVICE"
@@ -672,7 +637,6 @@ def test_create_service_should_throw_duplicate_key_constraint_for_existing_email
                 "letter_message_limit": 1000,
                 "restricted": False,
                 "active": False,
-                "email_from": "first.service",
                 "created_by": str(sample_user.id),
             }
             auth_header = create_admin_authorization_header()
@@ -681,43 +645,6 @@ def test_create_service_should_throw_duplicate_key_constraint_for_existing_email
             json_resp = resp.json
             assert json_resp["result"] == "error"
             assert "Duplicate service name '{}'".format(service_name) in json_resp["message"]["name"]
-
-
-@pytest.mark.parametrize(
-    "email_from, should_error",
-    (
-        ("sams.sarnies", False),  # We are happy with plain ascii alnum/full-stops.
-        ("SAMS.SARNIES", True),  # We will reject anything with uppercase characters
-        ("sam's.sarnies", True),  # We reject punctuation other than a full-stop `.`
-        ("sams.Бутерброды", True),  # We reject unicode outside of the ascii charset
-        ("sams.ü", True),  # Even if it could theoretically be downcast to ascii
-        ("sams.u", False),  # Like this, which would be fine
-    ),
-)
-def test_create_service_allows_only_lowercase_digits_and_fullstops_in_email_from(
-    admin_request, service_factory, sample_user, email_from, should_error
-):
-    first_service = service_factory.get("First service", email_from="first.service")
-    service_name = "First SERVICE"
-    data = {
-        "name": service_name,
-        "user_id": str(first_service.users[0].id),
-        "email_message_limit": 1000,
-        "sms_message_limit": 1000,
-        "letter_message_limit": 1000,
-        "restricted": False,
-        "active": False,
-        "email_from": email_from,
-        "created_by": str(sample_user.id),
-    }
-    json_resp = admin_request.post("service.create_service", _data=data, _expected_status=400 if should_error else 201)
-
-    if should_error:
-        assert json_resp["result"] == "error"
-        assert (
-            "Unacceptable characters: `email_from` may only contain letters, numbers and full stops."
-            in json_resp["message"]["email_from"]
-        )
 
 
 @pytest.mark.parametrize("has_active_go_live_request", (True, False))
@@ -730,7 +657,6 @@ def test_update_service(client, notify_db_session, sample_service, has_active_go
 
     data = {
         "name": "updated service name",
-        "email_from": "updated.service.name",
         "created_by": str(sample_service.created_by.id),
         "email_branding": str(brand.id),
         "organisation_type": "school_or_college",
@@ -747,7 +673,7 @@ def test_update_service(client, notify_db_session, sample_service, has_active_go
     result = resp.json
     assert resp.status_code == 200
     assert result["data"]["name"] == "updated service name"
-    assert result["data"]["email_from"] == "updated.service.name"
+    assert result["data"]["email_sender_local_part"] == "updated.service.name"
     assert result["data"]["email_branding"] == str(brand.id)
     assert result["data"]["organisation_type"] == "school_or_college"
     assert result["data"]["has_active_go_live_request"] == has_active_go_live_request
@@ -756,7 +682,6 @@ def test_update_service(client, notify_db_session, sample_service, has_active_go
 def test_cant_update_service_org_type_to_random_value(client, sample_service):
     data = {
         "name": "updated service name",
-        "email_from": "updated.service.name",
         "created_by": str(sample_service.created_by.id),
         "organisation_type": "foo",
     }
@@ -994,37 +919,6 @@ def test_update_service_permissions_will_add_service_permissions(client, sample_
 
 
 @pytest.mark.parametrize(
-    "email_from, should_error",
-    (
-        ("sams.sarnies", False),  # We are happy with plain ascii alnum/full-stops.
-        ("SAMS.SARNIES", True),  # We will reject anything with uppercase characters
-        ("sam's.sarnies", True),  # We reject punctuation other than a full-stop `.`
-        ("sams.Бутерброды", True),  # We reject unicode outside of the ascii charset
-        ("sams.ü", True),  # Even if it could theoretically be downcast to ascii
-        ("sams.u", False),  # Like this, which would be fine
-    ),
-)
-def test_update_service_allows_only_lowercase_digits_and_fullstops_in_email_from(
-    admin_request, sample_service, email_from, should_error
-):
-    data = {"service_name": "Sam's sarnies", "email_from": email_from}
-
-    result = admin_request.post(
-        "service.update_service",
-        service_id=sample_service.id,
-        _data=data,
-        _expected_status=400 if should_error else 200,
-    )
-
-    if should_error:
-        assert result["result"] == "error"
-        assert (
-            "Unacceptable characters: `email_from` may only contain letters, numbers and full stops."
-            in result["message"]["email_from"]
-        )
-
-
-@pytest.mark.parametrize(
     "permission_to_add",
     [
         (EMAIL_TYPE),
@@ -1092,7 +986,7 @@ def test_should_not_update_service_with_duplicate_name(notify_api, notify_db_ses
     with notify_api.test_request_context():
         with notify_api.test_client() as client:
             service_name = "another name"
-            service = create_service(service_name=service_name, user=sample_user, email_from="another.name")
+            service = create_service(service_name=service_name, user=sample_user)
             data = {"name": service_name, "created_by": str(service.created_by.id)}
 
             auth_header = create_admin_authorization_header()
@@ -1108,15 +1002,15 @@ def test_should_not_update_service_with_duplicate_name(notify_api, notify_db_ses
             assert "Duplicate service name '{}'".format(service_name) in json_resp["message"]["name"]
 
 
-def test_should_not_update_service_with_duplicate_email_from(
+def test_should_not_update_service_with_duplicate_normalised_service_name(
     notify_api, notify_db_session, sample_user, sample_service
 ):
     with notify_api.test_request_context():
         with notify_api.test_client() as client:
-            email_from = "duplicate.name"
-            service_name = "duplicate name"
-            service = create_service(service_name=service_name, user=sample_user, email_from=email_from)
-            data = {"name": service_name, "email_from": email_from, "created_by": str(service.created_by.id)}
+            # create a second service
+            create_service(service_name="service name", user=sample_user)
+
+            data = {"name": "SERVICE (name)", "created_by": str(sample_user.id)}
 
             auth_header = create_admin_authorization_header()
 
@@ -1128,10 +1022,7 @@ def test_should_not_update_service_with_duplicate_email_from(
             assert resp.status_code == 400
             json_resp = resp.json
             assert json_resp["result"] == "error"
-            assert (
-                "Duplicate service name '{}'".format(service_name) in json_resp["message"]["name"]
-                or "Duplicate service name '{}'".format(email_from) in json_resp["message"]["name"]
-            )
+            assert "Duplicate service name 'SERVICE (name)'" in json_resp["message"]["name"]
 
 
 def test_update_service_should_404_if_id_is_invalid(notify_api):
@@ -1211,7 +1102,6 @@ def test_default_permissions_are_added_for_user_service(notify_api, notify_db_se
                 "letter_message_limit": 1000,
                 "restricted": False,
                 "active": False,
-                "email_from": "created.service",
                 "created_by": str(sample_user.id),
             }
             auth_header = create_admin_authorization_header()
@@ -1221,7 +1111,6 @@ def test_default_permissions_are_added_for_user_service(notify_api, notify_db_se
             assert resp.status_code == 201
             assert json_resp["data"]["id"]
             assert json_resp["data"]["name"] == "created service"
-            assert json_resp["data"]["email_from"] == "created.service"
 
             auth_header_fetch = create_admin_authorization_header()
 
@@ -1633,8 +1522,8 @@ def test_get_service_and_api_key_history(notify_api, sample_service, sample_api_
 
 
 def test_get_all_notifications_for_service_in_order(client, notify_db_session):
-    service_1 = create_service(service_name="1", email_from="1")
-    service_2 = create_service(service_name="2", email_from="2")
+    service_1 = create_service(service_name="1")
+    service_2 = create_service(service_name="2")
 
     service_1_template = create_template(service_1)
     service_2_template = create_template(service_2)
@@ -1737,7 +1626,7 @@ def test_get_all_notifications_for_service_formatted_for_csv(client, sample_temp
 
 
 def test_get_notification_for_service_without_uuid(client, notify_db_session):
-    service_1 = create_service(service_name="1", email_from="1")
+    service_1 = create_service(service_name="1")
     response = client.get(
         path="/service/{}/notifications/{}".format(service_1.id, "foo"), headers=[create_admin_authorization_header()]
     )
@@ -1745,8 +1634,8 @@ def test_get_notification_for_service_without_uuid(client, notify_db_session):
 
 
 def test_get_notification_for_service(client, notify_db_session):
-    service_1 = create_service(service_name="1", email_from="1")
-    service_2 = create_service(service_name="2", email_from="2")
+    service_1 = create_service(service_name="1")
+    service_2 = create_service(service_name="2")
 
     service_1_template = create_template(service_1)
     service_2_template = create_template(service_2)
@@ -2055,8 +1944,8 @@ def test_get_services_with_detailed_flag_defaults_to_today(client, mocker):
 def test_get_detailed_services_groups_by_service(notify_db_session):
     from app.service.rest import get_detailed_services
 
-    service_1 = create_service(service_name="1", email_from="1")
-    service_2 = create_service(service_name="2", email_from="2")
+    service_1 = create_service(service_name="1")
+    service_2 = create_service(service_name="2")
 
     service_1_template = create_template(service_1)
     service_2_template = create_template(service_2)
@@ -2087,8 +1976,8 @@ def test_get_detailed_services_groups_by_service(notify_db_session):
 def test_get_detailed_services_includes_services_with_no_notifications(notify_db_session):
     from app.service.rest import get_detailed_services
 
-    service_1 = create_service(service_name="1", email_from="1")
-    service_2 = create_service(service_name="2", email_from="2")
+    service_1 = create_service(service_name="1")
+    service_2 = create_service(service_name="2")
 
     service_1_template = create_template(service_1)
     create_notification(service_1_template)
@@ -2681,7 +2570,7 @@ def test_verify_reply_to_email_address_doesnt_allow_duplicates(admin_request, no
     response = admin_request.post(
         "service.verify_reply_to_email_address", service_id=service.id, _data=data, _expected_status=409
     )
-    assert response["message"] == "Your service already uses ‘reply-here@example.gov.uk’ as an email reply-to address."
+    assert response["message"] == "‘reply-here@example.gov.uk’ is already a reply-to email address for this service."
 
 
 def test_add_service_reply_to_email_address(admin_request, sample_service):
@@ -2702,7 +2591,7 @@ def test_add_service_reply_to_email_address_doesnt_allow_duplicates(admin_reques
     response = admin_request.post(
         "service.add_service_reply_to_email_address", service_id=service.id, _data=data, _expected_status=409
     )
-    assert response["message"] == "Your service already uses ‘reply-here@example.gov.uk’ as an email reply-to address."
+    assert response["message"] == "‘reply-here@example.gov.uk’ is already a reply-to email address for this service."
 
 
 def test_add_service_reply_to_email_address_can_add_multiple_addresses(admin_request, sample_service):
@@ -3262,7 +3151,9 @@ def test_cancel_notification_for_service_raises_invalid_request_when_notificatio
 def test_cancel_notification_for_service_raises_invalid_request_when_notification_is_not_a_letter(
     admin_request,
     sample_notification,
+    mocker,
 ):
+    mock_adjust_redis = mocker.patch("app.service.rest.adjust_daily_service_limits_for_cancelled_letters")
     response = admin_request.post(
         "service.cancel_notification_for_service",
         service_id=sample_notification.service_id,
@@ -3271,6 +3162,7 @@ def test_cancel_notification_for_service_raises_invalid_request_when_notificatio
     )
     assert response["message"] == "Notification cannot be cancelled - only letters can be cancelled"
     assert response["result"] == "error"
+    assert not mock_adjust_redis.called
 
 
 @pytest.mark.parametrize(
@@ -3294,8 +3186,10 @@ def test_cancel_notification_for_service_raises_invalid_request_when_notificatio
 def test_cancel_notification_for_service_raises_invalid_request_when_letter_is_in_wrong_state_to_be_cancelled(
     admin_request,
     sample_letter_notification,
+    mocker,
     notification_status,
 ):
+    mock_adjust_redis = mocker.patch("app.service.rest.adjust_daily_service_limits_for_cancelled_letters")
     sample_letter_notification.status = notification_status
     sample_letter_notification.created_at = datetime.now()
 
@@ -3313,6 +3207,7 @@ def test_cancel_notification_for_service_raises_invalid_request_when_letter_is_i
             f"Letter status: {notification_status}, created_at: 2018-07-07 12:00:00"
         )
     assert response["result"] == "error"
+    assert not mock_adjust_redis.called
 
 
 @pytest.mark.parametrize("notification_status", ["created", "pending-virus-check"])
@@ -3320,8 +3215,10 @@ def test_cancel_notification_for_service_raises_invalid_request_when_letter_is_i
 def test_cancel_notification_for_service_updates_letter_if_letter_is_in_cancellable_state(
     admin_request,
     sample_letter_notification,
+    mocker,
     notification_status,
 ):
+    mock_adjust_redis = mocker.patch("app.service.rest.adjust_daily_service_limits_for_cancelled_letters")
     sample_letter_notification.status = notification_status
     sample_letter_notification.created_at = datetime.now()
 
@@ -3331,13 +3228,18 @@ def test_cancel_notification_for_service_updates_letter_if_letter_is_in_cancella
         notification_id=sample_letter_notification.id,
     )
     assert response["status"] == "cancelled"
+    mock_adjust_redis.assert_called_once_with(
+        sample_letter_notification.service_id, 1, sample_letter_notification.created_at
+    )
 
 
 @freeze_time("2017-12-12 17:30:00")
 def test_cancel_notification_for_service_raises_error_if_its_too_late_to_cancel(
     admin_request,
     sample_letter_notification,
+    mocker,
 ):
+    mock_adjust_redis = mocker.patch("app.service.rest.adjust_daily_service_limits_for_cancelled_letters")
     sample_letter_notification.created_at = datetime(2017, 12, 11, 17, 0)
 
     response = admin_request.post(
@@ -3348,6 +3250,7 @@ def test_cancel_notification_for_service_raises_error_if_its_too_late_to_cancel(
     )
     assert response["message"] == "It’s too late to cancel this letter. Printing started on 11 December at 5.30pm"
     assert response["result"] == "error"
+    assert not mock_adjust_redis.called
 
 
 @pytest.mark.parametrize(
@@ -3362,8 +3265,10 @@ def test_cancel_notification_for_service_raises_error_if_its_too_late_to_cancel(
 def test_cancel_notification_for_service_updates_letter_if_still_time_to_cancel(
     admin_request,
     sample_letter_notification,
+    mocker,
     created_at,
 ):
+    mock_adjust_redis = mocker.patch("app.service.rest.adjust_daily_service_limits_for_cancelled_letters")
     sample_letter_notification.created_at = created_at
 
     response = admin_request.post(
@@ -3372,6 +3277,9 @@ def test_cancel_notification_for_service_updates_letter_if_still_time_to_cancel(
         notification_id=sample_letter_notification.id,
     )
     assert response["status"] == "cancelled"
+    mock_adjust_redis.assert_called_once_with(
+        sample_letter_notification.service_id, 1, sample_letter_notification.created_at
+    )
 
 
 def test_get_monthly_notification_data_by_service(sample_service, admin_request):
@@ -3415,7 +3323,7 @@ def test_get_returned_letter_statistics_with_old_returned_letters(
         "app.service.rest.fetch_recent_returned_letter_count",
     )
 
-    assert admin_request.get("service.returned_letter_statistics", service_id=sample_service.id,) == {
+    assert admin_request.get("service.returned_letter_statistics", service_id=sample_service.id) == {
         "returned_letter_count": 0,
         "most_recent_report": "2019-12-03 00:00:00.000000",
     }
@@ -3432,7 +3340,7 @@ def test_get_returned_letter_statistics_with_no_returned_letters(
         "app.service.rest.fetch_recent_returned_letter_count",
     )
 
-    assert admin_request.get("service.returned_letter_statistics", service_id=sample_service.id,) == {
+    assert admin_request.get("service.returned_letter_statistics", service_id=sample_service.id) == {
         "returned_letter_count": 0,
         "most_recent_report": None,
     }
@@ -3590,474 +3498,47 @@ def test_get_returned_letter(admin_request, sample_letter_template):
     assert response[4]["uploaded_letter_file_name"] == "filename.pdf"
 
 
-@pytest.mark.parametrize("channel", ["operator", "test", "severe", "government"])
-def test_set_as_broadcast_service_sets_broadcast_channel(
-    admin_request, sample_service, broadcast_organisation, channel
-):
-    assert sample_service.service_broadcast_settings is None
-    data = {
-        "broadcast_channel": channel,
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-    )
-    assert result["data"]["name"] == "Sample service"
-    assert result["data"]["broadcast_channel"] == channel
-
-    records = ServiceBroadcastSettings.query.filter_by(service_id=sample_service.id).all()
-    assert len(records) == 1
-    assert records[0].service_id == sample_service.id
-    assert records[0].channel == channel
-
-
-def test_set_as_broadcast_service_updates_channel_for_broadcast_service(admin_request, sample_broadcast_service):
-    assert sample_broadcast_service.broadcast_channel == "severe"
-
-    data = {
-        "broadcast_channel": "test",
-        "service_mode": "training",
-        "provider_restriction": "all",
-    }
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_broadcast_service.id,
-        _data=data,
-    )
-    assert result["data"]["name"] == "Sample broadcast service"
-    assert result["data"]["broadcast_channel"] == "test"
-
-    records = ServiceBroadcastSettings.query.filter_by(service_id=sample_broadcast_service.id).all()
-    assert len(records) == 1
-    assert records[0].service_id == sample_broadcast_service.id
-    assert records[0].channel == "test"
-
-
-@pytest.mark.parametrize("channel", ["extreme", "exercise", "random", ""])
-def test_set_as_broadcast_service_rejects_unknown_channels(
-    admin_request, sample_service, broadcast_organisation, channel
-):
-    data = {
-        "broadcast_channel": channel,
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-        _expected_status=400,
-    )
-
-
-def test_set_as_broadcast_service_rejects_if_no_channel(
-    admin_request, notify_db_session, sample_service, broadcast_organisation
-):
-    data = {
-        "service_mode": "training",
-        "provider_restriction": "all",
-    }
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-        _expected_status=400,
-    )
-
-
 @pytest.mark.parametrize(
-    "starting_permissions, ending_permissions",
-    (
-        ([], [BROADCAST_TYPE]),
-        ([EMAIL_AUTH_TYPE], [BROADCAST_TYPE, EMAIL_AUTH_TYPE]),
-        ([p for p in SERVICE_PERMISSION_TYPES if p != BROADCAST_TYPE], [BROADCAST_TYPE, EMAIL_AUTH_TYPE]),
-    ),
+    "new_custom_email_sender_name, expected_email_sender_local_part",
+    [
+        ("some other name", "some.other.name"),
+        # clearing custom_email_sender_name sets local part back to the normalised service name
+        (None, "sample.service"),
+    ],
 )
-def test_set_as_broadcast_service_gives_broadcast_permission_and_removes_other_channel_permissions(
-    admin_request, broadcast_organisation, starting_permissions, ending_permissions
-):
-    sample_service = create_service(service_permissions=starting_permissions)
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "training",
-        "provider_restriction": "all",
-    }
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-    )
-    assert set(result["data"]["permissions"]) == set(ending_permissions)
-
-    permissions = ServicePermission.query.filter_by(service_id=sample_service.id).all()
-    assert set([p.permission for p in permissions]) == set(ending_permissions)
-
-
-@pytest.mark.parametrize(
-    "has_email_auth, ending_permissions",
-    (
-        (False, [BROADCAST_TYPE]),
-        (True, [BROADCAST_TYPE, EMAIL_AUTH_TYPE]),
-    ),
-)
-def test_set_as_broadcast_service_maintains_broadcast_permission_for_existing_broadcast_service(
-    admin_request, sample_broadcast_service, has_email_auth, ending_permissions
-):
-    if has_email_auth:
-        service_permission = ServicePermission(service_id=sample_broadcast_service.id, permission=EMAIL_AUTH_TYPE)
-        sample_broadcast_service.permissions.append(service_permission)
-
-    current_permissions = [p.permission for p in sample_broadcast_service.permissions]
-    assert set(current_permissions) == set(ending_permissions)
-
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_broadcast_service.id,
-        _data=data,
-    )
-    assert set(result["data"]["permissions"]) == set(ending_permissions)
-
-    permissions = ServicePermission.query.filter_by(service_id=sample_broadcast_service.id).all()
-    assert set([p.permission for p in permissions]) == set(ending_permissions)
-
-
-def test_set_as_broadcast_service_sets_count_as_live_to_false(admin_request, sample_service, broadcast_organisation):
-    assert sample_service.count_as_live is True
-
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-    )
-    assert result["data"]["count_as_live"] is False
-
-    service_from_db = Service.query.filter_by(id=sample_service.id).all()[0]
-    assert service_from_db.count_as_live is False
-
-
-def test_set_as_broadcast_service_sets_service_org_to_broadcast_org(
-    admin_request, sample_service, broadcast_organisation
-):
-    assert sample_service.organisation_id != current_app.config["BROADCAST_ORGANISATION_ID"]
-
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "training",
-        "provider_restriction": "all",
-    }
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-    )
-    assert result["data"]["organisation"] == current_app.config["BROADCAST_ORGANISATION_ID"]
-
-    service_from_db = Service.query.filter_by(id=sample_service.id).all()[0]
-    assert str(service_from_db.organisation_id) == current_app.config["BROADCAST_ORGANISATION_ID"]
-
-
-def test_set_as_broadcast_service_does_not_error_if_run_on_a_service_that_is_already_a_broadcast_service(
-    admin_request, sample_service, broadcast_organisation
-):
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-    for _ in range(2):
-        admin_request.post(
-            "service.set_as_broadcast_service",
-            service_id=sample_service.id,
-            _data=data,
-        )
-
-
-@freeze_time("2021-02-02")
-def test_set_as_broadcast_service_sets_service_to_live_mode(
-    admin_request, notify_db_session, sample_service, broadcast_organisation
-):
-    sample_service.restricted = True
-    notify_db_session.add(sample_service)
-    notify_db_session.commit()
-    assert sample_service.restricted is True
-    assert sample_service.go_live_at is None
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-    )
-    assert result["data"]["name"] == "Sample service"
-    assert result["data"]["restricted"] is False
-    assert result["data"]["go_live_at"] == "2021-02-02 00:00:00.000000"
-
-
-def test_set_as_broadcast_service_doesnt_override_existing_go_live_at(
-    admin_request, notify_db_session, sample_broadcast_service
-):
-    sample_broadcast_service.restricted = False
-    sample_broadcast_service.go_live_at = datetime(2021, 1, 1)
-    notify_db_session.add(sample_broadcast_service)
-    notify_db_session.commit()
-    assert sample_broadcast_service.restricted is False
-    assert sample_broadcast_service.go_live_at is not None
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_broadcast_service.id,
-        _data=data,
-    )
-    assert result["data"]["name"] == "Sample broadcast service"
-    assert result["data"]["restricted"] is False
-    assert result["data"]["go_live_at"] == "2021-01-01 00:00:00.000000"
-
-
-def test_set_as_broadcast_service_sets_service_to_training_mode(
-    admin_request, notify_db_session, sample_broadcast_service
-):
-    sample_broadcast_service.restricted = False
-    sample_broadcast_service.go_live_at = datetime(2021, 1, 1)
-    notify_db_session.add(sample_broadcast_service)
-    notify_db_session.commit()
-    assert sample_broadcast_service.restricted is False
-    assert sample_broadcast_service.go_live_at is not None
-
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "training",
-        "provider_restriction": "all",
-    }
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_broadcast_service.id,
-        _data=data,
-    )
-    assert result["data"]["name"] == "Sample broadcast service"
-    assert result["data"]["restricted"] is True
-    assert result["data"]["go_live_at"] is None
-
-
-@pytest.mark.parametrize("service_mode", ["testing", ""])
-def test_set_as_broadcast_service_rejects_unknown_service_mode(
-    admin_request, sample_service, broadcast_organisation, service_mode
-):
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": service_mode,
-        "provider_restriction": "all",
-    }
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-        _expected_status=400,
-    )
-
-
-def test_set_as_broadcast_service_rejects_if_no_service_mode(admin_request, sample_service, broadcast_organisation):
-    data = {
-        "broadcast_channel": "severe",
-        "provider_restriction": "all",
-    }
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-        _expected_status=400,
-    )
-
-
-@pytest.mark.parametrize("provider", ["all", "three", "ee", "vodafone", "o2"])
-def test_set_as_broadcast_service_sets_mobile_provider_restriction(
-    admin_request, sample_service, broadcast_organisation, provider
-):
-    assert sample_service.service_broadcast_settings is None
-    data = {"broadcast_channel": "severe", "service_mode": "live", "provider_restriction": provider}
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-    )
-    assert result["data"]["name"] == "Sample service"
-    assert result["data"]["allowed_broadcast_provider"] == provider
-
-    records = ServiceBroadcastSettings.query.filter_by(service_id=sample_service.id).all()
-    assert len(records) == 1
-    assert records[0].service_id == sample_service.id
-    assert records[0].provider == provider
-
-
-@pytest.mark.parametrize("provider", ["all", "vodafone"])
-def test_set_as_broadcast_service_updates_mobile_provider_restriction(
-    admin_request, notify_db_session, sample_broadcast_service, provider
-):
-    sample_broadcast_service.service_broadcast_settings.provider = "o2"
-    notify_db_session.add(sample_broadcast_service)
-    notify_db_session.commit()
-    assert sample_broadcast_service.service_broadcast_settings.provider == "o2"
-
-    data = {"broadcast_channel": "severe", "service_mode": "live", "provider_restriction": provider}
-
-    result = admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_broadcast_service.id,
-        _data=data,
-    )
-
-    assert result["data"]["name"] == "Sample broadcast service"
-    assert result["data"]["allowed_broadcast_provider"] == provider
-
-    records = ServiceBroadcastSettings.query.filter_by(service_id=sample_broadcast_service.id).all()
-    assert len(records) == 1
-    assert records[0].service_id == sample_broadcast_service.id
-    assert records[0].provider == provider
-
-
-@pytest.mark.parametrize("provider", ["three, o2", "giffgaff", "", "None"])
-def test_set_as_broadcast_service_rejects_unknown_provider_restriction(
-    admin_request, sample_service, broadcast_organisation, provider
-):
-    data = {"broadcast_channel": "test", "service_mode": "live", "provider_restriction": provider}
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-        _expected_status=400,
-    )
-
-
-def test_set_as_broadcast_service_errors_if_no_mobile_provider_restriction(
-    admin_request, sample_service, broadcast_organisation
-):
-    data = {
-        "broadcast_channel": "severe",
-        "service_mode": "live",
-    }
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-        _expected_status=400,
-    )
-
-
-def test_set_as_broadcast_service_updates_services_history(admin_request, sample_service, broadcast_organisation):
-    old_history_records = Service.get_history_model().query.filter_by(id=sample_service.id).all()
-    data = {
-        "broadcast_channel": "test",
-        "service_mode": "live",
-        "provider_restriction": "all",
-    }
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data=data,
-    )
-
-    new_history_records = Service.get_history_model().query.filter_by(id=sample_service.id).all()
-    assert len(new_history_records) == len(old_history_records) + 1
-
-
-def test_set_as_broadcast_service_removes_user_permissions(
+def test_update_service_set_custom_email_sender_name_sets_email_sender_local_part(
+    sample_user,
     admin_request,
-    broadcast_organisation,
-    sample_service,
-    sample_service_full_permissions,
-    sample_invited_user,
+    new_custom_email_sender_name,
+    expected_email_sender_local_part,
 ):
-    service_user = sample_service.users[0]
-
-    # make the user a member of a second service
-    dao_add_user_to_service(
-        sample_service_full_permissions,
-        service_user,
-        permissions=[
-            Permission(service_id=sample_service_full_permissions.id, user_id=service_user.id, permission="send_emails")
-        ],
+    # set columns directly to avoid hitting the hybrid properties
+    service = Service(
+        name="Sample service",
+        _custom_email_sender_name="existing name",
+        _email_sender_local_part="existing.name",
+        restricted=True,
+        created_by=sample_user,
     )
-    assert len(service_user.get_permissions(service_id=sample_service.id)) == 8
-    assert len(sample_invited_user.get_permissions()) == 3
+    from app.dao.services_dao import dao_update_service
+
+    # use the dao method as it creates a proper history version
+    dao_update_service(service)
 
     admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data={"broadcast_channel": "test", "service_mode": "live", "provider_restriction": "ee"},
+        "service.update_service",
+        service_id=service.id,
+        _data={"custom_email_sender_name": new_custom_email_sender_name},
     )
 
-    # The user permissions for the broadcast service (apart from 'view_activity') get removed
-    assert service_user.get_permissions(service_id=sample_service.id) == ["view_activity"]
+    assert service.name == "Sample service"
+    assert service.custom_email_sender_name == new_custom_email_sender_name
+    assert service.email_sender_local_part == expected_email_sender_local_part
 
-    # Permissions for users invited to the broadcast service (apart from 'view_activity') get removed
-    assert sample_invited_user.permissions == "view_activity"
+    ServiceHistory = Service.get_history_model()
+    prev_history, new_history = ServiceHistory.query.filter_by(id=service.id).order_by(ServiceHistory.version)
+    assert prev_history.version == 2
+    assert prev_history.email_sender_local_part == "existing.name"
 
-    # Permissions for other services remain
-    assert service_user.get_permissions(service_id=sample_service_full_permissions.id) == ["send_emails"]
-
-
-@freeze_time("2021-12-21")
-def test_set_as_broadcast_service_revokes_api_keys(
-    admin_request,
-    broadcast_organisation,
-    sample_service,
-    sample_service_full_permissions,
-):
-    api_key_1 = create_api_key(service=sample_service)
-    api_key_2 = create_api_key(service=sample_service)
-    api_key_3 = create_api_key(service=sample_service_full_permissions)
-
-    api_key_2.expiry_date = datetime.utcnow() - timedelta(days=365)
-
-    admin_request.post(
-        "service.set_as_broadcast_service",
-        service_id=sample_service.id,
-        _data={
-            "broadcast_channel": "government",
-            "service_mode": "live",
-            "provider_restriction": "all",
-        },
-    )
-
-    # This key should have a new expiry date
-    assert api_key_1.expiry_date.isoformat().startswith("2021-12-21")
-
-    # This key keeps its old expiry date
-    assert api_key_2.expiry_date.isoformat().startswith("2020-12-21")
-
-    # This key is from a different service
-    assert api_key_3.expiry_date is None
+    assert new_history.version == 3
+    assert new_history.email_sender_local_part == expected_email_sender_local_part

@@ -12,8 +12,8 @@ from app import (
     api_user,
     authenticated_service,
     document_download_client,
-    encryption,
     notify_celery,
+    signing,
 )
 from app.celery.letters_pdf_tasks import (
     get_pdf_for_templated_letter,
@@ -293,12 +293,12 @@ def save_email_or_sms_to_queue(
         "status": NOTIFICATION_CREATED,
         "created_at": datetime.utcnow().strftime(DATETIME_FORMAT),
     }
-    encrypted = encryption.encrypt(data)
+    encoded = signing.encode(data)
 
     if notification_type == EMAIL_TYPE:
-        save_api_email.apply_async([encrypted], queue=QueueNames.SAVE_API_EMAIL)
+        save_api_email.apply_async([encoded], queue=QueueNames.SAVE_API_EMAIL)
     elif notification_type == SMS_TYPE:
-        save_api_sms.apply_async([encrypted], queue=QueueNames.SAVE_API_SMS)
+        save_api_sms.apply_async([encoded], queue=QueueNames.SAVE_API_SMS)
 
     return Notification(**data)
 
@@ -337,6 +337,8 @@ def process_document_uploads(personalisation_data, service, send_to: str, simula
                 personalisation_data[key].get("retention_period") or DEFAULT_DOCUMENT_DOWNLOAD_RETENTION_PERIOD
             )
 
+            filename = personalisation_data[key].get("filename")
+
             try:
                 personalisation_data[key] = document_download_client.upload_document(
                     service.id,
@@ -344,6 +346,7 @@ def process_document_uploads(personalisation_data, service, send_to: str, simula
                     personalisation_data[key].get("is_csv"),
                     confirmation_email=send_to if confirm_email is not False else None,
                     retention_period=retention_period,
+                    filename=filename,
                 )
             except DocumentDownloadError as e:
                 raise BadRequestError(message=e.message, status_code=e.status_code) from e
@@ -490,7 +493,7 @@ def create_response_for_post_notification(
         create_resp_partial = functools.partial(
             create_post_email_response_from_notification,
             subject=template_with_content.subject,
-            email_from="{}@{}".format(authenticated_service.email_from, current_app.config["NOTIFY_EMAIL_DOMAIN"]),
+            email_from=f"{authenticated_service.email_sender_local_part}@{current_app.config['NOTIFY_EMAIL_DOMAIN']}",
         )
     elif notification_type == LETTER_TYPE:
         create_resp_partial = functools.partial(

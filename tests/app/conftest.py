@@ -12,7 +12,6 @@ from sqlalchemy.orm.session import make_transient
 from app import db
 from app.clients.sms.firetext import FiretextClient
 from app.constants import (
-    BROADCAST_TYPE,
     EMAIL_TYPE,
     KEY_TYPE_NORMAL,
     KEY_TYPE_TEAM,
@@ -22,16 +21,10 @@ from app.constants import (
     SMS_TYPE,
 )
 from app.dao.api_key_dao import save_model_api_key
-from app.dao.broadcast_service_dao import (
-    insert_or_update_service_broadcast_settings,
-)
 from app.dao.invited_user_dao import save_invited_user
 from app.dao.jobs_dao import dao_create_job
 from app.dao.notifications_dao import dao_create_notification
-from app.dao.organisation_dao import (
-    dao_add_service_to_organisation,
-    dao_create_organisation,
-)
+from app.dao.organisation_dao import dao_create_organisation
 from app.dao.services_dao import dao_add_user_to_service, dao_create_service
 from app.dao.templates_dao import dao_create_template
 from app.dao.users_dao import create_secret_code, create_user_code
@@ -54,6 +47,7 @@ from app.models import (
 )
 from tests import (
     create_admin_authorization_header,
+    create_functional_tests_authorization_header,
     create_service_authorization_header,
 )
 from tests.app.db import (
@@ -80,14 +74,11 @@ def rmock():
 @pytest.fixture(scope="function")
 def service_factory(sample_user):
     class ServiceFactory(object):
-        def get(self, service_name, user=None, template_type=None, email_from=None):
+        def get(self, service_name, user=None, template_type=None):
             if not user:
                 user = sample_user
-            if not email_from:
-                email_from = service_name
 
             service = create_service(
-                email_from=email_from,
                 service_name=service_name,
                 service_permissions=None,
                 user=user,
@@ -98,7 +89,7 @@ def service_factory(sample_user):
                     service,
                     template_name="Template Name",
                     template_type=template_type,
-                    subject=service.email_from,
+                    subject=service.email_sender_local_part,
                 )
             else:
                 create_template(
@@ -139,7 +130,6 @@ def sample_sms_code(notify_db_session):
 @pytest.fixture(scope="function")
 def sample_service(sample_user):
     service_name = "Sample service"
-    email_from = service_name.lower().replace(" ", ".")
 
     data = {
         "name": service_name,
@@ -147,7 +137,6 @@ def sample_service(sample_user):
         "sms_message_limit": 1000,
         "letter_message_limit": 1000,
         "restricted": False,
-        "email_from": email_from,
         "created_by": sample_user,
         "crown": True,
     }
@@ -166,64 +155,6 @@ def sample_service(sample_user):
 def sample_service_with_email_branding(sample_service):
     sample_service.email_branding = create_email_branding(id=uuid.uuid4())
     return sample_service
-
-
-@pytest.fixture(scope="function")
-def sample_broadcast_service(broadcast_organisation, sample_user):
-    service_name = "Sample broadcast service"
-    email_from = service_name.lower().replace(" ", ".")
-
-    data = {
-        "name": service_name,
-        "email_message_limit": 1000,
-        "sms_message_limit": 1000,
-        "letter_message_limit": 1000,
-        "restricted": False,
-        "email_from": email_from,
-        "created_by": sample_user,
-        "crown": True,
-        "count_as_live": False,
-    }
-    service = Service.query.filter_by(name=service_name).first()
-    if not service:
-        service = Service(**data)
-        dao_create_service(service, sample_user, service_permissions=[BROADCAST_TYPE])
-        insert_or_update_service_broadcast_settings(service, channel="severe")
-        dao_add_service_to_organisation(service, current_app.config["BROADCAST_ORGANISATION_ID"])
-    else:
-        if sample_user not in service.users:
-            dao_add_user_to_service(service, sample_user)
-
-    return service
-
-
-@pytest.fixture(scope="function")
-def sample_broadcast_service_2(broadcast_organisation, sample_user):
-    service_name = "Sample broadcast service 2"
-    email_from = service_name.lower().replace(" ", ".")
-
-    data = {
-        "name": service_name,
-        "email_message_limit": 1000,
-        "sms_message_limit": 1000,
-        "letter_message_limit": 1000,
-        "restricted": False,
-        "email_from": email_from,
-        "created_by": sample_user,
-        "crown": True,
-        "count_as_live": False,
-    }
-    service = Service.query.filter_by(name=service_name).first()
-    if not service:
-        service = Service(**data)
-        dao_create_service(service, sample_user, service_permissions=[BROADCAST_TYPE])
-        insert_or_update_service_broadcast_settings(service, channel="severe")
-        dao_add_service_to_organisation(service, current_app.config["BROADCAST_ORGANISATION_ID"])
-    else:
-        if sample_user not in service.users:
-            dao_add_user_to_service(service, sample_user)
-
-    return service
 
 
 @pytest.fixture(scope="function", name="sample_service_full_permissions")
@@ -685,19 +616,6 @@ def invitation_email_template(notify_service):
 
 
 @pytest.fixture(scope="function")
-def broadcast_invitation_email_template(notify_service):
-    content = ("((user_name)) is invited to broadcast Notify by ((service_name)) ((url)) to complete registration",)
-    return create_custom_template(
-        service=notify_service,
-        user=notify_service.users[0],
-        template_config_name="BROADCAST_INVITATION_EMAIL_TEMPLATE_ID",
-        content=content,
-        subject="Invitation to ((service_name))",
-        template_type="email",
-    )
-
-
-@pytest.fixture(scope="function")
 def org_invite_email_template(notify_service):
     return create_custom_template(
         service=notify_service,
@@ -705,6 +623,30 @@ def org_invite_email_template(notify_service):
         template_config_name="ORGANISATION_INVITATION_EMAIL_TEMPLATE_ID",
         content="((user_name)) ((organisation_name)) ((url))",
         subject="Invitation to ((organisation_name))",
+        template_type="email",
+    )
+
+
+@pytest.fixture(scope="function")
+def request_invite_email_template(notify_service):
+    return create_custom_template(
+        service=notify_service,
+        user=notify_service.users[0],
+        template_config_name="REQUEST_INVITE_TO_SERVICE_TEMPLATE_ID",
+        content="((user_name)) ((organisation_name)) ((url))",
+        subject="((requester_name)) wants to join your GOV.UK Notify service",
+        template_type="email",
+    )
+
+
+@pytest.fixture(scope="function")
+def receipt_for_request_invite_email_template(notify_service):
+    return create_custom_template(
+        service=notify_service,
+        user=notify_service.users[0],
+        template_config_name="RECEIPT_FOR_REQUEST_INVITE_TO_SERVICE_TEMPLATE_ID",
+        content="((name)) ((requester_name)) ((service_name)) ((reason)) ((url)) ((requester_email))",
+        subject="",
         template_type="email",
     )
 
@@ -890,9 +832,60 @@ def organisation_has_new_go_live_request_template(notify_service):
     return create_custom_template(
         service=notify_service,
         user=notify_service.users[0],
-        template_config_name="ORGANISATION_HAS_NEW_GO_LIVE_REQUEST_TEMPLATE_ID",
+        template_config_name="GO_LIVE_NEW_REQUEST_FOR_ORG_USERS_TEMPLATE_ID",
         content=template_content,
         subject="Request to go live: ((service_name))",
+        template_type="email",
+    )
+
+
+@pytest.fixture(scope="function")
+def organisation_next_steps_for_go_live_request_template(notify_service):
+    template_content = textwrap.dedent(
+        """\
+        ((body))
+        """
+    )
+
+    return create_custom_template(
+        service=notify_service,
+        user=notify_service.users[0],
+        template_config_name="GO_LIVE_REQUEST_NEXT_STEPS_FOR_ORG_USER_TEMPLATE_ID",
+        content=template_content,
+        subject="Request to go live: ((service_name))",
+        template_type="email",
+    )
+
+
+@pytest.fixture(scope="function")
+def organisation_reject_go_live_request_template(notify_service):
+    template_content = textwrap.dedent(
+        """\
+        Hi ((name))
+
+        # Your request to go live was rejected
+
+        You sent a request to go live for a GOV.UK Notify service called ‘((service_name))’.
+
+        ((organisation_team_member_name)) at ((organisation_name)) rejected the request for the following reason:
+
+        ((reason))
+
+        If you have any questions, you can email ((organisation_team_member_name)) at ((organisation_team_member_email))
+
+        Thanks
+
+        GOV.​UK Notify team
+        https://www.gov.uk/notify
+        """  # noqa
+    )
+
+    return create_custom_template(
+        service=notify_service,
+        user=notify_service.users[0],
+        template_config_name="GO_LIVE_REQUEST_REJECTED_BY_ORG_USER_TEMPLATE_ID",
+        content=template_content,
+        subject="Your request to go live has been rejected",
         template_type="email",
     )
 
@@ -907,7 +900,6 @@ def notify_service(notify_db_session, sample_user):
             sms_message_limit=1000,
             letter_message_limit=1000,
             restricted=False,
-            email_from="notify.service",
             created_by=sample_user,
             prefix_sms=False,
         )
@@ -950,16 +942,6 @@ def sample_inbound_numbers(sample_service):
 def sample_organisation(notify_db_session):
     org = Organisation(name="sample organisation")
     dao_create_organisation(org)
-    return org
-
-
-@pytest.fixture
-def broadcast_organisation(notify_db_session):
-    org = Organisation.query.get(current_app.config["BROADCAST_ORGANISATION_ID"])
-    if not org:
-        org = Organisation(id=current_app.config["BROADCAST_ORGANISATION_ID"], name="broadcast organisation")
-        dao_create_organisation(org)
-
     return org
 
 
@@ -1058,6 +1040,28 @@ def admin_request(client):
 
 
 @pytest.fixture
+def functional_tests_request(client):
+    class FunctionalTestsRequest:
+        app = client.application
+
+        @staticmethod
+        def put(endpoint, _data=None, _expected_status=200, **endpoint_kwargs):
+            resp = client.put(
+                url_for(endpoint, **(endpoint_kwargs or {})),
+                data=json.dumps(_data),
+                headers=[("Content-Type", "application/json"), create_functional_tests_authorization_header()],
+            )
+            if resp.get_data():
+                json_resp = resp.json
+            else:
+                json_resp = None
+            assert resp.status_code == _expected_status
+            return json_resp
+
+    return FunctionalTestsRequest
+
+
+@pytest.fixture
 def api_client_request(client, notify_user):
     """
     For v2 endpoints. Same as admin_request, except all functions take a required service_id and an optional
@@ -1104,6 +1108,13 @@ def api_client_request(client, notify_user):
             return json_resp
 
     return ApiClientRequest
+
+
+@pytest.fixture(scope="function")
+def mock_onwards_request_headers(mocker):
+    mock_gorh = mocker.patch("notifications_utils.request_helper.NotifyRequest.get_onwards_request_headers")
+    mock_gorh.return_value = {"some-onwards": "request-headers"}
+    return mock_gorh
 
 
 def datetime_in_past(days=0, seconds=0):

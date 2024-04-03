@@ -85,7 +85,7 @@ get_notifications_request = {
             "type": "array",
             "items": {
                 "enum": NOTIFICATION_STATUS_TYPES
-                + [NOTIFICATION_STATUS_LETTER_ACCEPTED + ", " + NOTIFICATION_STATUS_LETTER_RECEIVED]
+                + [NOTIFICATION_STATUS_LETTER_ACCEPTED, NOTIFICATION_STATUS_LETTER_RECEIVED]
             },
         },
         "template_type": {"type": "array", "items": {"enum": NOTIFICATION_TYPES}},
@@ -123,7 +123,6 @@ send_a_file_validation = {
         },
         "is_csv": {
             "format": "send_a_file_is_csv",
-            "required": False,
         },
         "confirm_email_before_download": {
             "format": "send_a_file_confirm_email_before_download",
@@ -133,7 +132,19 @@ send_a_file_validation = {
             "format": "send_a_file_retention_period",
             "required": False,
         },
+        "filename": {
+            "format": "send_a_file_filename",
+        },
     },
+    "allOf": [
+        {
+            "anyOf": [
+                {"not": {"required": ["is_csv"]}},
+                {"not": {"required": ["filename"]}},
+            ],
+            "validationMessage": "Do not set a value for `is_csv` if `filename` is set.",
+        }
+    ],
 }
 
 post_sms_request = {

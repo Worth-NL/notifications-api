@@ -30,7 +30,7 @@ from tests.app.db import (
     create_template,
     create_user,
 )
-from tests.utils import count_sqlalchemy_queries
+from tests.utils import QueryRecorder
 
 
 def test_get_all_organisations(admin_request, notify_db_session, nhs_email_branding, nhs_letter_branding):
@@ -172,7 +172,9 @@ def test_organisation_search_finds_organisations(notify_db_session, admin_reques
     organisation_2 = create_organisation(name="ABCGHT")
     create_organisation(name="ZYSWVU")
     response = admin_request.get("organisation.search", name="ABC")
-    assert response["data"] == [organisation_1.serialize_for_list(), organisation_2.serialize_for_list()]
+    assert sorted(response["data"], key=lambda x: x["id"]) == sorted(
+        [organisation_1.serialize_for_list(), organisation_2.serialize_for_list()], key=lambda x: x["id"]
+    )
 
 
 def test_organisation_search_handles_no_results(notify_db_session, admin_request):
@@ -548,6 +550,7 @@ def test_post_update_organisation_set_mou_emails_signed_by(
     on_behalf_of_name,
     on_behalf_of_email_address,
     templates_and_recipients,
+    hostnames,
 ):
     queue_mock = mocker.patch("app.organisation.rest.send_notification_to_queue")
     sample_organisation.agreement_signed_on_behalf_of_name = on_behalf_of_name
@@ -566,9 +569,9 @@ def test_post_update_organisation_set_mou_emails_signed_by(
     for n in notifications:
         # we pass in the same personalisation for all templates (though some templates don't use all fields)
         assert n.personalisation == {
-            "mou_link": "http://localhost:6012/agreement/non-crown.pdf",
+            "mou_link": f"{hostnames.admin}/agreement/non-crown.pdf",
             "org_name": "sample organisation",
-            "org_dashboard_link": "http://localhost:6012/organisations/{}".format(sample_organisation.id),
+            "org_dashboard_link": f"{hostnames.admin}/organisations/{sample_organisation.id}",
             "signed_by_name": "Test User",
             "on_behalf_of_name": on_behalf_of_name,
         }
@@ -878,14 +881,6 @@ def test_get_organisation_services_usage(admin_request, notify_db_session, mocke
     assert response["updated_at"] == "2019-06-01T12:00:00+00:00"
 
 
-@pytest.mark.skip(
-    "Another test (`test_cbc_proxy_vodafone_send_link_test_invokes_function`) fails when we enable "
-    "SQLALCHEMY_RECORD_QUERIES, which is a requirement for this test. So we can't run this for now ... but "
-    "maybe the flask-sqlalchemy/psycopg2 edge case causing the exception (below) will eventually be fixed and we can "
-    "re-enable this. This exception is thrown when trying to record the query result, after sqlalchemy fetches the "
-    "next value from a sequence (sqlalchemy.engine.default.DefaultExecutionContext._execute_scalar).\n\n"
-    "Test error: *** AttributeError: 'PGExecutionContext_psycopg2' object has no attribute 'parameters'"
-)
 @pytest.mark.parametrize("num_services", [1, 5, 10])
 @freeze_time("2020-02-24 13:30")
 def test_get_organisation_services_usage_limit_queries_executed(admin_request, notify_db_session, num_services):
@@ -904,10 +899,10 @@ def test_get_organisation_services_usage_limit_queries_executed(admin_request, n
                 notifications_sent=num_billing_days + 1,
             )
 
-    with count_sqlalchemy_queries() as get_query_count:
+    with QueryRecorder() as query_recorder:
         admin_request.get("organisation.get_organisation_services_usage", organisation_id=org.id, **{"year": 2019})
 
-    assert get_query_count() == 9, (
+    assert len(query_recorder.queries) == 5, (
         "The number of queries executed by this view has changed. The number of queries executed "
         "shouldn't increase as the number of org services increases. If this has increased by 1 or 2 queries, and "
         "affects all parameterized versions of this test, you can probably accept the change. If only one of the "
@@ -1038,7 +1033,7 @@ def test_remove_email_branding_from_organisation_pool(
     dao_add_email_branding_to_organisation_pool(
         organisation_id=sample_organisation.id, email_branding_id=second_branding.id
     )
-    assert sample_organisation.email_branding_pool == [first_branding, second_branding]
+    assert set(sample_organisation.email_branding_pool) == {first_branding, second_branding}
 
     admin_request.delete(
         "organisation.remove_email_branding_from_organisation_pool",
@@ -1196,6 +1191,7 @@ def test_notify_org_users_of_request_to_go_live(
     sample_organisation,
     sample_service,
     organisation_has_new_go_live_request_template,
+    hostnames,
 ):
     notify_service = dao_fetch_service_by_id(current_app.config["NOTIFY_SERVICE_ID"])
 
@@ -1244,8 +1240,8 @@ def test_notify_org_users_of_request_to_go_live(
                 "service_name": "Sample service",
                 "requester_name": "Go live user",
                 "requester_email_address": "go-live-user@example.gov.uk",
-                "make_service_live_link": f"http://localhost:6012/services/{sample_service.id}/make-service-live",
-                "support_page_link": "http://localhost:6012/support",
+                "make_service_live_link": f"{hostnames.admin}/services/{sample_service.id}/make-service-live",
+                "support_page_link": f"{hostnames.admin}/support",
                 "organisation_name": "sample organisation",
                 "name": ANY,
             },
@@ -1294,3 +1290,133 @@ def test_notify_org_users_of_request_to_go_live_requires_org_user_permission(
 
     assert mock_persist_notification.call_args_list == []
     assert mock_send_notification_to_queue.call_args_list == []
+
+
+def test_notify_org_member_about_next_steps_of_go_live_request(
+    mocker,
+    admin_request,
+    notify_service,
+    sample_organisation,
+    sample_service,
+    organisation_next_steps_for_go_live_request_template,
+    hostnames,
+):
+    notify_service = dao_fetch_service_by_id(current_app.config["NOTIFY_SERVICE_ID"])
+
+    go_live_user = create_user(email="go-live-user@example.gov.uk", name="Go live user")
+    first_org_user = create_user(email="first-org-user@example.gov.uk", name="First org user")
+    second_org_user = create_user(email="second-org-user@example.gov.uk", name="Second org user")
+    dao_add_user_to_organisation(
+        organisation_id=sample_organisation.id, user_id=first_org_user.id, permissions=["can_make_services_live"]
+    )
+    dao_add_user_to_organisation(
+        organisation_id=sample_organisation.id, user_id=second_org_user.id, permissions=["can_make_services_live"]
+    )
+
+    notifications = [object()]
+
+    mock_persist_notification = mocker.patch(
+        "app.organisation.rest.persist_notification",
+        side_effect=notifications,
+    )
+    mock_send_notification_to_queue = mocker.patch(
+        "app.organisation.rest.send_notification_to_queue",
+    )
+    sample_service.organisation = sample_organisation
+    sample_service.has_active_go_live_request = True
+    sample_service.go_live_user = go_live_user
+
+    admin_request.post(
+        "organisation.notify_org_member_about_next_steps_of_go_live_request",
+        service_id=sample_service.id,
+        _data={"to": "first-org-user@example.gov.uk", "service_name": "test service", "body": "blah blah blah"},
+        _expected_status=204,
+    )
+
+    assert mock_persist_notification.call_count == 1
+    assert mock_persist_notification.call_args_list[0][1]["recipient"] == "first-org-user@example.gov.uk"
+
+    assert mock_persist_notification.call_args_list[0][1] == dict(
+        template_id=uuid.UUID("62f12a62-742b-4458-9336-741521b131c7"),
+        template_version=1,
+        recipient="first-org-user@example.gov.uk",
+        service=notify_service,
+        personalisation={"service_name": "test service", "body": "blah blah blah"},
+        notification_type="email",
+        api_key_id=None,
+        key_type="normal",
+        reply_to_text="notify@gov.uk",
+    )
+
+    assert mock_send_notification_to_queue.call_args_list == [
+        mocker.call(notification, queue="notify-internal-tasks") for notification in notifications
+    ]
+
+
+def test_notify_service_member_of_rejected_request_to_go_live(
+    mocker,
+    admin_request,
+    notify_service,
+    sample_organisation,
+    sample_service,
+    organisation_reject_go_live_request_template,
+    hostnames,
+):
+    notify_service = dao_fetch_service_by_id(current_app.config["NOTIFY_SERVICE_ID"])
+
+    go_live_user = create_user(email="go-live-user@example.gov.uk", name="Go live user")
+    first_org_user = create_user(email="first-org-user@example.gov.uk", name="First org user")
+    second_org_user = create_user(email="second-org-user@example.gov.uk", name="Second org user")
+    dao_add_user_to_organisation(
+        organisation_id=sample_organisation.id, user_id=first_org_user.id, permissions=["can_make_services_live"]
+    )
+    dao_add_user_to_organisation(
+        organisation_id=sample_organisation.id, user_id=second_org_user.id, permissions=["can_make_services_live"]
+    )
+
+    notifications = [object()]
+
+    mock_persist_notification = mocker.patch(
+        "app.organisation.rest.persist_notification",
+        side_effect=notifications,
+    )
+    mock_send_notification_to_queue = mocker.patch(
+        "app.organisation.rest.send_notification_to_queue",
+    )
+    sample_service.organisation = sample_organisation
+    sample_service.has_active_go_live_request = True
+    sample_service.go_live_user = go_live_user
+
+    personalisation = {
+        "name": "Sam",
+        "service_name": sample_service.name,
+        "organisation_name": sample_organisation.name,
+        "reason": "line 1\nline 2",
+        "organisation_team_member_name": "First",
+        "organisation_team_member_email": "first-org-user@example.gov.uk",
+    }
+    admin_request.post(
+        "organisation.notify_service_member_of_rejected_go_live_request",
+        service_id=sample_service.id,
+        _data=personalisation,
+        _expected_status=204,
+    )
+
+    assert mock_persist_notification.call_count == 1
+    assert mock_persist_notification.call_args_list[0][1]["recipient"] == "go-live-user@example.gov.uk"
+
+    assert mock_persist_notification.call_args_list[0][1] == dict(
+        template_id=uuid.UUID("507d0796-9e23-4ad7-b83b-5efbd9496866"),
+        template_version=1,
+        recipient="go-live-user@example.gov.uk",
+        service=notify_service,
+        personalisation={**personalisation, "reason": "^ line 1\n^ line 2"},
+        notification_type="email",
+        api_key_id=None,
+        key_type="normal",
+        reply_to_text="notify@gov.uk",
+    )
+
+    assert mock_send_notification_to_queue.call_args_list == [
+        mocker.call(notification, queue="notify-internal-tasks") for notification in notifications
+    ]

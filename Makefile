@@ -66,7 +66,7 @@ run-celery-beat: ## Run celery beat
 
 .PHONY: run-celery-beat-with-docker
 run-celery-beat-with-docker: ## Run celery beat in Docker container (useful if you can't install pycurl locally)
-	./scripts/run_locally_with_docker.sh beat
+	./scripts/run_locally_with_docker.sh celery-beat
 
 .PHONY: run-migrations-with-docker
 run-migrations-with-docker: ## Run alembic migrations in Docker container
@@ -87,6 +87,15 @@ drop-test-dbs:
 	    dropdb test_notification_api_gw$${number} --if-exists; \
 	done
 	@dropdb test_notification_api_master --if-exists
+	@echo "Done."
+
+.PHONY: drop-test-dbs-in-docker
+drop-test-dbs-in-docker:
+	@echo "Dropping test DBs in docker."
+	@for number in $$(seq 0 $$(python -c 'import os; print(os.cpu_count() - 1)')); do \
+	    PGUSER=notify PGPASSWORD=notify PGHOST=0.0.0.0 PGPORT=5433 dropdb test_notification_api_gw$${number} --if-exists; \
+	done
+	@PGUSER=notify PGPASSWORD=notify PGHOST=0.0.0.0 PGPORT=5433 dropdb test_notification_api_master --if-exists
 	@echo "Done."
 
 .PHONY: test
