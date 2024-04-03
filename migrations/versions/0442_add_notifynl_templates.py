@@ -1,7 +1,7 @@
 """empty message
 
-Revision ID: 0421_add_notifynl_templates
-Revises: 0420_add_notifynl_templates
+Revision ID: 0442_add_notifynl_templates
+Revises: 0441_add_notifynl_templates
 Create Date: 2023-09-29 14:17:01.963181
 
 """
@@ -10,8 +10,8 @@ from alembic import op
 from flask import current_app
 
 # revision identifiers, used by Alembic.
-revision = "0421_add_notifynl_templates"
-down_revision = "0420_add_notifynl_templates"
+revision = "0442_add_notifynl_templates"
+down_revision = "0441_add_notifynl_templates"
 
 
 templates = [
