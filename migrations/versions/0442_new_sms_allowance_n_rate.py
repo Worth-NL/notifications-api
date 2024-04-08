@@ -1,7 +1,7 @@
 """
 
-Revision ID: 0440_new_sms_allowance_n_rate
-Revises: 0439_intl_letters_jan_24
+Revision ID: 0442_new_sms_allowance_n_rate
+Revises: 0441_intl_letters_jan_24.py
 Create Date: 2023-03-06 11:32:20.588364
 
 """
@@ -11,8 +11,8 @@ import uuid
 from alembic import op
 
 
-revision = "0440_new_sms_allowance_n_rate"
-down_revision = "0439_intl_letters_jan_24"
+revision = "0442_new_sms_allowance_n_rate"
+down_revision = "0441_intl_letters_jan_24.py"
 
 new_allowances = {
     "central": 30000,

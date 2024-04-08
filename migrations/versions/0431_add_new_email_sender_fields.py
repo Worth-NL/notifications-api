@@ -1,7 +1,7 @@
 """
 
-Revision ID: 0429_add_new_email_sender_fields
-Revises: 0428_letter_rates_errata
+Revision ID: 0431_add_new_email_sender_fields
+Revises: 0430_letter_rates_errata.py
 Create Date: 2023-10-16 15:46:30.137552
 
 """
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0429_add_new_email_sender_fields"
-down_revision = "0428_letter_rates_errata"
+revision = "0431_add_new_email_sender_fields"
+down_revision = "0430_letter_rates_errata.py"
 
 
 def upgrade():

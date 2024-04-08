@@ -1,7 +1,7 @@
 """
 
-Revision ID: 0424_n_history_created_at
-Revises: 0423_notify_user_name
+Revision ID: 0426_n_history_created_at
+Revises: 0425_notify_user_name.py
 Create Date: 2023-09-17 15:17:58.545277
 
 """
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0424_n_history_created_at"
-down_revision = "0423_notify_user_name"
+revision = "0426_n_history_created_at"
+down_revision = "0425_notify_user_name.py"
 
 
 def upgrade():

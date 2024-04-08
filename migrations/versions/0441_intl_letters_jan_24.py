@@ -1,12 +1,12 @@
 """
 
-Revision ID: 0439_intl_letters_jan_24
-Revises: 0438_request_invite_templates
+Revision ID: 0441_intl_letters_jan_24
+Revises: 0440_request_invite_templates.py
 Create Date: 2024-01-02 12:39:29.779099
 
 """
-revision = "0439_intl_letters_jan_24"
-down_revision = "0438_request_invite_templates"
+revision = "0441_intl_letters_jan_24"
+down_revision = "0440_request_invite_templates.py"
 
 import itertools
 import uuid

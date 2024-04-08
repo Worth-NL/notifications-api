@@ -1,7 +1,7 @@
 """
 
-Revision ID: 0420_unique_service_name_1
-Revises: 0419_take_part_in_research
+Revision ID: 0422_unique_service_name_1
+Revises: 0421_add_notifynl_templates
 Create Date: 2023-08-24 16:26:03.488048
 
 """
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "0420_unique_service_name_1"
-down_revision = "0419_take_part_in_research"
+revision = "0422_unique_service_name_1"
+down_revision = "0421_add_notifynl_templates"
 
 
 def upgrade():

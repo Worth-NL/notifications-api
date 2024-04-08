@@ -1,12 +1,12 @@
 """
 
-Revision ID: 0428_letter_rates_errata
-Revises: 0427_letter_rates_from_1_11_23
+Revision ID: 0430_letter_rates_errata
+Revises: 0429_letter_rates_from_1_11_23.py
 
 """
 
-revision = "0428_letter_rates_errata"
-down_revision = "0427_letter_rates_from_1_11_23"
+revision = "0430_letter_rates_errata"
+down_revision = "0429_letter_rates_from_1_11_23.py"
 
 import uuid
 from datetime import datetime

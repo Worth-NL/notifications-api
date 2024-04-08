@@ -1,15 +1,15 @@
 """
 
-Revision ID: 0435_s_swap_check_for_not_null
-Revises: 0434_validate_not_null_check
+Revision ID: 0437_s_swap_check_for_not_null
+Revises: 0436_validate_not_null_check.py
 Create Date: 2023-11-15 22:27:23.511256
 
 """
 from alembic import op
 from sqlalchemy import column
 
-revision = "0435_s_swap_check_for_not_null"
-down_revision = "0434_validate_not_null_check"
+revision = "0437_s_swap_check_for_not_null"
+down_revision = "0436_validate_not_null_check.py"
 
 
 def upgrade():

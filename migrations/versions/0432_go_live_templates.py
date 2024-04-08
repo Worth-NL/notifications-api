@@ -1,56 +1,44 @@
 """
 
-Revision ID: 0438_request_invite_templates
-Revises: 0437_min_numeric_scl_aux_tbls
-Create Date: 2023-12-11 16:21:05.947886
+Revision ID: 0432_go_live_templates
+Revises: 0431_add_new_email_sender_fields.py
+Create Date: 2023-10-31 13:23:51.260909
 
 """
 import textwrap
+
 from alembic import op
 from flask import current_app
 
+revision = "0432_go_live_templates"
+down_revision = "0431_add_new_email_sender_fields.py"
 
-revision = "0438_request_invite_templates"
-down_revision = "0437_min_numeric_scl_aux_tbls"
+continue_template_id = "62f12a62-742b-4458-9336-741521b131c7"
+continue_template_content = textwrap.dedent(
+    """
+    ((body))
+    """
+)
 
-
-request_invite_to_a_service_template_id = "77677459-f862-44ee-96d9-b8cb2323d407"
-request_invite_to_a_service_template_content = textwrap.dedent(
-    """\
+reject_template_id = "507d0796-9e23-4ad7-b83b-5efbd9496866"
+reject_template_content = textwrap.dedent(
+    """
 Hi ((name))
 
-((requester_name)) would like to join the ‘((service_name))’ team on GOV.UK Notify.
+# Your request to go live was rejected
 
-((reason_given??They gave the following reason for wanting to join:))
+You sent a request to go live for a GOV.UK Notify service called ‘((service_name))’.
+
+((organisation_team_member_name)) at ((organisation_name)) rejected the request for the following reason:
 
 ((reason))
 
-Use this link to invite ((requester_name)) to join the team:
-
-((url))
-
-If you have any questions, you can email ((requester_name)) at ((requester_email))
+If you have any questions, you can email ((organisation_team_member_name)) at ((organisation_team_member_email))
 
 Thanks
 
 GOV.​UK Notify team
 https://www.gov.uk/notify
-    """
-)
-
-
-receipt_for_request_invite_to_a_service_template_id = "38bcd263-6ce8-431f-979d-8e637c1f0576"
-receipt_for_request_invite_to_a_service_template_content = textwrap.dedent(
-    """\
-    Hi ((name))
-
-    …
-
-    Thanks
-
-    GOV.​UK Notify team
-    https://www.gov.uk/notify
-
     """
 )
 
@@ -74,12 +62,12 @@ def upgrade():
                 hidden
             )
             VALUES (
-                '{request_invite_to_a_service_template_id}',
-                'Request invite to a service',
+                '{continue_template_id}',
+                'Reminder: continue self-service go live journey (for organisation users)',
                 'email',
                 current_timestamp,
-                '((requester_name)) wants to join your GOV.UK Notify service',
-                '{request_invite_to_a_service_template_content}',
+                'Request to go live: ((service_name))',
+                '{continue_template_content}',
                 false,
                 '{current_app.config["NOTIFY_SERVICE_ID"]}',
                 '{current_app.config["NOTIFY_USER_ID"]}',
@@ -100,7 +88,7 @@ def upgrade():
             updated_at,
             updated_by_id
         ) VALUES (
-            '{request_invite_to_a_service_template_id}',
+            '{continue_template_id}',
             false,
             current_timestamp,
             '{current_app.config["NOTIFY_USER_ID"]}'
@@ -127,12 +115,12 @@ def upgrade():
                 hidden
             )
             VALUES (
-                '{receipt_for_request_invite_to_a_service_template_id}',
-                'Receipt email after requesting service invite',
+                '{reject_template_id}',
+                'Reject self-service go live request',
                 'email',
                 current_timestamp,
-                '',
-                '{receipt_for_request_invite_to_a_service_template_content}',
+                'Your request to go live has been rejected',
+                '{reject_template_content}',
                 false,
                 '{current_app.config["NOTIFY_SERVICE_ID"]}',
                 '{current_app.config["NOTIFY_USER_ID"]}',
@@ -153,7 +141,7 @@ def upgrade():
             updated_at,
             updated_by_id
         ) VALUES (
-            '{receipt_for_request_invite_to_a_service_template_id}',
+            '{reject_template_id}',
             false,
             current_timestamp,
             '{current_app.config["NOTIFY_USER_ID"]}'
@@ -164,4 +152,7 @@ def upgrade():
 
 
 def downgrade():
+    # I don't consider there to be a safe downgrade path as other tables could theoretically have FK dependencies
+    # on the inserted templates (eg notifications). I don't like the idea of deleting the record of notifications
+    # in order to be able to drop the templates.
     pass

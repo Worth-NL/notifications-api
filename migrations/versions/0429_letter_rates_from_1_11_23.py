@@ -1,12 +1,12 @@
 """
 
-Revision ID: 0427_letter_rates_from_1_11_23
-Revises: 0426_drop_email_from
+Revision ID: 0429_letter_rates_from_1_11_23
+Revises: 0428_drop_email_from.py
 
 """
 
-revision = "0427_letter_rates_from_1_11_23"
-down_revision = "0426_drop_email_from"
+revision = "0429_letter_rates_from_1_11_23"
+down_revision = "0428_drop_email_from.py"
 
 import uuid
 from datetime import datetime

@@ -1,15 +1,15 @@
 """
 
-Revision ID: 0423_notify_user_name
-Revises: 0422_letter_languages_constraint
+Revision ID: 0425_notify_user_name
+Revises: 0424_letter_languages_constraint.py
 Create Date: 2023-09-14 14:00:28.925639
 
 """
 from alembic import op
 
 
-revision = "0423_notify_user_name"
-down_revision = "0422_letter_languages_constraint"
+revision = "0425_notify_user_name"
+down_revision = "0424_letter_languages_constraint.py"
 
 
 def upgrade():

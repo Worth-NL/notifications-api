@@ -1,12 +1,12 @@
 """
 
-Revision ID: 0437_min_numeric_scl_aux_tbls
-Revises: 0436_sh_swap_check_for_not_null
+Revision ID: 0439_min_numeric_scl_aux_tbls
+Revises: 0438_sh_swap_check_for_not_null.py
 
 """
 
-revision = "0437_min_numeric_scl_aux_tbls"
-down_revision = "0436_sh_swap_check_for_not_null"
+revision = "0439_min_numeric_scl_aux_tbls"
+down_revision = "0438_sh_swap_check_for_not_null.py"
 
 from alembic import op
 from sqlalchemy import (
