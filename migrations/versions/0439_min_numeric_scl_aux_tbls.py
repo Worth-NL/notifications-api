@@ -1,14 +1,10 @@
 """
 
 Revision ID: 0439_min_numeric_scl_aux_tbls
-Revises: 0438_sh_swap_check_for_not_null.py
+Revises: 0438_sh_swap_check_for_not_null
 
 """
 
-revision = "0439_min_numeric_scl_aux_tbls"
-down_revision = "0438_sh_swap_check_for_not_null.py"
-
-from alembic import op
 from sqlalchemy import (
     Numeric,
     case,
@@ -18,6 +14,11 @@ from sqlalchemy import (
     table,
     update,
 )
+from alembic import op
+
+
+revision = "0439_min_numeric_scl_aux_tbls"
+down_revision = "0438_sh_swap_check_for_not_null"
 
 
 def _get_cases(var, max_scale=7):

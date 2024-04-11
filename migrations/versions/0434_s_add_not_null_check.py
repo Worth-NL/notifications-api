@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0434_s_add_not_null_check
-Revises: 0433_migrate_email_local_part.py
+Revises: 0433_migrate_email_local_part
 Create Date: 2023-11-15 22:27:23.511256
 
 """
@@ -9,7 +9,7 @@ from alembic import op
 from sqlalchemy import column
 
 revision = "0434_s_add_not_null_check"
-down_revision = "0433_migrate_email_local_part.py"
+down_revision = "0433_migrate_email_local_part"
 
 
 def upgrade():

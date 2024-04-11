@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0442_new_sms_allowance_n_rate
-Revises: 0441_intl_letters_jan_24.py
+Revises: 0441_intl_letters_jan_24
 Create Date: 2023-03-06 11:32:20.588364
 
 """
@@ -12,7 +12,7 @@ from alembic import op
 
 
 revision = "0442_new_sms_allowance_n_rate"
-down_revision = "0441_intl_letters_jan_24.py"
+down_revision = "0441_intl_letters_jan_24"
 
 new_allowances = {
     "central": 30000,

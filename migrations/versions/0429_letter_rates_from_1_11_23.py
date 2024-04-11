@@ -1,18 +1,19 @@
 """
 
 Revision ID: 0429_letter_rates_from_1_11_23
-Revises: 0428_drop_email_from.py
+Revises: 0428_drop_email_from
 
 """
 
-revision = "0429_letter_rates_from_1_11_23"
-down_revision = "0428_drop_email_from.py"
-
-import uuid
-from datetime import datetime
-
-from alembic import op
 from sqlalchemy.sql import text
+from alembic import op
+from datetime import datetime
+import uuid
+
+
+revision = "0429_letter_rates_from_1_11_23"
+down_revision = "0428_drop_email_from"
+
 
 RATE_CHANGE_DATE = datetime(2023, 11, 1, 0, 0)
 

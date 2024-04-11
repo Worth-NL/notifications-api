@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0438_sh_swap_check_for_not_null
-Revises: 0437_s_swap_check_for_not_null.py
+Revises: 0437_s_swap_check_for_not_null
 Create Date: 2023-11-15 22:27:23.511256
 
 """
@@ -9,7 +9,7 @@ from alembic import op
 from sqlalchemy import column
 
 revision = "0438_sh_swap_check_for_not_null"
-down_revision = "0437_s_swap_check_for_not_null.py"
+down_revision = "0437_s_swap_check_for_not_null"
 
 
 def upgrade():

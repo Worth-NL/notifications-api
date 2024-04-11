@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0428_drop_email_from
-Revises: 0427_unique_service_name_2.py
+Revises: 0427_unique_service_name_2
 Create Date: 2023-09-29 18:47:48.703294
 
 """
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "0428_drop_email_from"
-down_revision = "0427_unique_service_name_2.py"
+down_revision = "0427_unique_service_name_2"
 
 
 def upgrade():

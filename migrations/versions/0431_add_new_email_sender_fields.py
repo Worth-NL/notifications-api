@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0431_add_new_email_sender_fields
-Revises: 0430_letter_rates_errata.py
+Revises: 0430_letter_rates_errata
 Create Date: 2023-10-16 15:46:30.137552
 
 """
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "0431_add_new_email_sender_fields"
-down_revision = "0430_letter_rates_errata.py"
+down_revision = "0430_letter_rates_errata"
 
 
 def upgrade():

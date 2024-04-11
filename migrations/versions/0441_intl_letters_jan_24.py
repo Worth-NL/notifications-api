@@ -1,19 +1,20 @@
 """
 
 Revision ID: 0441_intl_letters_jan_24
-Revises: 0440_request_invite_templates.py
+Revises: 0440_request_invite_templates
 Create Date: 2024-01-02 12:39:29.779099
 
 """
-revision = "0441_intl_letters_jan_24"
-down_revision = "0440_request_invite_templates.py"
-
-import itertools
-import uuid
-from datetime import datetime
-
-from alembic import op
 from sqlalchemy.sql import text
+from alembic import op
+from datetime import datetime
+import uuid
+import itertools
+
+
+revision = "0441_intl_letters_jan_24"
+down_revision = "0440_request_invite_templates"
+
 
 RATE_CHANGE_DATE = datetime(2024, 1, 2, 0, 0)
 

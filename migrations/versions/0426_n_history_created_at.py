@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0426_n_history_created_at
-Revises: 0425_notify_user_name.py
+Revises: 0425_notify_user_name
 Create Date: 2023-09-17 15:17:58.545277
 
 """
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "0426_n_history_created_at"
-down_revision = "0425_notify_user_name.py"
+down_revision = "0425_notify_user_name"
 
 
 def upgrade():

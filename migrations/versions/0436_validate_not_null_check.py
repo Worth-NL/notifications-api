@@ -1,14 +1,14 @@
 """
 
 Revision ID: 0436_validate_not_null_check
-Revises: 0435_sh_add_not_null_check.py
+Revises: 0435_sh_add_not_null_check
 Create Date: 2023-11-15 22:27:23.511256
 
 """
 from alembic import op
 
 revision = "0436_validate_not_null_check"
-down_revision = "0435_sh_add_not_null_check.py"
+down_revision = "0435_sh_add_not_null_check"
 
 
 def upgrade():

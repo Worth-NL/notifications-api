@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0424_letter_languages_constraint
-Revises: 0423_bilingual_templates.py
+Revises: 0423_bilingual_templates
 Create Date: 2023-09-07 14:00:28.925639
 
 """
@@ -9,7 +9,7 @@ from alembic import op
 
 
 revision = "0424_letter_languages_constraint"
-down_revision = "0423_bilingual_templates.py"
+down_revision = "0423_bilingual_templates"
 
 
 def upgrade():

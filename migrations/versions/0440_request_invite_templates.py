@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0440_request_invite_templates
-Revises: 0439_min_numeric_scl_aux_tbls.py
+Revises: 0439_min_numeric_scl_aux_tbls
 Create Date: 2023-12-11 16:21:05.947886
 
 """
@@ -11,7 +11,7 @@ from flask import current_app
 
 
 revision = "0440_request_invite_templates"
-down_revision = "0439_min_numeric_scl_aux_tbls.py"
+down_revision = "0439_min_numeric_scl_aux_tbls"
 
 
 request_invite_to_a_service_template_id = "77677459-f862-44ee-96d9-b8cb2323d407"

@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0423_bilingual_templates
-Revises: 0422_unique_service_name_1.py
+Revises: 0422_unique_service_name_1
 Create Date: 2023-08-30 17:26:28.925639
 
 """
@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 
 
 revision = "0423_bilingual_templates"
-down_revision = "0422_unique_service_name_1.py"
+down_revision = "0422_unique_service_name_1"
 
 
 def upgrade():

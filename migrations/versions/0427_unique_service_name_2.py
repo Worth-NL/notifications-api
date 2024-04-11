@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0427_unique_service_name_2
-Revises: 0426_n_history_created_at.py
+Revises: 0426_n_history_created_at
 Create Date: 2023-09-01 10:10:19.011060
 
 """
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "0427_unique_service_name_2"
-down_revision = "0426_n_history_created_at.py"
+down_revision = "0426_n_history_created_at"
 
 
 def upgrade():

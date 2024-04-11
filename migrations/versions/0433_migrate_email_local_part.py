@@ -1,14 +1,14 @@
 """
 
 Revision ID: 0433_migrate_email_local_part
-Revises: 0432_go_live_templates.py
+Revises: 0432_go_live_templates
 Create Date: 2023-11-15 22:27:23.511256
 
 """
 from alembic import op
 
 revision = "0433_migrate_email_local_part"
-down_revision = "0432_go_live_templates.py"
+down_revision = "0432_go_live_templates"
 
 
 def upgrade():

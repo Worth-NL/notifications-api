@@ -1,7 +1,7 @@
 """
 
 Revision ID: 0432_go_live_templates
-Revises: 0431_add_new_email_sender_fields.py
+Revises: 0431_add_new_email_sender_fields
 Create Date: 2023-10-31 13:23:51.260909
 
 """
@@ -11,7 +11,7 @@ from alembic import op
 from flask import current_app
 
 revision = "0432_go_live_templates"
-down_revision = "0431_add_new_email_sender_fields.py"
+down_revision = "0431_add_new_email_sender_fields"
 
 continue_template_id = "62f12a62-742b-4458-9336-741521b131c7"
 continue_template_content = textwrap.dedent(
