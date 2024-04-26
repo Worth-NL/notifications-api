@@ -12,8 +12,8 @@ def sentry_sampler(sampling_context, sample_rate: float = 0.0):
 
 
 def init_performance_monitoring():
-    environment = os.getenv("NOTIFY_ENVIRONMENT").lower()
-    not_production = environment in {"development", "preview", "staging"}
+    environment = os.getenv("SENTRY_ENVIRONMENT", os.getenv("NOTIFY_ENVIRONMENT")).lower()
+    not_production = environment in {"development", "preview", "staging", "test", "acceptance"}
     sentry_enabled = bool(int(os.getenv("SENTRY_ENABLED", "0")))
     sentry_dsn = os.getenv("SENTRY_DSN")
 
