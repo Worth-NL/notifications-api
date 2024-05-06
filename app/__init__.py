@@ -22,7 +22,6 @@ from gds_metrics.metrics import Gauge, Histogram
 from notifications_utils import logging, request_helper
 from notifications_utils.celery import NotifyCelery
 from notifications_utils.clients.redis.redis_client import RedisClient
-from notifications_utils.clients.signing.signing_client import Signing
 from notifications_utils.clients.statsd.statsd_client import StatsdClient
 from notifications_utils.clients.zendesk.zendesk_client import ZendeskClient
 from sqlalchemy import event
@@ -37,6 +36,7 @@ from app.clients.email.aws_ses_stub import AwsSesStubClient
 from app.clients.letter.dvla import DVLAClient
 from app.clients.sms.firetext import FiretextClient
 from app.clients.sms.mmg import MMGClient
+from app.clients.sms.spryng import SpryngClient
 
 db = SQLAlchemy()
 migrate = Migrate()
@@ -47,7 +47,7 @@ mmg_client = MMGClient()
 aws_ses_client = AwsSesClient()
 aws_ses_stub_client = AwsSesStubClient()
 dvla_client = DVLAClient()
-signing = Signing()
+spryng_client = SpryngClient()
 zendesk_client = ZendeskClient()
 statsd_client = StatsdClient()
 redis_store = RedisClient()
@@ -90,6 +90,7 @@ def create_app(application):
     logging.init_app(application, statsd_client)
     firetext_client.init_app(application, statsd_client=statsd_client)
     mmg_client.init_app(application, statsd_client=statsd_client)
+    spryng_client.init_app(application, statsd_client=statsd_client)
     dvla_client.init_app(application, statsd_client=statsd_client)
     aws_ses_client.init_app(application.config["AWS_REGION"], statsd_client=statsd_client)
     aws_ses_stub_client.init_app(
@@ -97,10 +98,11 @@ def create_app(application):
     )
     # If a stub url is provided for SES, then use the stub client rather than the real SES boto client
     email_clients = [aws_ses_stub_client] if application.config["SES_STUB_URL"] else [aws_ses_client]
-    notification_provider_clients.init_app(sms_clients=[firetext_client, mmg_client], email_clients=email_clients)
+    notification_provider_clients.init_app(
+        sms_clients=[firetext_client, mmg_client, spryng_client], email_clients=email_clients
+    )
 
     notify_celery.init_app(application)
-    signing.init_app(application)
     redis_store.init_app(application)
     document_download_client.init_app(application)
 
@@ -167,7 +169,6 @@ def register_blueprint(application):
     from app.service_invite.rest import (
         service_invite as service_invite_blueprint,
     )
-    from app.sms.rest import sms_rate_blueprint
     from app.status.healthcheck import status as status_blueprint
     from app.template.rest import template_blueprint
     from app.template_folder.rest import template_folder_blueprint
@@ -277,9 +278,6 @@ def register_blueprint(application):
 
     letter_attachment_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(letter_attachment_blueprint)
-
-    sms_rate_blueprint.before_request(requires_admin_auth)
-    application.register_blueprint(sms_rate_blueprint)
 
     if _should_register_functional_testing_blueprint(application.config["NOTIFY_ENVIRONMENT"]):
         test_blueprint.before_request(requires_functional_test_auth)
@@ -411,8 +409,7 @@ def setup_sqlalchemy_events(app):
                 elif current_task:
                     connection_record.info["request_data"] = {
                         "method": "celery",
-                        # worker name
-                        "host": current_app.config["NOTIFY_APP_NAME"],
+                        "host": current_app.config["NOTIFY_APP_NAME"],  # worker name
                         "url_rule": current_task.name,  # task name
                     }
                 # anything else. migrations possibly, or flask cli commands.

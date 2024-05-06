@@ -8,6 +8,7 @@ from app import notify_celery, statsd_client
 from app.clients import ClientException
 from app.clients.sms.firetext import get_firetext_responses
 from app.clients.sms.mmg import get_mmg_responses
+from app.clients.sms.spryng import get_spryng_responses
 from app.constants import NOTIFICATION_PENDING
 from app.dao import notifications_dao
 from app.dao.templates_dao import dao_get_template_by_id
@@ -15,10 +16,7 @@ from app.notifications.notifications_ses_callback import (
     check_and_queue_callback_task,
 )
 
-sms_response_mapper = {
-    "MMG": get_mmg_responses,
-    "Firetext": get_firetext_responses,
-}
+sms_response_mapper = {"MMG": get_mmg_responses, "Firetext": get_firetext_responses, "Spryng": get_spryng_responses}
 
 
 @notify_celery.task(bind=True, name="process-sms-client-response", max_retries=5, default_retry_delay=300)
