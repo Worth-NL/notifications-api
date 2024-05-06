@@ -53,7 +53,7 @@ def process_firetext_response():
 @sms_callback_blueprint.route("/spryng", methods=["POST"])
 def process_spryng_response():
     client_name = "Spryng"
-    errors = validate_callback_data(data=request.form, fields=[], client_name=client_name)
+    errors = validate_callback_data(data=request.form, fields=["status", "reasoncode"], client_name=client_name)
     if errors:
         raise InvalidRequest(errors, status_code=400)
 
