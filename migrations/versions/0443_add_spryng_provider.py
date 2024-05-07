@@ -17,10 +17,10 @@ down_revision = "0442_new_sms_allowance_n_rate"
 
 
 identifier = "spryng"
+provider_id = str(uuid.uuid4())
 
 
 def upgrade():
-    provider_id = str(uuid.uuid4())
     op.execute(
         f"INSERT INTO provider_details (id, display_name, identifier, priority, notification_type, active, version) values ('{provider_id}', '{identifier.capitalize()}', '{identifier}', 30, 'sms', true, 1)"
     )
@@ -29,16 +29,7 @@ def upgrade():
         f"INSERT INTO provider_rates (id, valid_from, rate, provider_id) VALUES ('{uuid.uuid4()}', '{datetime.utcnow()}', 1.0, '{provider_id}')"
     )
 
-    op.execute(
-        f"UPDATE provider_rates set provider_id = (select id from provider_details where identifier = '{identifier}') where provider = '{identifier}'"
-    )
-
-    op.execute(
-        f"UPDATE provider_statistics set provider_id = (select id from provider_details where identifier = '{identifier}') where provider = '{identifier}'"
-    )
-
 
 def downgrade():
-    op.execute(f"DELETE FROM provider_statistics WHERE provider = '{identifier}'")
-    op.execute(f"DELETE FROM provider_rates WHERE provider = '{identifier}'")
-    op.execute(f"DELETE FROM provider_details WHERE identifier = '{identifier}'")
+    op.execute(f"DELETE FROM provider_rates WHERE provider_id = '{provider_id}'")
+    op.execute(f"DELETE FROM provider_details WHERE id = '{provider_id}'")
