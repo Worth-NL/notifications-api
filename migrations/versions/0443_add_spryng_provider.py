@@ -25,11 +25,6 @@ def upgrade():
         f"INSERT INTO provider_details (id, display_name, identifier, priority, notification_type, active, version) values ('{provider_id}', '{identifier.capitalize()}', '{identifier}', 30, 'sms', true, 1)"
     )
 
-    op.execute(
-        f"INSERT INTO provider_rates (id, valid_from, rate, provider_id) VALUES ('{uuid.uuid4()}', '{datetime.utcnow()}', 1.0, '{provider_id}')"
-    )
-
 
 def downgrade():
-    op.execute(f"DELETE FROM provider_rates WHERE provider_id = '{provider_id}'")
     op.execute(f"DELETE FROM provider_details WHERE id = '{provider_id}'")
