@@ -22,6 +22,7 @@ from gds_metrics.metrics import Gauge, Histogram
 from notifications_utils import logging, request_helper
 from notifications_utils.celery import NotifyCelery
 from notifications_utils.clients.redis.redis_client import RedisClient
+from notifications_utils.clients.signing.signing_client import Signing
 from notifications_utils.clients.statsd.statsd_client import StatsdClient
 from notifications_utils.clients.zendesk.zendesk_client import ZendeskClient
 from sqlalchemy import event
@@ -48,6 +49,7 @@ aws_ses_client = AwsSesClient()
 aws_ses_stub_client = AwsSesStubClient()
 dvla_client = DVLAClient()
 spryng_client = SpryngClient()
+signing = Signing()
 zendesk_client = ZendeskClient()
 statsd_client = StatsdClient()
 redis_store = RedisClient()
