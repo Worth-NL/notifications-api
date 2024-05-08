@@ -93,6 +93,7 @@ def create_app(application):
     firetext_client.init_app(application, statsd_client=statsd_client)
     mmg_client.init_app(application, statsd_client=statsd_client)
     spryng_client.init_app(application, statsd_client=statsd_client)
+    signing.init_app(application)
     dvla_client.init_app(application, statsd_client=statsd_client)
     aws_ses_client.init_app(application.config["AWS_REGION"], statsd_client=statsd_client)
     aws_ses_stub_client.init_app(

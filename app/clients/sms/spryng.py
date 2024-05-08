@@ -38,7 +38,6 @@ class SpryngClient(SmsClient):
         super().init_app(*args, **kwargs)
         self.api_key = self.current_app.config.get("SPRYNG_API_KEY")
         self.url = self.current_app.config.get("SPRYNG_URL")
-        self.current_app.logger.info("Spryng loaded %s ", self.url)
 
     @property
     def name(self):
