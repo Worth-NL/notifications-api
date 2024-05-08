@@ -22,7 +22,7 @@ provider_id = str(uuid.uuid4())
 
 def upgrade():
     op.execute(
-        f"INSERT INTO provider_details (id, display_name, identifier, priority, notification_type, active, version) values ('{provider_id}', '{identifier.capitalize()}', '{identifier}', 30, 'sms', true, 1)"
+        f"INSERT INTO provider_details (id, display_name, identifier, priority, notification_type, active, version, supports_international) values ('{provider_id}', '{identifier.capitalize()}', '{identifier}', 30, 'sms', true, 1, true)"
     )
 
 
