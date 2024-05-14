@@ -53,15 +53,13 @@ class SpryngClient(SmsClient):
             "encoding": "unicode",
         }
 
-        headers = {"Content-Type": "application/json", "Authorization": "Bearer {}".format(self.api_key)}
-
         try:
             response = request(
                 "POST",
                 self.url,
                 data=json.dumps(data),
                 timeout=60,
-                headers=json.dumps(headers),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(self.api_key)},
             )
 
             response.raise_for_status()
