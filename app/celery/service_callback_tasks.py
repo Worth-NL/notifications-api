@@ -58,13 +58,31 @@ def send_complaint_to_service(self, complaint_data):
 def _send_data_to_service_callback_api(self, data, service_callback_url, token, function_name):
     notification_id = data["notification_id"] if "notification_id" in data else data["id"]
     try:
-        response = request(
-            method="POST",
-            url=service_callback_url,
-            data=json.dumps(data),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
-            timeout=5,
-        )
+        ssl_crt = current_app.config["SSL_CLIENT_OVERRIDE_CERT"]
+        ssl_key = current_app.config["SSL_CLIENT_OVERRIDE_KEY"]
+        ssl_verify = current_app.config["SSL_VERIFY_OVERRIDE"]
+
+        if ssl_crt and ssl_key and ssl_verify:
+            current_app.logger.warning("!!! USING CLIENT CERT !!!")
+            response = request(
+                method="POST",
+                url=service_callback_url,
+                data=json.dumps(data),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
+                cert=(ssl_crt, ssl_key),
+                verify=ssl_verify,
+                timeout=5,
+            )
+        else:
+            current_app.logger.warning("!!! NOT USING CLIENT CERT !!!")
+            response = request(
+                method="POST",
+                url=service_callback_url,
+                data=json.dumps(data),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
+                timeout=5,
+            )
+
         current_app.logger.info(
             "%s sending %s to %s, response %s",
             function_name,
@@ -108,9 +126,9 @@ def create_delivery_status_callback_data(notification, service_callback_api):
         "notification_to": notification.to,
         "notification_status": notification.status,
         "notification_created_at": notification.created_at.strftime(DATETIME_FORMAT),
-        "notification_updated_at": notification.updated_at.strftime(DATETIME_FORMAT)
-        if notification.updated_at
-        else None,
+        "notification_updated_at": (
+            notification.updated_at.strftime(DATETIME_FORMAT) if notification.updated_at else None
+        ),
         "notification_sent_at": notification.sent_at.strftime(DATETIME_FORMAT) if notification.sent_at else None,
         "notification_type": notification.notification_type,
         "service_callback_api_url": service_callback_api.url,
