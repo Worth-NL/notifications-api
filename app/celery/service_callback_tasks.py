@@ -59,18 +59,15 @@ def _send_data_to_service_callback_api(self, data, service_callback_url, token, 
     notification_id = data["notification_id"] if "notification_id" in data else data["id"]
     try:
         ssl_crt = current_app.config["SSL_CLIENT_OVERRIDE_CERT"]
-        ssl_key = current_app.config["SSL_CLIENT_OVERRIDE_KEY"]
-        ssl_verify = current_app.config["SSL_VERIFY_OVERRIDE"]
 
-        if ssl_crt and ssl_key and ssl_verify:
+        if ssl_crt:
             current_app.logger.warning("!!! USING CLIENT CERT !!!")
             response = request(
                 method="POST",
                 url=service_callback_url,
                 data=json.dumps(data),
                 headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
-                cert=(ssl_crt, ssl_key),
-                verify=ssl_verify,
+                cert=ssl_crt,
                 timeout=5,
             )
         else:
