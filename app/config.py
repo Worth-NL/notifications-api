@@ -495,6 +495,10 @@ class Development(Config):
 
     CBC_PROXY_ENABLED = False
 
+    SSL_CLIENT_OVERRIDE_CERT = os.getenv("SSL_CLIENT_OVERRIDE_CERT")
+    SSL_CLIENT_OVERRIDE_KEY = os.getenv("SSL_CLIENT_OVERRIDE_KEY")
+    SSL_VERIFY_OVERRIDE = os.getenv("SSL_CERT_FILE")
+
 
 class Test(Development):
     NOTIFY_EMAIL_DOMAIN = "test.notify.com"
