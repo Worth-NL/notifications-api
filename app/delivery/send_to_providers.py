@@ -135,7 +135,7 @@ def send_email_to_provider(notification):
             reply_to = dao_get_reply_to_by_service_id(service_id=service.id)
 
             if len(reply_to) > 0:
-                current_app.logger.info("reply_to used :: %s :: %s:: %s", reply_to, type(reply_to), len(reply_to))
+                current_app.logger.warning("reply_to used :: %s :: %s:: %s", reply_to, type(reply_to), len(reply_to))
                 # from_email_address = reply_to if len(reply_to) < 2 else reply_to[0]
 
             from_address = f'"{email_sender_name}" <{from_email_address}>'
