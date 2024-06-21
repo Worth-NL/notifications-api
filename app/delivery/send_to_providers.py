@@ -133,9 +133,12 @@ def send_email_to_provider(notification):
             from_email_address = f'{service.email_sender_local_part}@{current_app.config["NOTIFY_EMAIL_DOMAIN"]}'
 
             reply_to = dao_get_reply_to_by_service_id(service_id=service.id)
+            current_app.logger.warning("!!! reply_to :: %s", reply_to)
 
             if len(reply_to) > 0:
-                current_app.logger.warning("reply_to used :: %s :: %s:: %s", reply_to, type(reply_to), len(reply_to))
+                current_app.logger.warning(
+                    "!!! reply_to used :: %s :: %s:: %s", reply_to, type(reply_to), len(reply_to)
+                )
                 # from_email_address = reply_to if len(reply_to) < 2 else reply_to[0]
 
             from_address = f'"{email_sender_name}" <{from_email_address}>'
