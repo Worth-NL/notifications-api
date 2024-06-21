@@ -32,7 +32,6 @@ from app.dao.provider_details_dao import (
     dao_reduce_sms_provider_priority,
     get_provider_details_by_notification_type,
 )
-from app.dao.service_email_reply_to_dao import dao_get_reply_to_by_service_id
 from app.exceptions import NotificationTechnicalFailureException
 from app.serialised_models import SerialisedService, SerialisedTemplate
 
@@ -132,14 +131,9 @@ def send_email_to_provider(notification):
             email_sender_name = service.custom_email_sender_name or service.name
             from_email_address = f'{service.email_sender_local_part}@{current_app.config["NOTIFY_EMAIL_DOMAIN"]}'
 
-            reply_to = dao_get_reply_to_by_service_id(service_id=service.id)
-            current_app.logger.warning("!!! reply_to :: %s", reply_to)
-
-            if len(reply_to) > 0:
-                current_app.logger.warning(
-                    "!!! reply_to used :: %s :: %s:: %s", reply_to, type(reply_to), len(reply_to)
-                )
-                from_email_address = reply_to if len(reply_to) < 2 else reply_to[0]
+            if notification.reply_to_text:
+                current_app.logger.warning("!!! reply_to used :: %s", notification.reply_to_text)
+                from_email_address = notification.reply_to_text
 
             from_address = f'"{email_sender_name}" <{from_email_address}>'
 
