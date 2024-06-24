@@ -61,7 +61,6 @@ def _send_data_to_service_callback_api(self, data, service_callback_url, token, 
         ssl_crt = current_app.config["SSL_CLIENT_OVERRIDE_CERT"]
 
         if ssl_crt:
-            current_app.logger.warning("!!! USING CLIENT CERT !!!")
             response = request(
                 method="POST",
                 url=service_callback_url,
@@ -71,7 +70,6 @@ def _send_data_to_service_callback_api(self, data, service_callback_url, token, 
                 timeout=5,
             )
         else:
-            current_app.logger.warning("!!! NOT USING CLIENT CERT !!!")
             response = request(
                 method="POST",
                 url=service_callback_url,

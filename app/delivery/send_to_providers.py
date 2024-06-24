@@ -33,7 +33,7 @@ from app.dao.provider_details_dao import (
     get_provider_details_by_notification_type,
 )
 from app.exceptions import NotificationTechnicalFailureException
-from app.serialised_models import SerialisedService, SerialisedTemplate
+from app.serialised_models import SerialisedOrganisation, SerialisedService, SerialisedTemplate
 
 
 def send_sms_to_provider(notification):
@@ -129,9 +129,13 @@ def send_email_to_provider(notification):
             send_email_response(notification.reference, notification.to)
         else:
             email_sender_name = service.custom_email_sender_name or service.name
-            from_address = (
-                f'"{email_sender_name}" <{service.email_sender_local_part}@{current_app.config["NOTIFY_EMAIL_DOMAIN"]}>'
-            )
+            from_email_domain = current_app.config["NOTIFY_EMAIL_DOMAIN"]
+
+            org_domains = SerialisedOrganisation.from_id(str(service.organisation)).domains
+            if org_domains:
+                from_email_domain = org_domains[0]
+
+            from_address = f'"{email_sender_name}" <{service.email_sender_local_part}@{from_email_domain}>'
 
             reference = provider.send_email(
                 from_address,
