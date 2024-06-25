@@ -105,6 +105,7 @@ def send_sms_to_provider(notification):
 
 def send_email_to_provider(notification):
     service = SerialisedService.from_id(notification.service_id)
+    organisation = SerialisedOrganisation.from_id(service.organisation)
 
     if not service.active:
         technical_failure(notification=notification)
@@ -128,12 +129,8 @@ def send_email_to_provider(notification):
             update_notification_to_sending(notification, provider)
             send_email_response(notification.reference, notification.to)
         else:
-            email_sender_name = service.custom_email_sender_name or service.name
-            from_email_domain = current_app.config["NOTIFY_EMAIL_DOMAIN"]
-
-            org_domains = SerialisedOrganisation.from_id(str(service.organisation)).domains
-            if org_domains:
-                from_email_domain = org_domains[0]
+            email_sender_name = organisation.name or service.custom_email_sender_name or service.name
+            from_email_domain = organisation.domains[0] or current_app.config["NOTIFY_EMAIL_DOMAIN"]
 
             from_address = f'"{email_sender_name}" <{service.email_sender_local_part}@{from_email_domain}>'
 
