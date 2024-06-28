@@ -139,7 +139,7 @@ class SerialisedAPIKeyCollection(SerialisedModelCollection):
 
 
 class SerialisedOrganisation(SerialisedModel):
-    ALLOWED_PROPERTIES = {"domains"}
+    ALLOWED_PROPERTIES = {"name", "domains"}
 
     @classmethod
     @memory_cache

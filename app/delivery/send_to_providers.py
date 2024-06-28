@@ -131,9 +131,12 @@ def send_email_to_provider(notification):
             email_sender_name = service.custom_email_sender_name or service.name
             from_email_domain = current_app.config["NOTIFY_EMAIL_DOMAIN"]
 
-            org_domains = SerialisedOrganisation.from_id(str(service.organisation)).domains
-            if org_domains:
-                from_email_domain = org_domains[0]
+            try:
+                organisation = SerialisedOrganisation.from_id(service.organisation)
+                email_sender_name = organisation.name
+                from_email_domain = organisation.domains[0]
+            except Exception as err:
+                current_app.logger.warning("No organisation found :: %s", err)
 
             from_address = f'"{email_sender_name}" <{service.email_sender_local_part}@{from_email_domain}>'
 
@@ -192,7 +195,7 @@ def provider_to_use(notification_type, international=False):
 
 def get_logo_url(base_url, logo_file):
     base_url = parse.urlparse(base_url)
-    # netloc = base_url.netloc
+    netloc = base_url.netloc
 
     if base_url.hostname.split(".")[-1] == "localhost":
         netloc = "notify.tools"
