@@ -115,7 +115,7 @@ greenlet==3.0.3
     #   sqlalchemy
 gunicorn[eventlet] @ git+https://github.com/benoitc/gunicorn.git@1299ea9e967a61ae2edebe191082fd169b864c64
     # via -r requirements.in
-idna==3.4
+idna==3.7
     # via
     #   jsonschema
     #   requests
