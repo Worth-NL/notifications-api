@@ -27,4 +27,4 @@ def upgrade():
 
 
 def downgrade():
-    op.execute(f"DELETE FROM provider_details WHERE id = '{provider_id}'")
+    op.execute(f"DELETE FROM provider_details WHERE identifier = '{identifier}'")
