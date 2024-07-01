@@ -24,11 +24,9 @@ def get_provider_details_by_identifier(identifier):
 
 
 def get_alternative_sms_provider(identifier):
-    if identifier == "firetext":
-        return "mmg"
-    elif identifier == "mmg":
-        return "firetext"
-    raise ValueError("Unrecognised sms provider {}".format(identifier))
+    if identifier in ["firetext", "mmg", "spryng"]:
+        return identifier
+    raise ValueError(f"Unrecognised sms provider {identifier}")
 
 
 def dao_get_provider_versions(provider_id):
