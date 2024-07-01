@@ -68,6 +68,7 @@ target/
 # Mac
 *.DS_Store
 environment.sh
+environment.fish
 .envrc
 
 celerybeat-schedule
