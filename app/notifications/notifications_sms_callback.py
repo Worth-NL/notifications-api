@@ -57,9 +57,9 @@ def process_spryng_response():
     if errors:
         raise InvalidRequest(errors, status_code=400)
 
-    status = request.args.get("status")
-    detailed_status_code = request.args.get("reasoncode")
-    provider_reference = request.args.get("reference")
+    status = request.args.get("STATUS")
+    detailed_status_code = request.args.get("REASONCODE")
+    provider_reference = request.args.get("REFERENCE")
 
     process_sms_client_response.apply_async(
         [status, provider_reference, client_name, detailed_status_code], queue=QueueNames.SMS_CALLBACKS
