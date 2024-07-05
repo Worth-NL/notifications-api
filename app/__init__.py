@@ -37,6 +37,7 @@ from app.clients.email.aws_ses_stub import AwsSesStubClient
 from app.clients.letter.dvla import DVLAClient
 from app.clients.sms.firetext import FiretextClient
 from app.clients.sms.mmg import MMGClient
+from app.clients.sms.spryng import SpryngClient
 
 db = SQLAlchemy()
 migrate = Migrate()
@@ -47,6 +48,7 @@ mmg_client = MMGClient()
 aws_ses_client = AwsSesClient()
 aws_ses_stub_client = AwsSesStubClient()
 dvla_client = DVLAClient()
+spryng_client = SpryngClient()
 signing = Signing()
 zendesk_client = ZendeskClient()
 statsd_client = StatsdClient()
@@ -90,6 +92,7 @@ def create_app(application):
     logging.init_app(application, statsd_client)
     firetext_client.init_app(application, statsd_client=statsd_client)
     mmg_client.init_app(application, statsd_client=statsd_client)
+    spryng_client.init_app(application, statsd_client=statsd_client)
     dvla_client.init_app(application, statsd_client=statsd_client)
     aws_ses_client.init_app(application.config["AWS_REGION"], statsd_client=statsd_client)
     aws_ses_stub_client.init_app(
@@ -97,7 +100,9 @@ def create_app(application):
     )
     # If a stub url is provided for SES, then use the stub client rather than the real SES boto client
     email_clients = [aws_ses_stub_client] if application.config["SES_STUB_URL"] else [aws_ses_client]
-    notification_provider_clients.init_app(sms_clients=[firetext_client, mmg_client], email_clients=email_clients)
+    notification_provider_clients.init_app(
+        sms_clients=[firetext_client, mmg_client, spryng_client], email_clients=email_clients
+    )
 
     notify_celery.init_app(application)
     signing.init_app(application)
@@ -411,8 +416,7 @@ def setup_sqlalchemy_events(app):
                 elif current_task:
                     connection_record.info["request_data"] = {
                         "method": "celery",
-                        # worker name
-                        "host": current_app.config["NOTIFY_APP_NAME"],
+                        "host": current_app.config["NOTIFY_APP_NAME"],  # worker name
                         "url_rule": current_task.name,  # task name
                     }
                 # anything else. migrations possibly, or flask cli commands.

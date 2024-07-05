@@ -102,6 +102,9 @@ class Config(object):
     FIRETEXT_API_KEY = os.getenv("FIRETEXT_API_KEY")
     FIRETEXT_INTERNATIONAL_API_KEY = os.getenv("FIRETEXT_INTERNATIONAL_API_KEY", "placeholder")
 
+    # Spryng API key
+    SPRYNG_API_KEY = os.environ.get("SPRYNG_API_KEY")
+
     # Prefix to identify queues in SQS
     NOTIFICATION_QUEUE_PREFIX = os.getenv("NOTIFICATION_QUEUE_PREFIX")
 
@@ -154,7 +157,7 @@ class Config(object):
     CHECK_PROXY_HEADER = False
 
     # these should always add up to 100%
-    SMS_PROVIDER_RESTING_POINTS = {"mmg": 51, "firetext": 49}
+    SMS_PROVIDER_RESTING_POINTS = {"mmg": 0, "firetext": 0, "spryng": 100}
 
     NOTIFY_SERVICE_ID = "d6aa2c68-a2d9-4437-ab19-3ae8eb202553"
     NOTIFY_USER_ID = "6af522d0-2915-4e52-83a3-3690455a5fe6"
@@ -275,12 +278,14 @@ class Config(object):
             },
             "create-nightly-notification-status": {
                 "task": "create-nightly-notification-status",
-                "schedule": crontab(hour=0, minute=30),  # after 'timeout-sending-notifications'
+                # after 'timeout-sending-notifications'
+                "schedule": crontab(hour=0, minute=30),
                 "options": {"queue": QueueNames.REPORTING},
             },
             "delete-notifications-older-than-retention": {
                 "task": "delete-notifications-older-than-retention",
-                "schedule": crontab(hour=3, minute=0),  # after 'create-nightly-notification-status'
+                # after 'create-nightly-notification-status'
+                "schedule": crontab(hour=3, minute=0),
                 "options": {"queue": QueueNames.REPORTING},
             },
             "delete-inbound-sms": {
@@ -416,6 +421,7 @@ class Config(object):
     # these environment vars aren't defined in the manifest so to set them on paas use `cf set-env`
     MMG_URL = os.environ.get("MMG_URL", "https://api.mmg.co.uk/jsonv2a/api.php")
     FIRETEXT_URL = os.environ.get("FIRETEXT_URL", "https://www.firetext.co.uk/api/sendsms/json")
+    SPRYNG_URL = os.environ.get("SPRYNG_URL", "https://rest.spryngsms.com/v1/messages")
     SES_STUB_URL = os.environ.get("SES_STUB_URL")
 
     AWS_REGION = "eu-west-1"
@@ -446,8 +452,6 @@ class Config(object):
 ######################
 # Config overrides ###
 ######################
-
-
 class Development(Config):
     DEBUG = True
     SQLALCHEMY_ECHO = False
