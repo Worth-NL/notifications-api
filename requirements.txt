@@ -230,7 +230,7 @@ s3transfer==0.6.0
     #   boto3
 segno==1.5.2
     # via notifications-utils
-sentry-sdk[celery,flask,sqlalchemy]==1.38.0
+sentry-sdk==2.8.0
     # via -r requirements.in
 six==1.16.0
     # via
