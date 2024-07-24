@@ -65,7 +65,7 @@ def _send_data_to_service_callback_api(self, data, service_callback_url, token, 
                 method="POST",
                 url=service_callback_url,
                 data=json.dumps(data),
-                headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
                 cert=ssl_crt,
                 timeout=5,
             )
@@ -74,7 +74,7 @@ def _send_data_to_service_callback_api(self, data, service_callback_url, token, 
                 method="POST",
                 url=service_callback_url,
                 data=json.dumps(data),
-                headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
                 timeout=5,
             )
 
