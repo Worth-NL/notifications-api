@@ -499,9 +499,7 @@ class Development(Config):
 
     CBC_PROXY_ENABLED = False
 
-    SSL_CLIENT_OVERRIDE_CERT = os.getenv("SSL_CLIENT_OVERRIDE_CERT")
-    SSL_CLIENT_OVERRIDE_KEY = os.getenv("SSL_CLIENT_OVERRIDE_KEY")
-    SSL_VERIFY_OVERRIDE = os.getenv("SSL_CERT_FILE")
+    SSL_CERT_DIR = os.getenv("SSL_CERT_DIR")
 
 
 class Test(Development):
