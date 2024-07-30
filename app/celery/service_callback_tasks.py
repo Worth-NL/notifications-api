@@ -1,4 +1,6 @@
 import json
+import os
+from urllib.parse import urlparse
 
 from flask import current_app
 from requests import HTTPError, RequestException, request
@@ -58,25 +60,32 @@ def send_complaint_to_service(self, complaint_data):
 def _send_data_to_service_callback_api(self, data, service_callback_url, token, function_name):
     notification_id = data["notification_id"] if "notification_id" in data else data["id"]
     try:
-        ssl_crt = current_app.config["SSL_CLIENT_OVERRIDE_CERT"]
+        request_kwargs = {
+            "method": "POST",
+            "url": service_callback_url,
+            "data": json.dumps(data),
+            "headers": {"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            "timeout": 5,
+        }
 
-        if ssl_crt:
-            response = request(
-                method="POST",
-                url=service_callback_url,
-                data=json.dumps(data),
-                headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
-                cert=ssl_crt,
-                timeout=5,
+        converted_url = urlparse(service_callback_url).hostname.replace(".", "-")
+        certificate_name = f"{converted_url}.pem"
+
+        certificate_path = f"{current_app.config['SSL_CERT_DIR']}/{certificate_name}"
+
+        if os.path.exists(certificate_path):
+            current_app.logger.info(
+                "Certificate [%s] found for [%s] , using as client certificate.", certificate_name, service_callback_url
             )
+            request_kwargs["cert"] = certificate_path
         else:
-            response = request(
-                method="POST",
-                url=service_callback_url,
-                data=json.dumps(data),
-                headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(token)},
-                timeout=5,
+            current_app.logger.warning(
+                "Certificate [%s] not found for [%s], no client certificate used.",
+                certificate_name,
+                service_callback_url,
             )
+
+        response = request(**request_kwargs)
 
         current_app.logger.info(
             "%s sending %s to %s, response %s",
