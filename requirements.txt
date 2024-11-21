@@ -72,6 +72,8 @@ click-repl==0.2.0
     # via celery
 colorama==0.4.4
     # via awscli
+deprecated==1.2.15
+    # via -r requirements.in
 dnspython==2.4.2
     # via eventlet
 docopt==0.6.2
@@ -163,7 +165,7 @@ mistune==0.8.4
     # via notifications-utils
 notifications-python-client==8.0.1
     # via -r requirements.in
-notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@75.2.0-rc
+notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@75.2.1-rc
     # via -r requirements.in
 ordered-set==4.1.0
     # via notifications-utils
@@ -272,6 +274,8 @@ webcolors==1.12
     # via jsonschema
 werkzeug==3.0.1
     # via flask
+wrapt==1.16.0
+    # via deprecated
 
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools
