@@ -28,10 +28,11 @@ notifications-python-client==8.0.1
 # PaaS
 awscli-cwlogs==1.4.6
 
-notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@75.1.0-patch
+notifications-utils @ git+https://github.com/Worth-NL/notifications-utils.git@75.2.3-rc
 
 # gds-metrics requires prometheseus 0.2.0, override that requirement as 0.7.1 brings significant performance gains
 prometheus-client==0.14.1
 git+https://github.com/alphagov/gds_metrics_python.git@6f1840a57b6fb1ee40b7e84f2f18ec229de8aa72
 
 sentry-sdk[flask,celery,sqlalchemy]>=1.0.0,<2.0.0
+Deprecated==1.2.15
