@@ -397,7 +397,7 @@ class Config(object):
         "simulate-delivered-3@notifications.service.gov.uk",
     )
 
-    SIMULATED_SMS_NUMBERS = ("+447700900000", "+447700900111", "+447700900222")
+    SIMULATED_SMS_NUMBERS = ("+31612345678", "+31623456789", "+31634567890")
 
     FREE_SMS_TIER_FRAGMENT_COUNT = 250000
 
