@@ -1,0 +1,81 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Don't want the tests running in parallel
+  cancel-in-progress: true
+
+jobs:
+  app-build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: szenius/set-timezone@v2.0
+        with:
+          timezoneLinux: "Europe/Amsterdam"
+
+      - name: Set TAG
+        run: echo "TAG=$(date +%Y%m%d).${{ github.run_number }}.dev" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v4
+
+      - uses: gerlero/apt-install@v1
+        with:
+          packages: build-essential git libcurl4-openssl-dev curl libssl-dev
+          install-recommends: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: BSFishy/pip-action@v1
+        with:
+          requirements: requirements_for_test.txt
+
+      - uses: astral-sh/ruff-action@v2
+
+      - uses: jpetrucciani/black-check@master
+
+      # TODO: fix automated tests
+      # Connection from runner to test database is needed for tests to run
+      # or somehow sending a custom job to k8s that would run the tests and report back 
+      - uses: pavelzw/pytest-action@v2
+        with:
+          verbose: false
+          job-summary: true
+          custom-arguments: "-n auto --max-fail=10"
+        continue-on-error: true
+
+  docker-build-and-push:
+    runs-on: ubuntu-latest
+    needs: app-build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate version.py before building image
+        run: |
+          echo -e "__git_commit__ = \"${{ github.sha }}\"\n__time__ = \"$(date)\"\n__version__ = \"${{ env.TAG }}\"" > ./app/version.py
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          file: docker/Dockerfile
+          push: true
+          tags: worthnl/notifynl-api:${{ env.TAG }}
