@@ -43,6 +43,12 @@ jobs:
 
       - uses: jpetrucciani/black-check@master
 
+      - uses: BSFishy/pip-action@v1
+        with:
+          packages: |
+            pytest-md
+            pytest-emoji
+
       # TODO: fix automated tests
       # Connection from runner to test database is needed for tests to run
       # or somehow sending a custom job to k8s that would run the tests and report back 
