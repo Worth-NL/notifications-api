@@ -50,7 +50,6 @@ jobs:
         with:
           verbose: false
           job-summary: true
-          custom-arguments: "-n auto --max-fail=10"
         continue-on-error: true
 
     outputs:
