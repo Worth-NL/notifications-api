@@ -97,6 +97,14 @@ jobs:
   helm-release:
     runs-on: ubuntu-latest
     needs: docker-build-and-push
+    environment: Test
 
     steps:
-      - run: echo "${{ needs.docker-build-and-push.outputs.tag }}"
+      - uses: licenseware/helm@v1
+        with:
+          kubeconfig: ${{ secrets.K8S_CONFIG }}
+          action: upgrade -i
+          release-name: notifynl-api
+          namespace: ${{ secrets.K8S_NAMESPACE }}
+          reuse-values: 1
+          values: dockerTagOverride=${{needs.docker-build-and-push.outputs.tag}}
