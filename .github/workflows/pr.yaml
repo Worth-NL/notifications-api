@@ -127,6 +127,5 @@ jobs:
         name: Install helm
       - run: |
           helm version
-          ls
-          ls $GITHUB_WORKSPACE
+          helm upgrade --install notifynl-api notifynl-api/ -n ${{ secrets.K8S_NAMESPACE }} --reuse-values --set dockerTagOverride=${{ needs.docker-build-and-push.outputs.tag }}
         name: Deploy chart
