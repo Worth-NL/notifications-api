@@ -123,7 +123,7 @@ jobs:
           mkdir -p $HOME/.kube
           echo "${{ secrets.K8S_CONFIG }}" > $HOME/.kube/config
         name: Setup kubernetes config
-      - uses: azure/setup-helm@v1
+      - uses: azure/setup-helm@v4
         name: Install helm
       - run: |
           helm init
