@@ -100,10 +100,14 @@ jobs:
     environment: Test
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Worth-NL/notifynl-charts-private
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: echo "${{ secrets.K8S_CONFIG }}" > $HOME/.kube/config
+        name: Setup k8s
+      - uses: azure/setup-helm@v1
+      - run: helm repo add notifynl-private file://$GITHUB_WORKSPACE
+        name: Setup helm repo
       - run: |
-          curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
-          sudo apt-get install apt-transport-https --yes
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-          sudo apt-get update
-          sudo apt-get install helm
-      - run: helm version
+          helm repo update
