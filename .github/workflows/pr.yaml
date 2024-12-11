@@ -126,7 +126,7 @@ jobs:
       - uses: azure/setup-helm@v4
         name: Install helm
       - run: |
-          helm init
+          helm version
           helm repo add notifynl-private file://$GITHUB_WORKSPACE
           helm repo update
         name: Setup helm repository
