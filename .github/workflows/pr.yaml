@@ -125,8 +125,8 @@ jobs:
         name: Setup kubernetes config
       - uses: azure/setup-helm@v1
         name: Install helm
-      - run: helm repo add notifynl-private file://$GITHUB_WORKSPACE
-        name: Setup helm repository
       - run: |
+          helm init
+          helm repo add notifynl-private file://$GITHUB_WORKSPACE
           helm repo update
-        name: Update helm repository
+        name: Setup helm repository
