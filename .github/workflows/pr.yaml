@@ -106,11 +106,4 @@ jobs:
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
           sudo apt-get update
           sudo apt-get install helm
-      - uses: licenseware/helm@v1
-        with:
-          kubeconfig: ${{ secrets.K8S_CONFIG }}
-          action: upgrade -i
-          release-name: notifynl-api
-          namespace: ${{ secrets.K8S_NAMESPACE }}
-          reuse-values: 1
-          values: dockerTagOverride=${{needs.docker-build-and-push.outputs.tag}}
+      - run: helm --version
