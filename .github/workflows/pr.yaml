@@ -119,9 +119,12 @@ jobs:
           ref: main
           token: ${{ secrets.WORTHNL_PAT }}
         name: Checkout Worth-NL/notifynl-charts-private
-      - run: echo "${{ secrets.K8S_CONFIG }}" > $HOME/.kube/config
+      - run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K8S_CONFIG }}" > $HOME/.kube/config
         name: Setup kubernetes config
       - uses: azure/setup-helm@v1
+        name: Install helm
       - run: helm repo add notifynl-private file://$GITHUB_WORKSPACE
         name: Setup helm repository
       - run: |
