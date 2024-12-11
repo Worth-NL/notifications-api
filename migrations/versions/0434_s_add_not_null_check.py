@@ -5,6 +5,7 @@ Revises: 0433_migrate_email_local_part
 Create Date: 2023-11-15 22:27:23.511256
 
 """
+
 from alembic import op
 from sqlalchemy import column
 
