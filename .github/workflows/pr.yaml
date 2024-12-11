@@ -127,6 +127,6 @@ jobs:
         name: Install helm
       - run: |
           helm version
-          helm repo add notifynl-private file://$GITHUB_WORKSPACE
-          helm repo update
-        name: Setup helm repository
+          ls
+          ls $GITHUB_WORKSPACE
+        name: Deploy chart
