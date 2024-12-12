@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Don't want the tests running in parallel
+  # Don't want multiple builds running in parallel
   cancel-in-progress: true
 
 jobs:
@@ -17,34 +17,105 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set TAG
-        run: echo "TAG=$(date +%Y%m%d).${{ github.run_number }}" >> $GITHUB_ENV
+      - run: echo "TAG=$(date +%Y%m%d).${{ github.run_number }}" >> $GITHUB_ENV
+        name: Set tag
+        id: set-tag
 
-      - name: Generate version.py before building image
-        run: |
+      - run: |
           echo -e "__git_commit__ = \"${{ github.sha }}\"\n__time__ = \"$(date)\"\n__version__ = \"${{ env.TAG }}\"" > ./app/version.py
+        name: Generate version.py before building image
 
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+        name: Login at dockerhub
 
       - uses: docker/setup-qemu-action@v3
+        name: Setup QEMU
 
       - uses: docker/setup-buildx-action@v3
+        name: Setup buildx
 
       - uses: docker/build-push-action@v6
         with:
           file: docker/Dockerfile
           push: true
           tags: worthnl/notifynl-api:latest,worthnl/notifynl-api:${{ env.TAG }}
+        name: Docker build and push ${{ env.TAG }}
 
       - uses: mathieudutour/github-tag-action@v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           custom_tag: ${{ env.TAG }}
+        name: Create git tag
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
           make_latest: true
+        name: Create Github release
+
+    outputs:
+      tag: ${{ steps.set-tag.outputs.tag }}
+
+  helm-chart-bump:
+    runs-on: ubuntu-latest
+    needs: docker-build-and-push
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Worth-NL/notifynl-charts-private
+          ref: main
+          token: ${{ secrets.WORTHNL_PAT }}
+        name: Checkout Worth-NL/notifynl-charts-private
+
+      - uses: pietrobolcato/action-read-yaml@1.0.0
+        with:
+          config: notifynl-api/Chart.yaml
+        name: Read Chart.yaml
+        id: yaml-read
+
+      - uses: olegsu/semver-action@v1
+        with:
+          version: ${{ steps.yaml-read.outputs['version'] }}
+        name: Chart version bump
+        id: version-bump
+
+      - uses: rmeneely/update-yaml@v1
+        with:
+          infile: notifynl-api/Chart.yaml
+          varlist: version=${{ steps.version-bump.outputs.version }},appVersion=${{ needs.docker-build-and-push.outputs.tag }}
+        name: Update Chart.yaml
+
+      - uses: offensive-vk/auto-commit-push@v7
+        with:
+          message: 🤖 notifynl-api chart bump
+          github-token: ${{ secrets.WORTHNL_PAT }}
+
+  helm-release:
+    runs-on: ubuntu-latest
+    needs: helm-chart-bump
+    environment: Test
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Worth-NL/notifynl-charts-private
+          ref: main
+          token: ${{ secrets.WORTHNL_PAT }}
+        name: Checkout Worth-NL/notifynl-charts-private
+
+      - run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K8S_CONFIG }}" > $HOME/.kube/config
+        name: Setup kubernetes config
+
+      - uses: azure/setup-helm@v4
+        name: Install helm
+
+      - run: |
+          helm version
+          helm upgrade --install notifynl-api notifynl-api/ -n ${{ secrets.K8S_NAMESPACE }} --reuse-values --set dockerTagOverride=${{ needs.docker-build-and-push.outputs.tag }} --wait
+        name: Deploy chart

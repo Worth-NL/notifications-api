@@ -119,13 +119,16 @@ jobs:
           ref: main
           token: ${{ secrets.WORTHNL_PAT }}
         name: Checkout Worth-NL/notifynl-charts-private
+
       - run: |
           mkdir -p $HOME/.kube
           echo "${{ secrets.K8S_CONFIG }}" > $HOME/.kube/config
         name: Setup kubernetes config
+
       - uses: azure/setup-helm@v4
         name: Install helm
+
       - run: |
           helm version
-          helm upgrade --install notifynl-api notifynl-api/ -n ${{ secrets.K8S_NAMESPACE }} --reuse-values --set dockerTagOverride=${{ needs.docker-build-and-push.outputs.tag }}
+          helm upgrade --install notifynl-api notifynl-api/ -n ${{ secrets.K8S_NAMESPACE }} --reuse-values --set dockerTagOverride=${{ needs.docker-build-and-push.outputs.tag }} --wait
         name: Deploy chart
