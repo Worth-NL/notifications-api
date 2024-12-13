@@ -120,13 +120,9 @@ jobs:
           token: ${{ secrets.WORTHNL_PAT }}
         name: Checkout Worth-NL/notifynl-charts-private
 
-      - run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.K8S_CONFIG }}" > $HOME/.kube/config
-        name: Setup kubernetes config
-
-      - uses: azure/setup-helm@v4
-        name: Install helm
+      - uses: bwvolleyball/k8s-toolkit@v1.0.0
+        with:
+          config: ${{ secrets.K8S_CONFIG }}
 
       - run: |
           helm version
