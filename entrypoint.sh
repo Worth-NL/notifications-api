@@ -25,7 +25,7 @@ then
 
 elif [ "$1" == "api-local" ]
 then
-  exec flask run --host 0.0.0.0 --port $PORT
+  exec python -m debugpy --wait-for-client --listen $DEBUG_PORT -m flask run --host 0.0.0.0 --port $PORT
 
 elif [ "$1" == "migration" ]
 then
