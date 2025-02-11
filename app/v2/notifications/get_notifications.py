@@ -27,7 +27,7 @@ def get_notification_by_id(notification_id):
     notification = notifications_dao.get_notification_with_personalisation(
         authenticated_service.id, notification_id, key_type=None
     )
-    return jsonify(notification.serialize()), 200
+    return jsonify(notification.serialize_with_cost_data()), 200
 
 
 @v2_notification_blueprint.route("/<notification_id>/pdf", methods=["GET"])
@@ -43,15 +43,15 @@ def get_pdf_for_notification(notification_id):
         raise BadRequestError(message="File did not pass the virus scan")
 
     if notification.status == NOTIFICATION_TECHNICAL_FAILURE:
-        raise BadRequestError(message="PDF not available for letters in status {}".format(notification.status))
+        raise BadRequestError(message=f"PDF not available for letters in status {notification.status}")
 
     if notification.status == NOTIFICATION_PENDING_VIRUS_CHECK:
-        raise PDFNotReadyError()
+        raise PDFNotReadyError
 
     try:
         pdf_data, metadata = get_letter_pdf_and_metadata(notification)
     except Exception as e:
-        raise PDFNotReadyError() from e
+        raise PDFNotReadyError from e
 
     return send_file(path_or_file=BytesIO(pdf_data), mimetype="application/pdf")
 
@@ -77,7 +77,7 @@ def get_notifications():
         str(authenticated_service.id),
         filter_dict=data,
         key_type=api_user.key_type,
-        personalisation=True,
+        with_template=True,
         older_than=data.get("older_than"),
         client_reference=data.get("reference"),
         page_size=current_app.config.get("API_PAGE_SIZE"),
@@ -98,7 +98,7 @@ def get_notifications():
 
     return (
         jsonify(
-            notifications=[notification.serialize() for notification in paginated_notifications.items],
+            notifications=[notification.serialize_with_cost_data() for notification in paginated_notifications.items],
             links=_build_links(paginated_notifications.items),
         ),
         200,

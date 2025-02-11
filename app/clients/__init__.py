@@ -3,15 +3,11 @@ class ClientException(Exception):
     Base Exceptions for sending notifications that fail
     """
 
-    pass
 
-
-class Client(object):
+class Client:
     """
     Base client for sending notifications.
     """
-
-    pass
 
 
 STATISTICS_REQUESTED = "requested"
@@ -19,16 +15,10 @@ STATISTICS_DELIVERED = "delivered"
 STATISTICS_FAILURE = "failure"
 
 
-class NotificationProviderClients(object):
-    sms_clients = {}
-    email_clients = {}
-
-    def init_app(self, sms_clients, email_clients):
-        for client in sms_clients:
-            self.sms_clients[client.name] = client
-
-        for client in email_clients:
-            self.email_clients[client.name] = client
+class NotificationProviderClients:
+    def __init__(self, sms_clients, email_clients):
+        self.sms_clients = {**sms_clients}
+        self.email_clients = {**email_clients}
 
     def get_sms_client(self, name):
         return self.sms_clients.get(name)

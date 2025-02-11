@@ -6,12 +6,11 @@ from freezegun import freeze_time
 from app.dao.annual_billing_dao import (
     dao_create_or_update_annual_billing_for_year,
     dao_get_free_sms_fragment_limit_for_year,
-    dao_update_annual_billing_for_future_years,
     set_default_free_allowance_for_service,
 )
 from app.dao.date_util import get_current_financial_year_start_year
 from app.models import AnnualBilling
-from tests.app.db import create_annual_billing, create_service
+from tests.app.db import create_service
 
 
 def test_dao_update_free_sms_fragment_limit(notify_db_session, sample_service):
@@ -29,22 +28,6 @@ def test_create_annual_billing(sample_service):
     free_limit = dao_get_free_sms_fragment_limit_for_year(sample_service.id, 2016)
 
     assert free_limit.free_sms_fragment_limit == 9999
-
-
-def test_dao_update_annual_billing_for_future_years(notify_db_session, sample_service):
-    current_year = get_current_financial_year_start_year()
-    limits = [1, 2, 3, 4]
-    create_annual_billing(sample_service.id, limits[0], current_year - 1)
-    create_annual_billing(sample_service.id, limits[2], current_year + 1)
-    create_annual_billing(sample_service.id, limits[3], current_year + 2)
-
-    dao_update_annual_billing_for_future_years(sample_service.id, 9999, current_year)
-
-    assert dao_get_free_sms_fragment_limit_for_year(sample_service.id, current_year - 1).free_sms_fragment_limit == 1
-    # current year is not created
-    assert dao_get_free_sms_fragment_limit_for_year(sample_service.id, current_year) is None
-    assert dao_get_free_sms_fragment_limit_for_year(sample_service.id, current_year + 1).free_sms_fragment_limit == 9999
-    assert dao_get_free_sms_fragment_limit_for_year(sample_service.id, current_year + 2).free_sms_fragment_limit == 9999
 
 
 @pytest.mark.parametrize(
@@ -76,15 +59,15 @@ def test_dao_update_annual_billing_for_future_years(notify_db_session, sample_se
         ("emergency_service", 2022, 20000),
         ("central", 2023, 40000),
         # Some test cases that will make valid assertions as time inevitably marches on
-        ("central", get_current_financial_year_start_year(), 40_000),
-        ("local", get_current_financial_year_start_year(), 20_000),
-        ("nhs_central", get_current_financial_year_start_year(), 40_000),
-        ("nhs_local", get_current_financial_year_start_year(), 20_000),
-        ("nhs_gp", get_current_financial_year_start_year(), 10_000),
-        ("emergency_service", get_current_financial_year_start_year(), 20_000),
-        ("school_or_college", get_current_financial_year_start_year(), 10_000),
-        ("other", get_current_financial_year_start_year(), 10_000),
-        (None, get_current_financial_year_start_year(), 10_000),
+        ("central", get_current_financial_year_start_year(), 30_000),
+        ("local", get_current_financial_year_start_year(), 10_000),
+        ("nhs_central", get_current_financial_year_start_year(), 30_000),
+        ("nhs_local", get_current_financial_year_start_year(), 10_000),
+        ("nhs_gp", get_current_financial_year_start_year(), 0),
+        ("emergency_service", get_current_financial_year_start_year(), 10_000),
+        ("school_or_college", get_current_financial_year_start_year(), 5_000),
+        ("other", get_current_financial_year_start_year(), 5_000),
+        (None, get_current_financial_year_start_year(), 5_000),
     ],
 )
 def test_set_default_free_allowance_for_service(notify_db_session, org_type, year, expected_default):

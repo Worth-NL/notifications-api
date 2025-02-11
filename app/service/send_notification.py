@@ -39,7 +39,7 @@ from app.v2.errors import BadRequestError
 def validate_created_by(service, created_by_id):
     user = get_user_by_id(created_by_id)
     if service not in user.services:
-        message = 'Can’t create notification - {} is not part of the "{}" service'.format(user.name, service.name)
+        message = f'Can’t create notification - {user.name} is not part of the "{service.name}" service'
         raise BadRequestError(message=message)
 
 
@@ -92,6 +92,7 @@ def send_one_off_notification(service_id, post_data):
     notification = persist_notification(
         template_id=template.id,
         template_version=template.version,
+        template_has_unsubscribe_link=template.has_unsubscribe_link,
         recipient=post_data["to"],
         service=service,
         personalisation=personalisation,
@@ -130,7 +131,7 @@ def get_reply_to_text(notification_type, sender_id, service, template):
 def send_pdf_letter_notification(service_id, post_data):
     service = dao_fetch_service_by_id(service_id)
 
-    check_service_has_permission(LETTER_TYPE, [p.permission for p in service.permissions])
+    check_service_has_permission(service, LETTER_TYPE)
     check_service_over_daily_message_limit(service, KEY_TYPE_NORMAL, notification_type=LETTER_TYPE)
     validate_created_by(service, post_data["created_by"])
     validate_and_format_recipient(

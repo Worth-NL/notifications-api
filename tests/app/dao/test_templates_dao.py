@@ -7,11 +7,11 @@ from sqlalchemy.orm.exc import NoResultFound
 from app.dao.templates_dao import (
     dao_create_template,
     dao_get_all_templates_for_service,
+    dao_get_template_by_id,
     dao_get_template_by_id_and_service_id,
     dao_get_template_versions,
     dao_redact_template,
     dao_update_template,
-    dao_update_template_reply_to,
 )
 from app.models import Template, TemplateHistory, TemplateRedacted
 from tests.app.db import create_letter_contact, create_template
@@ -40,10 +40,10 @@ def test_create_template(sample_service, sample_user, template_type, subject):
     template = Template(**data)
     dao_create_template(template)
 
-    assert Template.query.count() == 1
-    assert len(dao_get_all_templates_for_service(sample_service.id)) == 1
-    assert dao_get_all_templates_for_service(sample_service.id)[0].name == "Sample Template"
-    assert dao_get_all_templates_for_service(sample_service.id)[0].process_type == "normal"
+    template = Template.query.one()
+    assert template.name == "Sample Template"
+    assert template.process_type == "normal"
+    assert template.has_unsubscribe_link is False
 
 
 def test_create_template_creates_redact_entry(sample_service):
@@ -110,7 +110,8 @@ def test_dao_update_template_reply_to_none_to_some(sample_service, sample_user):
     assert created.reply_to is None
     assert created.service_letter_contact_id is None
 
-    dao_update_template_reply_to(template_id=template.id, reply_to=letter_contact.id)
+    created.service_letter_contact_id = letter_contact.id
+    dao_update_template(created)
 
     updated = Template.query.get(template.id)
     assert updated.reply_to == letter_contact.id
@@ -138,7 +139,8 @@ def test_dao_update_template_reply_to_some_to_some(sample_service, sample_user):
     template = Template(**data)
     dao_create_template(template)
     created = Template.query.get(template.id)
-    dao_update_template_reply_to(template_id=created.id, reply_to=letter_contact_2.id)
+    created.service_letter_contact_id = letter_contact_2.id
+    dao_update_template(created)
     updated = Template.query.get(template.id)
     assert updated.reply_to == letter_contact_2.id
     assert updated.version == 2
@@ -163,7 +165,10 @@ def test_dao_update_template_reply_to_some_to_none(sample_service, sample_user):
     template = Template(**data)
     dao_create_template(template)
     created = Template.query.get(template.id)
-    dao_update_template_reply_to(template_id=created.id, reply_to=None)
+
+    created.service_letter_contact_id = None
+    dao_update_template(created)
+
     updated = Template.query.get(template.id)
     assert updated.reply_to is None
     assert updated.version == 2
@@ -404,3 +409,15 @@ def test_get_template_versions_is_empty_for_hidden_templates(sample_service):
     sample_template = create_template(template_name="Test Template", hidden=True, service=sample_service)
     versions = dao_get_template_versions(service_id=sample_template.service_id, template_id=sample_template.id)
     assert len(versions) == 0
+
+
+def test_dao_get_template_service_join_request_approved(service_join_request_approved_template):
+    template_id = "4d8ee728-100e-4f0e-8793-5638cfa4ffa4"
+    template_type = "email"
+    partial_content = "has approved your request to join"
+
+    template = dao_get_template_by_id(template_id=template_id)
+
+    assert str(template.id) == template_id
+    assert template.template_type == template_type
+    assert partial_content in template.content

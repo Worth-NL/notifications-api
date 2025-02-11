@@ -1,6 +1,6 @@
 import random
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -34,6 +34,7 @@ from app.dao.service_sms_sender_dao import (
 )
 from app.dao.services_dao import dao_add_user_to_service, dao_create_service
 from app.dao.templates_dao import dao_create_template, dao_update_template
+from app.dao.unsubscribe_request_dao import create_unsubscribe_request_dao, create_unsubscribe_request_reports_dao
 from app.dao.users_dao import save_model_user
 from app.models import (
     AnnualBilling,
@@ -45,7 +46,6 @@ from app.models import (
     BroadcastProviderMessageNumber,
     BroadcastStatusType,
     Complaint,
-    DailySortedLetter,
     Domain,
     EmailBranding,
     FactBilling,
@@ -76,9 +76,11 @@ from app.models import (
     ServiceSmsSender,
     Template,
     TemplateFolder,
+    UnsubscribeRequestReport,
     User,
     WebauthnCredential,
 )
+from app.utils import midnight_n_days_ago
 
 
 def create_user(*, mobile_number="+447700900986", email=None, state="active", id_=None, name="Test User", **kwargs):
@@ -138,7 +140,7 @@ def create_service(
             letter_message_limit=letter_message_limit,
             restricted=restricted,
             custom_email_sender_name=None,
-            created_by=user if user else create_user(email="{}@digital.cabinet-office.gov.uk".format(uuid.uuid4())),
+            created_by=user if user else create_user(email=f"{uuid.uuid4()}@digital.cabinet-office.gov.uk"),
             prefix_sms=prefix_sms,
             organisation_type=organisation_type,
             organisation=organisation,
@@ -151,10 +153,11 @@ def create_service(
             billing_reference=billing_reference,
             contact_link=contact_link,
         )
+        if service_id:
+            service.id = service_id
         dao_create_service(
             service,
             service.created_by,
-            service_id,
             service_permissions=service_permissions,
         )
 
@@ -194,6 +197,7 @@ def create_template(
     service,
     template_type=SMS_TYPE,
     template_name=None,
+    has_unsubscribe_link=False,
     subject="Template subject",
     content="Dear Sir/Madam, Hello. Yours Truly, The Government.",
     reply_to=None,
@@ -205,8 +209,9 @@ def create_template(
     contact_block_id=None,
 ):
     data = {
-        "name": template_name or "{} Template Name".format(template_type),
+        "name": template_name or f"{template_type} Template Name",
         "template_type": template_type,
+        "has_unsubscribe_link": has_unsubscribe_link,
         "content": content,
         "service": service,
         "created_by": service.created_by,
@@ -256,6 +261,7 @@ def create_notification(
     created_by_id=None,
     postage=None,
     document_download_count=None,
+    unsubscribe_link=None,
 ):
     assert job or template
     if job:
@@ -279,6 +285,9 @@ def create_notification(
 
     if template.template_type == "letter" and postage is None:
         postage = "second"
+
+    if template.template_type == "sms" and rate_multiplier is None:
+        rate_multiplier = 1
 
     data = {
         "id": uuid.uuid4(),
@@ -311,6 +320,7 @@ def create_notification(
         "created_by_id": created_by_id,
         "postage": postage,
         "document_download_count": document_download_count,
+        "unsubscribe_link": unsubscribe_link,
     }
     notification = Notification(**data)
     dao_create_notification(notification)
@@ -442,7 +452,7 @@ def create_inbound_sms(
     if not service.inbound_number:
         create_inbound_number(
             # create random inbound number
-            notify_number or "07{:09}".format(random.randint(0, 1e9 - 1)),
+            notify_number or f"07{random.randint(0, 1e9 - 1):09}",
             provider=provider,
             service_id=service.id,
         )
@@ -473,9 +483,7 @@ def create_service_inbound_api(
     return service_inbound_api
 
 
-def create_service_callback_api(
-    service, url="https://something.com", bearer_token="some_super_secret", callback_type="delivery_status"
-):
+def create_service_callback_api(callback_type, service, url="https://something.com", bearer_token="some_super_secret"):
     service_callback_api = ServiceCallbackApi(
         service_id=service.id,
         url=url,
@@ -526,7 +534,7 @@ def create_letter_rate(start_date=None, end_date=None, crown=True, sheet_count=1
 def create_api_key(service, key_type=KEY_TYPE_NORMAL, key_name=None):
     id_ = uuid.uuid4()
 
-    name = key_name if key_name else "{} api key {}".format(key_type, id_)
+    name = key_name if key_name else f"{key_type} api key {id_}"
 
     api_key = ApiKey(
         service=service, name=name, created_by=service.created_by, key_type=key_type, id=id_, secret=uuid.uuid4()
@@ -655,22 +663,6 @@ def create_invited_org_user(organisation, invited_by, email_address="invite@exam
     )
     save_invited_org_user(invited_org_user)
     return invited_org_user
-
-
-def create_daily_sorted_letter(
-    billing_day=None, file_name="Notify-20180118123.rs.txt", unsorted_count=0, sorted_count=0
-):
-    daily_sorted_letter = DailySortedLetter(
-        billing_day=billing_day or date(2018, 1, 18),
-        file_name=file_name,
-        unsorted_count=unsorted_count,
-        sorted_count=sorted_count,
-    )
-
-    db.session.add(daily_sorted_letter)
-    db.session.commit()
-
-    return daily_sorted_letter
 
 
 def create_ft_billing(
@@ -935,7 +927,7 @@ def set_up_usage_data(start_date):
     )
 
     org_1 = create_organisation(
-        name="Org for {}".format(service_1_sms_and_letter.name),
+        name=f"Org for {service_1_sms_and_letter.name}",
         purchase_order_number="org1 purchase order number",
         billing_contact_names="org1 billing contact names",
         billing_contact_email_addresses="org1@billing.contact email@addresses.gov.uk",
@@ -976,7 +968,7 @@ def set_up_usage_data(start_date):
     service_with_emails = create_service(service_name="b - emails")
     email_template = create_template(service=service_with_emails, template_type="email")
     org_2 = create_organisation(
-        name="Org for {}".format(service_with_emails.name),
+        name=f"Org for {service_with_emails.name}",
     )
     dao_add_service_to_organisation(service=service_with_emails, organisation_id=org_2.id)
     create_annual_billing(service_id=service_with_emails.id, free_sms_fragment_limit=0, financial_year_start=year)
@@ -987,7 +979,7 @@ def set_up_usage_data(start_date):
     service_with_letters = create_service(service_name="c - letters only")
     letter_template_3 = create_template(service=service_with_letters, template_type="letter")
     org_for_service_with_letters = create_organisation(
-        name="Org for {}".format(service_with_letters.name),
+        name=f"Org for {service_with_letters.name}",
         purchase_order_number="org3 purchase order number",
         billing_contact_names="org3 billing contact names",
         billing_contact_email_addresses="org3@billing.contact email@addresses.gov.uk",
@@ -1272,3 +1264,95 @@ def create_letter_attachment(created_by_id):
     db.session.add(letter_attachment)
     db.session.commit()
     return letter_attachment
+
+
+def create_unsubscribe_request(
+    service,
+    *,
+    email_address=None,
+    created_at=None,
+    job=None,
+    unsubscribe_request_report_id=None,
+):
+    template = (
+        job.template
+        if job
+        else create_template(
+            service,
+            template_type=EMAIL_TYPE,
+        )
+    )
+    notification = create_notification(
+        template=template,
+        job=job,
+        to_field=email_address,
+        sent_at=(created_at or datetime.now()) - timedelta(days=1),
+    )
+    return create_unsubscribe_request_dao(
+        {
+            "notification_id": notification.id,
+            "template_id": notification.template_id,
+            "template_version": notification.template_version,
+            "service_id": notification.service_id,
+            "email_address": notification.to,
+            "created_at": created_at or datetime.now(),
+            "unsubscribe_request_report_id": unsubscribe_request_report_id,
+        }
+    )
+
+
+def create_unsubscribe_request_report(
+    service,
+    *,
+    count=123,
+    earliest_timestamp,
+    latest_timestamp,
+    processed_by_service_at=None,
+    created_at=None,
+):
+    report = UnsubscribeRequestReport(
+        id=uuid.uuid4(),
+        count=count,
+        earliest_timestamp=earliest_timestamp,
+        latest_timestamp=latest_timestamp,
+        service_id=service.id,
+        processed_by_service_at=processed_by_service_at,
+        created_at=created_at,
+    )
+    create_unsubscribe_request_reports_dao(report)
+    return report
+
+
+def create_unsubscribe_request_and_return_the_notification_id(
+    sample_service, sample_template, is_batched, processed_by_service
+):
+    notification = create_notification(
+        template=sample_template,
+        to_field="example@example.com",
+        sent_at=datetime.now() - timedelta(days=4),
+    )
+
+    unsubscribe_request_report_id = None
+    if is_batched:
+        # Create processed unsubscribe request report
+        unsubscribe_request_report = create_unsubscribe_request_report(
+            sample_service,
+            earliest_timestamp=midnight_n_days_ago(4),
+            latest_timestamp=midnight_n_days_ago(2),
+            processed_by_service_at=midnight_n_days_ago(1) if processed_by_service else None,
+        )
+        unsubscribe_request_report_id = unsubscribe_request_report.id
+
+    # Create an unsubscribe request
+    create_unsubscribe_request_dao(
+        {
+            "notification_id": notification.id,
+            "template_id": notification.template_id,
+            "template_version": notification.template_version,
+            "service_id": sample_service.id,
+            "email_address": notification.to,
+            "created_at": datetime.now(),
+            "unsubscribe_request_report_id": unsubscribe_request_report_id,
+        }
+    )
+    return notification.id

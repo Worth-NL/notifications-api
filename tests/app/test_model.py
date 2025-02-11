@@ -1,5 +1,10 @@
+import json
+from datetime import UTC, datetime, timedelta
+from unittest.mock import call
+
 import pytest
 from freezegun import freeze_time
+from sqlalchemy import func, literal_column, select, table
 from sqlalchemy.exc import IntegrityError
 
 from app import signing
@@ -18,10 +23,18 @@ from app.constants import (
     PRECOMPILED_TEMPLATE_NAME,
     SMS_TYPE,
 )
-from app.models import Notification, ServiceGuestList
+from app.models import (
+    FactNotificationStatus,
+    Job,
+    LetterCostThreshold,
+    Notification,
+    NotificationHistory,
+    ServiceGuestList,
+)
 from tests.app.db import (
     create_inbound_number,
     create_letter_contact,
+    create_letter_rate,
     create_notification,
     create_reply_to_email,
     create_service,
@@ -223,6 +236,166 @@ def test_letter_notification_serializes_with_subject(client, sample_letter_templ
     assert res["subject"] == "Template subject"
 
 
+def test_notification_serialize_with_cost_data_for_sms(client, sample_template, sms_rate):
+    notification = create_notification(sample_template, billable_units=2)
+
+    response = notification.serialize_with_cost_data()
+
+    assert response["is_cost_data_ready"] is True
+    assert response["cost_details"] == {
+        "billable_sms_fragments": 2,
+        "international_rate_multiplier": 1.0,
+        "sms_rate": 0.0227,
+    }
+    assert response["cost_in_pounds"] == 0.0454
+
+
+@pytest.mark.parametrize("status", ["created", "sending", "delivered", "returned-letter"])
+def test_notification_serialize_with_cost_data_for_letter(client, sample_letter_template, letter_rate, status):
+    notification = create_notification(sample_letter_template, billable_units=1, postage="second", status=status)
+
+    response = notification.serialize_with_cost_data()
+
+    assert response["is_cost_data_ready"] is True
+    assert response["cost_details"] == {"billable_sheets_of_paper": 1, "postage": "second"}
+    assert response["cost_in_pounds"] == 0.54
+
+
+@freeze_time("2024-07-10 12:11:04.000000")
+def test_notification_serialize_with_cost_data_uses_cache_to_get_sms_rate(client, mocker, sample_template, sms_rate):
+    notification_1 = create_notification(sample_template, billable_units=1)
+    notification_2 = create_notification(sample_template, billable_units=2)
+
+    mock_get_sms_rate = mocker.patch("app.dao.sms_rate_dao.dao_get_sms_rate_for_timestamp", return_value=sms_rate)
+    mock_redis_get = mocker.patch(
+        "app.RedisClient.get",
+        side_effect=[None, b"0.0227"],
+    )
+    mock_redis_set = mocker.patch(
+        "app.RedisClient.set",
+    )
+
+    # we serialize twice
+    notification_1.serialize_with_cost_data()
+    response = notification_2.serialize_with_cost_data()
+
+    # redis is called
+    assert mock_redis_get.call_args_list == [
+        call("sms-rate-for-2024-07-10"),
+        call("sms-rate-for-2024-07-10"),
+    ]
+    assert mock_redis_set.call_args_list == [call("sms-rate-for-2024-07-10", 0.0227, ex=86400)]
+
+    # but we only get rate once
+    assert mock_get_sms_rate.call_args_list == [
+        call(datetime.now().date()),
+    ]
+
+    # check that response returned from cache looks right
+    assert response["cost_details"] == {
+        "billable_sms_fragments": 2,
+        "international_rate_multiplier": 1.0,
+        "sms_rate": 0.0227,
+    }
+    assert response["cost_in_pounds"] == 0.0454
+
+
+@freeze_time("2024-07-10 12:11:04.000000")
+def test_notification_serialize_with_cost_data_uses_cache_to_get_letter_rate(
+    client, mocker, sample_letter_template, letter_rate, notify_db_session
+):
+    # letter rate for 2 sheets of paper
+    other_rate = create_letter_rate(
+        start_date=datetime.now(UTC) - timedelta(days=1), rate=0.85, post_class="first", sheet_count=2
+    )
+    # two letters that are 1 sheet of paper each 2nd class, and one letter that is two sheets long 1st class
+    notification_1 = create_notification(sample_letter_template, billable_units=1, postage="second")
+    notification_2 = create_notification(sample_letter_template, billable_units=1, postage="second")
+    notification_3 = create_notification(sample_letter_template, billable_units=2, postage="first")
+
+    mock_get_letter_rates = mocker.patch(
+        "app.dao.letter_rate_dao.dao_get_letter_rates_for_timestamp",
+        side_effect=[[letter_rate, other_rate], [letter_rate, other_rate]],
+    )
+    mock_redis_get = mocker.patch(
+        "app.RedisClient.get",
+        side_effect=[None, b"0.54", None],
+    )
+    mock_redis_set = mocker.patch(
+        "app.RedisClient.set",
+    )
+
+    # we serialize three times - two times for one rate, and once for the other rate
+    notification_1.serialize_with_cost_data()
+    response = notification_2.serialize_with_cost_data()
+    notification_3.serialize_with_cost_data()
+
+    # redis is called
+    assert mock_redis_get.call_args_list == [
+        call("letter-rate-for-date-2024-07-10-sheets-1-postage-second"),
+        call("letter-rate-for-date-2024-07-10-sheets-1-postage-second"),
+        call("letter-rate-for-date-2024-07-10-sheets-2-postage-first"),
+    ]
+    assert mock_redis_set.call_args_list == [
+        call("letter-rate-for-date-2024-07-10-sheets-1-postage-second", 0.54, ex=86400),
+        call("letter-rate-for-date-2024-07-10-sheets-2-postage-first", 0.85, ex=86400),
+    ]
+
+    # but we only get each rate once from db
+    assert mock_get_letter_rates.call_args_list == [
+        call(datetime.now().date()),
+        call(datetime.now().date()),
+    ]
+
+    # check that response returned from cache looks right
+    assert response["cost_in_pounds"] == 0.54
+
+
+def test_notification_serialize_with_cost_data_for_sms_when_data_not_ready(client, sample_template, letter_rate):
+    notification = create_notification(sample_template, billable_units=None, postage="first", status="created")
+
+    response = notification.serialize_with_cost_data()
+
+    assert response["is_cost_data_ready"] is False
+    assert response["cost_details"] == {}
+    assert response["cost_in_pounds"] is None
+
+
+@pytest.mark.parametrize("status", ["created", "pending-virus-check"])
+def test_notification_serialize_with_cost_data_for_letter_when_data_not_ready(
+    client, sample_letter_template, letter_rate, status
+):
+    notification = create_notification(sample_letter_template, billable_units=None, postage="first", status=status)
+
+    response = notification.serialize_with_cost_data()
+
+    assert response["is_cost_data_ready"] is False
+    assert response["cost_details"] == {}
+    assert response["cost_in_pounds"] is None
+
+
+@pytest.mark.parametrize("status", ["validation-failed", "technical-failure", "cancelled", "virus-scan-failed"])
+def test_notification_serialize_with_with_cost_data_for_letter_that_wasnt_sent(
+    client, sample_letter_template, letter_rate, status
+):
+    notification = create_notification(sample_letter_template, billable_units=1, postage="first", status=status)
+
+    response = notification.serialize_with_cost_data()
+
+    assert response["is_cost_data_ready"] is True
+    assert response["cost_details"] == {"billable_sheets_of_paper": 0, "postage": "first"}
+    assert response["cost_in_pounds"] == 0.00
+
+
+def test_notification_serialize_with_cost_data_for_email(client, sample_email_template):
+    notification = create_notification(sample_email_template, billable_units=0)
+
+    response = notification.serialize_with_cost_data()
+
+    assert response["cost_details"] == {}
+    assert response["cost_in_pounds"] == 0.00
+
+
 def test_notification_references_template_history(client, sample_template):
     noti = create_notification(sample_template)
     sample_template.version = 3
@@ -233,6 +406,64 @@ def test_notification_references_template_history(client, sample_template):
 
     assert res["body"] == noti.template.content
     assert noti.template.content != sample_template.content
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        FactNotificationStatus,
+        Job,
+        Notification,
+        NotificationHistory,
+    ),
+)
+def test_extended_statistics_presence(notify_db_session, model):
+    """
+    Test that the extended statistics objects in the fully-migrated database correspond to
+    those declared on a model's  __extended_statistics__
+    """
+
+    # a map of internal statistics kind labels to those used in the
+    # CREATE STATISTICS syntax
+    kinds_map = {
+        "d": "ndistinct",
+        "f": "dependencies",
+        "m": "mcv",
+    }
+
+    # it would be much more convenient to use the pg_stats_ext view, but
+    # that doesn't show entries for empty tables with no statistics - which
+    # is how tables tend to appear in these tests - so we have to do a lot
+    # of the joining nonsense ourselves.
+    # NOTE not handled: expression statistics
+    assert frozenset(
+        (
+            (name, frozenset(attnames), frozenset(kinds_map[kind] for kind in kinds))
+            for name, attnames, kinds in notify_db_session.execute(
+                select(
+                    literal_column("stxname"),
+                    select(func.array_agg(literal_column("attname")))
+                    .select_from(table("pg_attribute"))
+                    .where(
+                        literal_column("pg_attribute.attrelid") == literal_column("pg_statistic_ext.stxrelid"),
+                        literal_column("pg_attribute.attnum") == literal_column("pg_statistic_ext.stxkeys").any_(),
+                    )
+                    .scalar_subquery(),
+                    literal_column("stxkind"),
+                )
+                .select_from(
+                    table("pg_statistic_ext"),
+                    table("pg_class"),
+                )
+                .where(
+                    literal_column("pg_class.oid") == literal_column("pg_statistic_ext.stxrelid"),
+                    literal_column("pg_class.relname") == model.__tablename__,
+                )
+            ).fetchall()
+        )
+    ) == frozenset(
+        ((name, frozenset(attnames), frozenset(kinds)) for name, attnames, kinds in model.__extended_statistics__)
+    )
 
 
 def test_notification_requires_a_valid_template_version(client, sample_template):
@@ -355,3 +586,7 @@ def test_user_can_use_webauthn_if_they_login_with_it(sample_user, auth_type, can
 
 def test_user_can_use_webauthn_if_in_notify_team(notify_service):
     assert notify_service.users[0].can_use_webauthn
+
+
+def test_letter_cost_threshold_is_json_serializable():
+    assert json.dumps(LetterCostThreshold.sorted) == '"sorted"'

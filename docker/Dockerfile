@@ -1,7 +1,11 @@
-FROM python:3.11-slim-bullseye as base
+FROM python:3.11-slim-bookworm AS base
+
+COPY --from=ghcr.io/astral-sh/uv:0.5.28 /uv /uvx /bin/
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV UV_COMPILE_BYTECODE=1
+ENV VIRTUAL_ENV="/opt/venv"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -27,9 +31,10 @@ RUN echo "Install OS dependencies for python app requirements" &&  \
 
 COPY requirements.txt .
 
+ENV UV_CACHE_DIR='/tmp/uv-cache/'
 RUN echo "Installing python requirements" && \
     python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install -r requirements.txt
+    uv pip sync --python /opt/venv/bin/python requirements.txt
 
 COPY . .
 RUN make generate-version-file  # This file gets copied across
@@ -51,13 +56,14 @@ COPY --chown=notify:notify templates templates
 COPY --chown=notify:notify run_celery.py gunicorn_config.py application.py entrypoint.sh ./
 COPY --from=python_build --chown=notify:notify /home/vcap/app/app/version.py app/version.py
 
-RUN chown -R notify:notify /home/vcap/app && \
+RUN python -m compileall . && \
+    chown -R notify:notify /home/vcap/app && \
     chmod +x /home/vcap/app/entrypoint.sh
 
 ENTRYPOINT [ "/home/vcap/app/entrypoint.sh" ]
 
 ##### Test Image ##############################################################
-FROM production as test
+FROM production AS test
 
 USER root
 RUN echo "Install OS dependencies for test build" && \
@@ -80,13 +86,16 @@ RUN mkdir -p app
 COPY --from=python_build --chown=notify:notify /opt/venv /opt/venv
 
 # Install dev/test requirements
-COPY --chown=notify:notify Makefile requirements.txt requirements_for_test.txt ./
+COPY --chown=notify:notify Makefile requirements_for_test.txt ./
+ENV UV_CACHE_DIR='/tmp/uv-cache/'
 RUN make bootstrap
 
 COPY --chown=notify:notify . .
 
 ##### Concourse Test Image ##############################################################
-FROM production as concourse_tests
+FROM production AS concourse_tests
+
+SHELL ["/bin/bash", "-c"]
 
 USER root
 RUN echo "Install OS dependencies for test build" && \
@@ -115,7 +124,8 @@ COPY --chown=notify:notify . .
 
 ENV SQLALCHEMY_DATABASE_URI=postgresql://postgres:postgres@localhost/
 
-RUN pip3 install -r requirements_for_test.txt
+ENV UV_CACHE_DIR='/tmp/uv-cache/'
+RUN uv pip sync requirements_for_test.txt
 
 USER root
 

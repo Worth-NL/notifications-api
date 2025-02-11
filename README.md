@@ -75,6 +75,14 @@ To use redis caching you need to switch it on with an environment variable:
 export REDIS_ENABLED=1
 ```
 
+### uv
+
+We use [uv](https://github.com/astral-sh/uv) for Python dependency management. Follow the [install instructions](https://github.com/astral-sh/uv?tab=readme-ov-file#installation) or run:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
 ### Pre-commit
 
 We use [pre-commit](https://pre-commit.com/) to ensure that committed code meets basic standards for formatting, and will make basic fixes for you to save time and aggravation.
@@ -130,12 +138,14 @@ Locally
 flask command purge_functional_test_data -u <functional tests user name prefix>
 ```
 
-On the server
+To execute in ecs, you [can use the ecs-exec.sh script](https://github.com/alphagov/notifications-aws/blob/a1e8075926dc8d2f6c0b2e8f48479fc309742b35/scripts/ecs-exec/ecs-exec.sh)
 ```
-cf run-task notify-api "flask command purge_functional_test_data -u <functional tests user name prefix>"
+./scripts/ecs-exec/ecs-exec.sh
+<select notify-api>
+flask command purge_functional_test_data -u <functional tests user name prefix>
 ```
 
-All commands and command options have a --help command if you need more information.
+All flask commands and command options have a --help command if you need more information.
 
 ## Further documentation
 

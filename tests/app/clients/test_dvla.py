@@ -15,8 +15,8 @@ import pytz
 import requests
 import trustme
 from flask import current_app
-from moto import mock_ssm
-from notifications_utils.postal_address import PostalAddress
+from moto import mock_aws
+from notifications_utils.recipient_validation.postal_address import PostalAddress
 from redis.exceptions import LockError
 
 from app.clients.letter.dvla import (
@@ -33,7 +33,7 @@ from app.clients.letter.dvla import (
 
 @pytest.fixture
 def ssm():
-    with mock_ssm():
+    with mock_aws():
         ssm_client = boto3.client("ssm", "eu-west-1")
         ssm_client.put_parameter(
             Name="/notify/api/dvla_username",
@@ -55,8 +55,7 @@ def ssm():
 
 @pytest.fixture
 def dvla_client(notify_api, client, ssm):
-    dvla_client = DVLAClient()
-    dvla_client.init_app(notify_api, statsd_client=Mock())
+    dvla_client = DVLAClient(notify_api, statsd_client=Mock())
     yield dvla_client
 
 
@@ -119,9 +118,18 @@ def test_set_ssm_creds(dvla_client, ssm):
     dvla_client.dvla_password.set("some new password")
     dvla_client.dvla_api_key.set("some new api key")
 
-    assert ssm.get_parameter(Name="/notify/api/dvla_username")["Parameter"]["Value"] == "some new username"
-    assert ssm.get_parameter(Name="/notify/api/dvla_password")["Parameter"]["Value"] == "some new password"
-    assert ssm.get_parameter(Name="/notify/api/dvla_api_key")["Parameter"]["Value"] == "some new api key"
+    assert (
+        ssm.get_parameter(Name="/notify/api/dvla_username", WithDecryption=True)["Parameter"]["Value"]
+        == "some new username"
+    )
+    assert (
+        ssm.get_parameter(Name="/notify/api/dvla_password", WithDecryption=True)["Parameter"]["Value"]
+        == "some new password"
+    )
+    assert (
+        ssm.get_parameter(Name="/notify/api/dvla_api_key", WithDecryption=True)["Parameter"]["Value"]
+        == "some new api key"
+    )
 
 
 def test_jwt_token_returns_jwt_if_set_and_not_expired_yet(dvla_client, rmock):
@@ -222,9 +230,9 @@ def test_generate_password_creates_passwords_that_meet_dvla_criteria(_execution_
     for character_set in (string.ascii_uppercase, string.ascii_lowercase, string.digits, string.punctuation):
         # assert the intersection of the character class, and the chars in the password is not empty to make sure
         # that all character classes are represented
-        assert any(
-            character in character_set for character in password
-        ), f"{password} missing character from {character_set}"
+        assert any(character in character_set for character in password), (
+            f"{password} missing character from {character_set}"
+        )
     assert len(password) > 8
 
 
@@ -414,6 +422,7 @@ def test_format_create_print_job_json_builds_json_body_to_create_print_job(dvla_
         service_id="my_service_id",
         organisation_id="my_organisation_id",
         pdf_file=b"pdf_content",
+        callback_url="/my-callback",
     )
 
     assert formatted_json == {
@@ -425,11 +434,30 @@ def test_format_create_print_job_json_builds_json_body_to_create_print_job(dvla_
             "recipientName": "A. User",
             "address": {"unstructuredAddress": {"line1": "The road", "line2": "City", "postcode": "SW1 1AA"}},
         },
+        "callbackParams": {"retryParams": {"enabled": True, "maxRetryWindow": 10800}, "target": "/my-callback"},
         "customParams": [
             {"key": "pdfContent", "value": "cGRmX2NvbnRlbnQ="},
             {"key": "organisationIdentifier", "value": "my_organisation_id"},
             {"key": "serviceIdentifier", "value": "my_service_id"},
         ],
+    }
+
+
+def test_format_create_print_job_json_adds_callback_key_if_url_provided(dvla_client):
+    formatted_json = dvla_client._format_create_print_job_json(
+        notification_id="my_notification_id",
+        reference="ABCDEFGHIJKL",
+        address=PostalAddress("A. User\nThe road\nCity\nSW1 1AA"),
+        postage="second",
+        service_id="my_service_id",
+        organisation_id="my_organisation_id",
+        pdf_file=b"pdf_content",
+        callback_url="https://www.example.com?token=1234",
+    )
+
+    assert formatted_json["callbackParams"] == {
+        "target": "https://www.example.com?token=1234",
+        "retryParams": {"enabled": True, "maxRetryWindow": 10800},
     }
 
 
@@ -442,6 +470,7 @@ def test_format_create_print_job_json_adds_despatchMethod_key_for_first_class_po
         service_id="my_service_id",
         organisation_id="my_organisation_id",
         pdf_file=b"pdf_content",
+        callback_url="/my-callback",
     )
 
     assert formatted_json["standardParams"]["despatchMethod"] == "FIRST"
@@ -482,6 +511,7 @@ def test_format_create_print_job_json_formats_address_lines(dvla_client, address
         service_id="my_service_id",
         organisation_id="my_organisation_id",
         pdf_file=b"pdf_content",
+        callback_url="/my-callback",
     )
 
     assert formatted_json["standardParams"]["recipientName"] == recipient
@@ -500,6 +530,7 @@ def test_format_create_print_job_json_formats_international_address_lines(dvla_c
         service_id="my_service_id",
         organisation_id="my_organisation_id",
         pdf_file=b"pdf_content",
+        callback_url="/my-callback",
     )
 
     assert formatted_json["standardParams"]["recipientName"] == "The user"
@@ -521,6 +552,7 @@ def test_send_domestic_letter(dvla_client, dvla_authenticate, rmock):
         service_id="service_id",
         organisation_id="org_id",
         pdf_file=b"pdf",
+        callback_url="https://www.example.com?token=1234",
     )
 
     assert response == {"id": "noti_id"}
@@ -539,6 +571,10 @@ def test_send_domestic_letter(dvla_client, dvla_authenticate, rmock):
             {"key": "organisationIdentifier", "value": "org_id"},
             {"key": "serviceIdentifier", "value": "service_id"},
         ],
+        "callbackParams": {
+            "target": "https://www.example.com?token=1234",
+            "retryParams": {"enabled": True, "maxRetryWindow": 10800},
+        },
     }
 
     request_headers = print_mock.last_request.headers
@@ -567,6 +603,7 @@ def test_send_international_letter(dvla_client, dvla_authenticate, postage, desp
         service_id="service_id",
         organisation_id="org_id",
         pdf_file=b"pdf",
+        callback_url="/my-callback",
     )
 
     assert response == {"id": "noti_id"}
@@ -581,6 +618,7 @@ def test_send_international_letter(dvla_client, dvla_authenticate, postage, desp
             "address": {"internationalAddress": {"line1": "line1", "line2": "line2", "country": "country"}},
             "despatchMethod": despatch_method,
         },
+        "callbackParams": {"retryParams": {"enabled": True, "maxRetryWindow": 10800}, "target": "/my-callback"},
         "customParams": [
             {"key": "pdfContent", "value": "cGRm"},
             {"key": "organisationIdentifier", "value": "org_id"},
@@ -604,6 +642,7 @@ def test_send_bfpo_letter(dvla_client, dvla_authenticate, rmock):
         service_id="service_id",
         organisation_id="org_id",
         pdf_file=b"pdf",
+        callback_url="/my-callback",
     )
 
     assert response == {"id": "noti_id"}
@@ -617,6 +656,7 @@ def test_send_bfpo_letter(dvla_client, dvla_authenticate, rmock):
             "recipientName": "recipient",
             "address": {"bfpoAddress": {"line1": "recipient", "postcode": "BF1 1AA", "bfpoNumber": 1234}},
         },
+        "callbackParams": {"retryParams": {"enabled": True, "maxRetryWindow": 10800}, "target": "/my-callback"},
         "customParams": [
             {"key": "pdfContent", "value": "cGRm"},
             {"key": "organisationIdentifier", "value": "org_id"},
@@ -656,6 +696,7 @@ def test_send_letter_when_bad_request_error_is_raised(dvla_authenticate, dvla_cl
             service_id="s_id",
             organisation_id="org_id",
             pdf_file=b"pdf",
+            callback_url="/my-callback",
         )
 
     assert "Job type field must not be empty." in str(exc.value)
@@ -687,6 +728,7 @@ def test_send_letter_when_auth_error_is_raised(dvla_authenticate, dvla_client, r
             service_id="s_id",
             organisation_id="org_id",
             pdf_file=b"pdf",
+            callback_url="/my-callback",
         )
 
     # make sure we clear down the api key
@@ -705,8 +747,7 @@ def test_send_letter_when_conflict_error_is_raised(dvla_authenticate, dvla_clien
                     "code": "11",
                     "title": "Print job cannot be created",
                     "detail": (
-                        "The supplied identifier 1 conflicts with another print job. "
-                        "Please supply a unique identifier."
+                        "The supplied identifier 1 conflicts with another print job. Please supply a unique identifier."
                     ),
                 }
             ]
@@ -723,6 +764,7 @@ def test_send_letter_when_conflict_error_is_raised(dvla_authenticate, dvla_clien
             service_id="s_id",
             organisation_id="org_id",
             pdf_file=b"pdf",
+            callback_url="/my-callback",
         )
 
     assert "The supplied identifier 1 conflicts with another print job" in str(exc.value)
@@ -752,6 +794,7 @@ def test_send_letter_when_throttling_error_is_raised(dvla_authenticate, dvla_cli
             service_id="s_id",
             organisation_id="org_id",
             pdf_file=b"pdf",
+            callback_url="/my-callback",
         )
 
 
@@ -768,6 +811,7 @@ def test_send_letter_when_5xx_status_code_is_returned(dvla_authenticate, dvla_cl
             service_id="s_id",
             organisation_id="org_id",
             pdf_file=b"pdf",
+            callback_url="/my-callback",
         )
     assert str(exc.value) == f"Received 500 from {url}"
 
@@ -787,6 +831,7 @@ def test_send_letter_when_connection_error_is_returned(dvla_authenticate, dvla_c
             service_id="s_id",
             organisation_id="org_id",
             pdf_file=b"pdf",
+            callback_url="/my-callback",
         )
 
 
@@ -805,6 +850,7 @@ def test_send_letter_when_unknown_exception_is_raised(dvla_authenticate, dvla_cl
             service_id="s_id",
             organisation_id="org_id",
             pdf_file=b"pdf",
+            callback_url="/my-callback",
         )
 
 
@@ -896,8 +942,7 @@ class TestDVLAApiClientRestrictedCiphers:
             method="GET",
         ).respond_with_data("OK")
 
-        dvla_client = DVLAClient()
-        dvla_client.init_app(
+        dvla_client = DVLAClient(
             fake_app,
             statsd_client=mocker.Mock(),
         )
@@ -911,11 +956,9 @@ class TestDVLAApiClientRestrictedCiphers:
         assert response.text == "OK"
 
     def test_invalid_ciphers(self, mocker, server_base_url, fake_app):
-        dvla_client = DVLAClient()
-
         with pytest.raises(ssl.SSLError) as e:
             fake_app.config["DVLA_API_TLS_CIPHERS"] = "not-a-valid-cipher"
-            dvla_client.init_app(fake_app, statsd_client=mocker.Mock())
+            DVLAClient(fake_app, statsd_client=mocker.Mock())
 
         assert "No cipher can be selected." in e.value.args
 
@@ -931,8 +974,7 @@ class TestDVLAApiClientRestrictedCiphers:
         fake_app,
     ):
         fake_app.config["DVLA_API_TLS_CIPHERS"] = ":".join(cipherlist.allowlist)
-        dvla_client = DVLAClient()
-        dvla_client.init_app(
+        dvla_client = DVLAClient(
             fake_app,
             statsd_client=mocker.Mock(),
         )
@@ -962,8 +1004,7 @@ class TestDVLAApiClientRestrictedCiphers:
         fake_app,
     ):
         fake_app.config["DVLA_API_TLS_CIPHERS"] = ":".join(cipherlist.blocklist)
-        dvla_client = DVLAClient()
-        dvla_client.init_app(
+        dvla_client = DVLAClient(
             fake_app,
             statsd_client=mocker.Mock(),
         )

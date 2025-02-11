@@ -1,8 +1,8 @@
+import uuid
 from datetime import date, datetime, timedelta
 from unittest.mock import ANY, call
 
 import pytest
-import pytz
 from flask import current_app
 from freezegun import freeze_time
 from notifications_utils.clients.zendesk.zendesk_client import (
@@ -13,14 +13,17 @@ from notifications_utils.clients.zendesk.zendesk_client import (
 from app.celery import nightly_tasks
 from app.celery.nightly_tasks import (
     _delete_notifications_older_than_retention_by_type,
+    archive_batched_unsubscribe_requests,
+    archive_old_unsubscribe_requests,
+    archive_unsubscribe_requests,
     delete_email_notifications_older_than_retention,
     delete_inbound_sms,
     delete_letter_notifications_older_than_retention,
+    delete_notifications_for_service_and_type,
     delete_sms_notifications_older_than_retention,
     delete_unneeded_notification_history_by_hour,
     delete_unneeded_notification_history_for_specific_hour,
     get_letter_notifications_still_sending_when_they_shouldnt_be,
-    letter_raise_alert_if_no_ack_file_for_zip,
     raise_alert_if_letter_notifications_still_sending,
     remove_letter_csv_files,
     remove_sms_email_csv_files,
@@ -29,33 +32,17 @@ from app.celery.nightly_tasks import (
     timeout_notifications,
 )
 from app.constants import EMAIL_TYPE, LETTER_TYPE, SMS_TYPE
-from app.models import FactProcessingTime
+from app.models import FactProcessingTime, UnsubscribeRequest, UnsubscribeRequestHistory, UnsubscribeRequestReport
+from app.utils import midnight_n_days_ago
 from tests.app.db import (
     create_job,
     create_notification,
     create_service,
     create_service_data_retention,
     create_template,
+    create_unsubscribe_request,
+    create_unsubscribe_request_report,
 )
-
-
-def mock_s3_get_list_match(bucket_name, subfolder="", suffix="", last_modified=None):
-    if subfolder == "2018-01-11/zips_sent":
-        return ["NOTIFY.2018-01-11175007.ZIP.TXT", "NOTIFY.2018-01-11175008.ZIP.TXT"]
-    if subfolder == "root/dispatch":
-        return ["root/dispatch/NOTIFY.2018-01-11175007.ACK.txt", "root/dispatch/NOTIFY.2018-01-11175008.ACK.txt"]
-
-
-def mock_s3_get_list_diff(bucket_name, subfolder="", suffix="", last_modified=None):
-    if subfolder == "2018-01-11/zips_sent":
-        return [
-            "NOTIFY.2018-01-11175007p.ZIP.TXT",
-            "NOTIFY.2018-01-11175008.ZIP.TXT",
-            "NOTIFY.2018-01-11175009.ZIP.TXT",
-            "NOTIFY.2018-01-11175010.ZIP.TXT",
-        ]
-    if subfolder == "root/dispatch":
-        return ["root/dispatch/NOTIFY.2018-01-11175007p.ACK.TXT", "root/dispatch/NOTIFY.2018-01-11175008.ACK.TXT"]
 
 
 @freeze_time("2016-10-18T10:00:00")
@@ -150,6 +137,128 @@ def test_remove_csv_files_filters_by_type(mocker, sample_service):
     ]
 
 
+def test_archive_unsubscribe_requests(notify_db_session, mock_celery_task):
+    mock_archive_processed = mock_celery_task(archive_batched_unsubscribe_requests)
+    mock_archive_old = mock_celery_task(archive_old_unsubscribe_requests)
+
+    services_with_requests = [create_service(service_name=f"Unsubscribe service {i}") for i in range(3)]
+    [create_service(service_name=f"Normal service {i}") for i in range(3)]
+
+    for service in services_with_requests:
+        create_unsubscribe_request(service)
+
+    archive_unsubscribe_requests()
+
+    assert (
+        {call[1]["args"][0] for call in mock_archive_processed.call_args_list}
+        == {call[1]["args"][0] for call in mock_archive_old.call_args_list}
+        == {service.id for service in services_with_requests}
+    )
+
+    assert (
+        [call[1]["queue"] for call in mock_archive_processed.call_args_list]
+        == [call[1]["queue"] for call in mock_archive_old.call_args_list]
+        == [
+            "reporting-tasks",
+            "reporting-tasks",
+            "reporting-tasks",
+        ]
+    )
+
+
+def test_archive_batched_unsubscribe_requests(sample_service, mocker):
+    mock_redis = mocker.patch("app.dao.unsubscribe_request_dao.redis_store.delete")
+
+    unsubscribe_request_report_1 = create_unsubscribe_request_report(
+        sample_service,
+        earliest_timestamp=midnight_n_days_ago(12),
+        latest_timestamp=midnight_n_days_ago(10),
+        created_at=midnight_n_days_ago(9),
+    )
+    unsubscribe_request_report_2 = create_unsubscribe_request_report(
+        sample_service,
+        earliest_timestamp=midnight_n_days_ago(9),
+        latest_timestamp=midnight_n_days_ago(8),
+        created_at=midnight_n_days_ago(8),
+    )
+    unsubscribe_request_report_3 = create_unsubscribe_request_report(
+        sample_service,
+        earliest_timestamp=midnight_n_days_ago(7),
+        latest_timestamp=midnight_n_days_ago(4),
+        created_at=midnight_n_days_ago(3),
+    )
+
+    another_service = create_service(service_name="Another service")
+
+    for service, created_days_ago, report_id in (
+        (sample_service, 12, unsubscribe_request_report_1.id),
+        (sample_service, 10, unsubscribe_request_report_1.id),
+        (another_service, 9, unsubscribe_request_report_2.id),
+        (another_service, 8, unsubscribe_request_report_2.id),
+        (another_service, 7, unsubscribe_request_report_3.id),
+        (another_service, 4, unsubscribe_request_report_3.id),
+        (another_service, 4, None),
+    ):
+        create_unsubscribe_request(
+            service, created_at=midnight_n_days_ago(created_days_ago), unsubscribe_request_report_id=report_id
+        )
+
+    archive_batched_unsubscribe_requests(sample_service.id)
+    created_unsubscribe_request_history_objects = UnsubscribeRequestHistory.query.all()
+    remaining_unsubscribe_requests = UnsubscribeRequest.query.all()
+    UnsubscribeRequestReport.query.all()
+    assert len(created_unsubscribe_request_history_objects) == 2
+    assert len(remaining_unsubscribe_requests) == 5
+    assert mock_redis.call_args_list == [
+        call(f"service-{sample_service.id}-unsubscribe-request-statistics"),
+        call(f"service-{sample_service.id}-unsubscribe-request-reports-summary"),
+    ]
+
+
+def test_archive_old_unsubscribe_requests(mocker, sample_service):
+    mock_redis = mocker.patch("app.dao.unsubscribe_request_dao.redis_store.delete")
+
+    unsubscribe_request_report = create_unsubscribe_request_report(
+        sample_service,
+        earliest_timestamp=midnight_n_days_ago(12),
+        latest_timestamp=midnight_n_days_ago(10),
+        processed_by_service_at=midnight_n_days_ago(9),
+    )
+
+    another_service = create_service(service_name="Another service")
+    service_with_no_old_requests = create_service(service_name="No old requests")
+
+    for service, created_days_ago, report_id in (
+        # Should not be deleted by this task
+        (service_with_no_old_requests, 1, None),
+        (sample_service, 90, unsubscribe_request_report.id),
+        (sample_service, 90, None),
+        (another_service, 90, None),
+        (sample_service, 91, unsubscribe_request_report.id),
+        # Should be deleted by this task
+        (sample_service, 91, None),
+        (another_service, 91, None),
+    ):
+        create_unsubscribe_request(
+            service, created_at=midnight_n_days_ago(created_days_ago), unsubscribe_request_report_id=report_id
+        )
+
+    for service in (sample_service, another_service, service_with_no_old_requests):
+        archive_old_unsubscribe_requests(service.id)
+
+    created_unsubscribe_request_history_objects = UnsubscribeRequestHistory.query.all()
+    remaining_unsubscribe_requests = UnsubscribeRequest.query.all()
+    UnsubscribeRequestReport.query.all()
+    assert len(created_unsubscribe_request_history_objects) == 2
+    assert len(remaining_unsubscribe_requests) == 5
+    assert mock_redis.call_args_list == [
+        call(f"service-{sample_service.id}-unsubscribe-request-statistics"),
+        call(f"service-{sample_service.id}-unsubscribe-request-reports-summary"),
+        call(f"service-{another_service.id}-unsubscribe-request-statistics"),
+        call(f"service-{another_service.id}-unsubscribe-request-reports-summary"),
+    ]
+
+
 def test_delete_sms_notifications_older_than_retention_calls_child_task(notify_api, mocker):
     mocked = mocker.patch("app.celery.nightly_tasks._delete_notifications_older_than_retention_by_type")
     delete_sms_notifications_older_than_retention()
@@ -222,9 +331,9 @@ def test_create_ticket_if_letter_notifications_still_sending(notify_api, mocker)
             "There are 1 letters in the 'sending' state from Monday 15 January. Resolve using "
             "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-letters-still-in-sending"
         ),
-        ticket_type="incident",
+        ticket_type="task",
         notify_ticket_type=NotifyTicketType.TECHNICAL,
-        ticket_categories=["notify_letters"],
+        notify_task_type="notify_task_letters_sending",
     )
     mock_send_ticket_to_zendesk.assert_called_once()
 
@@ -244,19 +353,20 @@ def test_dont_create_ticket_if_letter_notifications_not_still_sending(notify_api
     mock_send_ticket_to_zendesk.assert_not_called()
 
 
-@freeze_time("Thursday 17th January 2018 17:00")
+@freeze_time("Thursday 17th January 2018 19:00")
 def test_get_letter_notifications_still_sending_when_they_shouldnt_finds_no_letters_if_sent_a_day_ago(
     sample_letter_template,
 ):
-    today = datetime.utcnow()
-    one_day_ago = today - timedelta(days=1)
-    create_notification(template=sample_letter_template, status="sending", sent_at=one_day_ago)
+    yesterday_lunch = datetime(2018, 1, 16, 12, 0)
+    today_lunch = datetime(2018, 1, 17, 12, 0)
+    create_notification(template=sample_letter_template, status="sending", sent_at=yesterday_lunch)
+    create_notification(template=sample_letter_template, status="sending", sent_at=today_lunch)
 
     count, expected_sent_date = get_letter_notifications_still_sending_when_they_shouldnt_be()
     assert count == 0
 
 
-@freeze_time("Thursday 17th January 2018 17:00")
+@freeze_time("Thursday 17th January 2018 19:00")
 def test_get_letter_notifications_still_sending_when_they_shouldnt_only_finds_letters_still_in_sending_status(
     sample_letter_template,
 ):
@@ -270,7 +380,7 @@ def test_get_letter_notifications_still_sending_when_they_shouldnt_only_finds_le
     assert expected_sent_date == date(2018, 1, 15)
 
 
-@freeze_time("Thursday 17th January 2018 17:00")
+@freeze_time("Thursday 17th January 2018 19:00")
 def test_get_letter_notifications_still_sending_when_they_shouldnt_finds_letters_older_than_offset(
     sample_letter_template,
 ):
@@ -282,7 +392,7 @@ def test_get_letter_notifications_still_sending_when_they_shouldnt_finds_letters
     assert expected_sent_date == date(2018, 1, 15)
 
 
-@freeze_time("Sunday 14th January 2018 17:00")
+@freeze_time("Sunday 14th January 2018 19:00")
 def test_get_letter_notifications_still_sending_when_they_shouldnt_be_finds_no_letters_on_weekend(
     sample_letter_template,
 ):
@@ -293,7 +403,7 @@ def test_get_letter_notifications_still_sending_when_they_shouldnt_be_finds_no_l
     assert count == 0
 
 
-@freeze_time("Monday 15th January 2018 17:00")
+@freeze_time("Monday 15th January 2018 19:00")
 def test_get_letter_notifications_still_sending_when_they_shouldnt_finds_thursday_letters_when_run_on_monday(
     sample_letter_template,
 ):
@@ -308,7 +418,7 @@ def test_get_letter_notifications_still_sending_when_they_shouldnt_finds_thursda
     assert expected_sent_date == date(2018, 1, 11)
 
 
-@freeze_time("Tuesday 16th January 2018 17:00")
+@freeze_time("Tuesday 16th January 2018 19:00")
 def test_get_letter_notifications_still_sending_when_they_shouldnt_finds_friday_letters_when_run_on_tuesday(
     sample_letter_template,
 ):
@@ -323,7 +433,7 @@ def test_get_letter_notifications_still_sending_when_they_shouldnt_finds_friday_
     assert expected_sent_date == date(2018, 1, 12)
 
 
-@freeze_time("Thursday 29th December 2022 17:00")
+@freeze_time("Thursday 29th December 2022 19:00")
 def test_get_letter_notifications_still_sending_when_they_shouldnt_treats_bank_holidays_as_non_working_and_looks_beyond(
     sample_letter_template, rmock
 ):
@@ -339,59 +449,6 @@ def test_get_letter_notifications_still_sending_when_they_shouldnt_treats_bank_h
     count, expected_sent_date = get_letter_notifications_still_sending_when_they_shouldnt_be()
     assert count == 2
     assert expected_sent_date == date(2022, 12, 23)
-
-
-@freeze_time("2018-01-11T23:00:00")
-def test_letter_raise_alert_if_no_ack_file_for_zip_does_not_raise_when_files_match_zip_list(mocker, notify_db_session):
-    mock_file_list = mocker.patch("app.aws.s3.get_list_of_files_by_suffix", side_effect=mock_s3_get_list_match)
-    letter_raise_alert_if_no_ack_file_for_zip()
-
-    yesterday = datetime.now(tz=pytz.utc) - timedelta(days=1)  # Datatime format on AWS
-    subfoldername = datetime.utcnow().strftime("%Y-%m-%d") + "/zips_sent"
-    assert mock_file_list.call_count == 2
-    assert mock_file_list.call_args_list == [
-        call(bucket_name=current_app.config["S3_BUCKET_LETTERS_PDF"], subfolder=subfoldername, suffix=".TXT"),
-        call(
-            bucket_name=current_app.config["S3_BUCKET_DVLA_RESPONSE"],
-            subfolder="root/dispatch",
-            suffix=".ACK.txt",
-            last_modified=yesterday,
-        ),
-    ]
-
-
-@freeze_time("2018-01-11T23:00:00")
-def test_letter_raise_alert_if_ack_files_not_match_zip_list(mocker, notify_db_session):
-    mock_file_list = mocker.patch("app.aws.s3.get_list_of_files_by_suffix", side_effect=mock_s3_get_list_diff)
-    mock_create_ticket = mocker.spy(NotifySupportTicket, "__init__")
-    mock_send_ticket_to_zendesk = mocker.patch(
-        "app.celery.nightly_tasks.zendesk_client.send_ticket_to_zendesk",
-        autospec=True,
-    )
-
-    letter_raise_alert_if_no_ack_file_for_zip()
-
-    assert mock_file_list.call_count == 2
-
-    mock_create_ticket.assert_called_once_with(
-        ANY,
-        subject="Letter acknowledge error",
-        message=ANY,
-        ticket_type="incident",
-        notify_ticket_type=NotifyTicketType.TECHNICAL,
-        ticket_categories=["notify_letters"],
-    )
-    mock_send_ticket_to_zendesk.assert_called_once()
-    assert "['NOTIFY.2018-01-11175009', 'NOTIFY.2018-01-11175010']" in mock_create_ticket.call_args[1]["message"]
-    assert "2018-01-11/zips_sent" in mock_create_ticket.call_args[1]["message"]
-
-
-@freeze_time("2018-01-11T23:00:00")
-def test_letter_not_raise_alert_if_no_files_do_not_cause_error(mocker, notify_db_session):
-    mock_file_list = mocker.patch("app.aws.s3.get_list_of_files_by_suffix", side_effect=None)
-    letter_raise_alert_if_no_ack_file_for_zip()
-
-    assert mock_file_list.call_count == 2
 
 
 @freeze_time("2021-01-18T02:00")
@@ -469,7 +526,9 @@ def test_save_daily_notification_processing_time_when_in_bst(mocker, sample_temp
 
 
 @freeze_time("2021-06-05 03:00")
-def test_delete_notifications_task_calls_task_for_services_with_data_retention_of_same_type(notify_db_session, mocker):
+def test_delete_notifications_task_calls_task_for_services_with_data_retention_of_same_type(
+    notify_db_session, mock_celery_task
+):
     sms_service = create_service(service_name="a")
     email_service = create_service(service_name="b")
     letter_service = create_service(service_name="c")
@@ -478,11 +537,11 @@ def test_delete_notifications_task_calls_task_for_services_with_data_retention_o
     create_service_data_retention(email_service, notification_type="email")
     create_service_data_retention(letter_service, notification_type="letter")
 
-    mock_subtask = mocker.patch("app.celery.nightly_tasks.delete_notifications_for_service_and_type")
+    mock_subtask = mock_celery_task(delete_notifications_for_service_and_type)
 
     _delete_notifications_older_than_retention_by_type("sms")
 
-    mock_subtask.apply_async.assert_called_once_with(
+    mock_subtask.assert_called_once_with(
         queue="reporting-tasks",
         kwargs={
             "service_id": sms_service.id,
@@ -490,24 +549,25 @@ def test_delete_notifications_task_calls_task_for_services_with_data_retention_o
             # three days of retention, its morn of 5th, so we want to keep all messages from 4th, 3rd and 2nd.
             "datetime_to_delete_before": datetime(2021, 6, 1, 23, 0),
         },
+        countdown=0.0,
     )
 
 
 @freeze_time("2021-04-05 03:00")
 def test_delete_notifications_task_calls_task_for_services_with_data_retention_by_looking_at_retention(
-    notify_db_session, mocker
+    notify_db_session, mock_celery_task
 ):
     service_14_days = create_service(service_name="a")
     service_3_days = create_service(service_name="b")
     create_service_data_retention(service_14_days, days_of_retention=14)
     create_service_data_retention(service_3_days, days_of_retention=3)
 
-    mock_subtask = mocker.patch("app.celery.nightly_tasks.delete_notifications_for_service_and_type")
+    mock_subtask = mock_celery_task(delete_notifications_for_service_and_type)
 
     _delete_notifications_older_than_retention_by_type("sms")
 
-    assert mock_subtask.apply_async.call_count == 2
-    mock_subtask.apply_async.assert_has_calls(
+    assert mock_subtask.call_count == 2
+    mock_subtask.assert_has_calls(
         any_order=True,
         calls=[
             call(
@@ -517,6 +577,7 @@ def test_delete_notifications_task_calls_task_for_services_with_data_retention_b
                     "notification_type": "sms",
                     "datetime_to_delete_before": datetime(2021, 3, 22, 0, 0),
                 },
+                countdown=ANY,
             ),
             call(
                 queue=ANY,
@@ -525,14 +586,20 @@ def test_delete_notifications_task_calls_task_for_services_with_data_retention_b
                     "notification_type": "sms",
                     "datetime_to_delete_before": datetime(2021, 4, 1, 23, 0),
                 },
+                countdown=ANY,
             ),
         ],
     )
+    # iterated order in tested code is not necessarily deterministic
+    assert sorted(kwargs["countdown"] for method, args, kwargs in mock_subtask.mock_calls) == [
+        0.0,
+        timedelta(minutes=5).seconds / 2,
+    ]
 
 
 @freeze_time("2021-04-03 03:00")
 def test_delete_notifications_task_calls_task_for_services_that_have_sent_notifications_recently(
-    notify_db_session, mocker
+    notify_db_session, mock_celery_task
 ):
     service_will_delete_1 = create_service(service_name="a")
     service_will_delete_2 = create_service(service_name="b")
@@ -552,12 +619,12 @@ def test_delete_notifications_task_calls_task_for_services_that_have_sent_notifi
     # this is an old notification, but for email not sms, so we won't run delete_notifications_for_service_and_type
     create_notification(nothing_to_delete_email_template, created_at=datetime.now() - timedelta(days=8))
 
-    mock_subtask = mocker.patch("app.celery.nightly_tasks.delete_notifications_for_service_and_type")
+    mock_subtask = mock_celery_task(delete_notifications_for_service_and_type)
 
     _delete_notifications_older_than_retention_by_type("sms")
 
-    assert mock_subtask.apply_async.call_count == 2
-    mock_subtask.apply_async.assert_has_calls(
+    assert mock_subtask.call_count == 2
+    mock_subtask.assert_has_calls(
         any_order=True,
         calls=[
             call(
@@ -567,6 +634,7 @@ def test_delete_notifications_task_calls_task_for_services_that_have_sent_notifi
                     "notification_type": "sms",
                     "datetime_to_delete_before": datetime(2021, 3, 27, 0, 0),
                 },
+                countdown=ANY,
             ),
             call(
                 queue=ANY,
@@ -575,9 +643,15 @@ def test_delete_notifications_task_calls_task_for_services_that_have_sent_notifi
                     "notification_type": "sms",
                     "datetime_to_delete_before": datetime(2021, 3, 27, 0, 0),
                 },
+                countdown=ANY,
             ),
         ],
     )
+    # iterated order in tested code is not necessarily deterministic
+    assert sorted(kwargs["countdown"] for method, args, kwargs in mock_subtask.mock_calls) == [
+        0.0,
+        timedelta(minutes=5).seconds / 2,
+    ]
 
 
 def test_delete_unneeded_notification_history_for_specific_hour(mocker):
@@ -590,20 +664,59 @@ def test_delete_unneeded_notification_history_for_specific_hour(mocker):
     delete_mock.assert_called_once_with(start, end)
 
 
-def test_delete_unneeded_notification_history_by_hour(mocker):
-    mock_subtask = mocker.patch("app.celery.nightly_tasks.delete_unneeded_notification_history_for_specific_hour")
+def test_delete_unneeded_notification_history_by_hour(mock_celery_task):
+    # we're passing in datetimes to the task call but expecting strings on the far side, so specifically turn off
+    # assert_types for this
+    mock_subtask = mock_celery_task(delete_unneeded_notification_history_for_specific_hour, assert_types=False)
 
     delete_unneeded_notification_history_by_hour()
 
-    assert mock_subtask.apply_async.call_args_list[0] == call(
+    assert mock_subtask.call_args_list[0] == call(
         [datetime(2020, 8, 1, 0, 0, 0), datetime(2020, 8, 1, 1, 0, 0)], queue=ANY
     )
-    assert mock_subtask.apply_async.call_args_list[1] == call(
+    assert mock_subtask.call_args_list[1] == call(
         [datetime(2020, 8, 1, 1, 0, 0), datetime(2020, 8, 1, 2, 0, 0)], queue=ANY
     )
-    assert mock_subtask.apply_async.call_args_list[-2] == call(
+    assert mock_subtask.call_args_list[-2] == call(
         [datetime(2022, 12, 31, 22, 0, 0), datetime(2022, 12, 31, 23, 0, 0)], queue=ANY
     )
-    assert mock_subtask.apply_async.call_args_list[-1] == call(
+    assert mock_subtask.call_args_list[-1] == call(
         [datetime(2022, 12, 31, 23, 0, 0), datetime(2023, 1, 1, 0, 0, 0)], queue=ANY
     )
+
+
+def test_delete_notifications_for_service_and_type_queues_up_second_task_if_things_deleted(mocker, mock_celery_task):
+    mock_move = mocker.patch("app.celery.nightly_tasks.move_notifications_to_notification_history", return_value=1)
+    mock_task_call = mock_celery_task(delete_notifications_for_service_and_type)
+    mock_delete_tests = mocker.patch("app.celery.nightly_tasks.delete_test_notifications")
+    service_id = uuid.uuid4()
+    notification_type = "some-str"
+    datetime_to_delete_before = datetime.utcnow()
+
+    delete_notifications_for_service_and_type(service_id, notification_type, datetime_to_delete_before)
+
+    mock_move.assert_called_once_with(notification_type, service_id, datetime_to_delete_before)
+    # the next task is queued up with the exact same args
+    mock_task_call.assert_called_once_with(
+        args=(service_id, notification_type, datetime_to_delete_before), queue="reporting-tasks"
+    )
+    assert not mock_delete_tests.called
+
+
+def test_delete_notifications_for_service_and_type_removes_test_notifications_if_no_normal_ones_deleted(
+    mocker, mock_celery_task
+):
+    mock_move = mocker.patch("app.celery.nightly_tasks.move_notifications_to_notification_history", return_value=0)
+    mock_task_call = mock_celery_task(delete_notifications_for_service_and_type)
+
+    mock_delete_tests = mocker.patch("app.celery.nightly_tasks.delete_test_notifications")
+    service_id = uuid.uuid4()
+    notification_type = "some-str"
+    datetime_to_delete_before = datetime.utcnow()
+
+    delete_notifications_for_service_and_type(service_id, notification_type, datetime_to_delete_before)
+
+    mock_move.assert_called_once_with(notification_type, service_id, datetime_to_delete_before)
+    # the next task is not queued up
+    assert not mock_task_call.called
+    mock_delete_tests.assert_called_once_with(notification_type, service_id, datetime_to_delete_before)

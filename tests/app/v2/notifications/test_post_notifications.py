@@ -1,8 +1,6 @@
 import uuid
-from unittest import mock
 from unittest.mock import call
 
-import botocore
 import pytest
 from flask import current_app, json
 
@@ -11,6 +9,7 @@ from app.constants import (
     INTERNATIONAL_SMS_TYPE,
     LETTER_TYPE,
     NOTIFICATION_CREATED,
+    SMS_TO_UK_LANDLINES,
     SMS_TYPE,
 )
 from app.dao import templates_dao
@@ -30,7 +29,6 @@ from tests.app.db import (
     create_service_with_inbound_number,
     create_template,
 )
-from tests.conftest import set_config_values
 
 
 @pytest.mark.parametrize("reference", [None, "reference_from_client"])
@@ -62,13 +60,11 @@ def test_post_sms_notification_returns_201(api_client_request, sample_template_w
     assert resp_json["reference"] == reference
     assert resp_json["content"]["body"] == sample_template_with_placeholders.content.replace("(( Name))", "Jo")
     assert resp_json["content"]["from_number"] == current_app.config["FROM_NUMBER"]
-    assert "v2/notifications/{}".format(notification_id) in resp_json["uri"]
+    assert f"v2/notifications/{notification_id}" in resp_json["uri"]
     assert resp_json["template"]["id"] == str(sample_template_with_placeholders.id)
     assert resp_json["template"]["version"] == sample_template_with_placeholders.version
     assert (
-        "services/{}/templates/{}".format(
-            sample_template_with_placeholders.service_id, sample_template_with_placeholders.id
-        )
+        f"services/{sample_template_with_placeholders.service_id}/templates/{sample_template_with_placeholders.id}"
         in resp_json["template"]["uri"]
     )
     assert not resp_json["scheduled_for"]
@@ -360,7 +356,7 @@ def test_post_notification_returns_401_and_well_formed_auth_error(
     data = {key_send_to: send_to, "template_id": str(sample_template.id)}
 
     response = client.post(
-        path="/v2/notifications/{}".format(notification_type),
+        path=f"/v2/notifications/{notification_type}",
         data=json.dumps(data),
         headers=[("Content-Type", "application/json")],
     )
@@ -505,13 +501,11 @@ def test_post_email_notification_returns_201(
         sample_email_template_with_placeholders.service.email_sender_local_part,
         current_app.config["NOTIFY_EMAIL_DOMAIN"],
     )
-    assert "v2/notifications/{}".format(notification.id) in resp_json["uri"]
+    assert f"v2/notifications/{notification.id}" in resp_json["uri"]
     assert resp_json["template"]["id"] == str(sample_email_template_with_placeholders.id)
     assert resp_json["template"]["version"] == sample_email_template_with_placeholders.version
     assert (
-        "services/{}/templates/{}".format(
-            str(sample_email_template_with_placeholders.service_id), str(sample_email_template_with_placeholders.id)
-        )
+        f"services/{str(sample_email_template_with_placeholders.service_id)}/templates/{str(sample_email_template_with_placeholders.id)}"
         in resp_json["template"]["uri"]
     )
     assert not resp_json["scheduled_for"]
@@ -620,9 +614,9 @@ def test_post_email_notification_returns_201(
             {"doc": {"file": "YSxiLGMKMSwyLDMK", "filename": "file.csv"}},
             201,
             None,
-            False,
-            None,
-            None,
+            True,
+            True,
+            "26 weeks",
             "file.csv",
         ),
         (
@@ -657,9 +651,9 @@ def test_post_email_notification_validates_personalisation_send_a_file_values(
     expected_filename,
 ):
     mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
-    document_download_mock = mocker.patch("app.v2.notifications.post_notifications.document_download_client")
-    document_download_mock.upload_document.side_effect = (
-        lambda service_id, content, is_csv, confirmation_email, **kwargs: f"{content}-link"
+    document_download_upload_document_mock = mocker.patch(
+        "app.document_download_client.upload_document",
+        side_effect=lambda service_id, content, is_csv, confirmation_email, **kwargs: f"{content}-link",
     )
 
     service = create_service(
@@ -691,8 +685,8 @@ def test_post_email_notification_validates_personalisation_send_a_file_values(
     if expect_error_message:
         assert expect_error_message in response["errors"][0]["message"]
 
-    if expect_upload:
-        assert document_download_mock.upload_document.call_args_list == [
+    assert document_download_upload_document_mock.call_args_list == (
+        [
             mocker.call(
                 str(template.service_id),
                 "YSxiLGMKMSwyLDMK",
@@ -702,6 +696,9 @@ def test_post_email_notification_validates_personalisation_send_a_file_values(
                 filename=expected_filename,
             )
         ]
+        if expect_upload
+        else []
+    )
 
 
 @pytest.mark.parametrize(
@@ -718,7 +715,7 @@ def test_post_email_notification_validates_personalisation_send_a_file_values(
 def test_should_not_persist_or_send_notification_if_simulated_recipient(
     api_client_request, recipient, notification_type, sample_email_template, sample_template, mocker
 ):
-    apply_async = mocker.patch("app.celery.provider_tasks.deliver_{}.apply_async".format(notification_type))
+    apply_async = mocker.patch(f"app.celery.provider_tasks.deliver_{notification_type}.apply_async")
 
     if notification_type == "sms":
         data = {"phone_number": recipient, "template_id": str(sample_template.id)}
@@ -772,19 +769,26 @@ def test_returns_a_429_limit_exceeded_if_rate_limit_exceeded(
     assert not deliver_mock.called
 
 
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        [SMS_TYPE],
+        [SMS_TYPE, SMS_TO_UK_LANDLINES],
+    ],
+)
 def test_post_sms_notification_returns_400_if_not_allowed_to_send_int_sms(
     api_client_request,
     notify_db_session,
+    permissions,
 ):
-    service = create_service(service_permissions=[SMS_TYPE])
+    service = create_service(service_permissions=permissions)
     template = create_template(service=service)
 
-    data = {"phone_number": "20-12-1234-1234", "template_id": template.id}
+    data = {"phone_number": "+14158961600", "template_id": template.id}
 
     error_json = api_client_request.post(
         service.id, "v2_notifications.post_notification", notification_type="sms", _data=data, _expected_status=400
     )
-
     assert error_json["status_code"] == 400
     assert error_json["errors"] == [
         {"error": "BadRequestError", "message": "Cannot send to international mobile numbers"}
@@ -805,9 +809,7 @@ def test_post_sms_notification_with_archived_reply_to_id_returns_400(api_client_
     )
 
     assert (
-        "sms_sender_id {} does not exist in database for service id {}".format(
-            archived_sender.id, sample_template.service_id
-        )
+        f"sms_sender_id {archived_sender.id} does not exist in database for service id {sample_template.service_id}"
         in resp_json["errors"][0]["message"]
     )
     assert "BadRequestError" in resp_json["errors"][0]["error"]
@@ -837,7 +839,7 @@ def test_post_sms_notification_returns_400_if_not_allowed_to_send_notification(
 
     assert error_json["status_code"] == 400
     assert error_json["errors"] == [
-        {"error": "BadRequestError", "message": "Service is not allowed to send {}".format(expected_error)}
+        {"error": "BadRequestError", "message": f"Service is not allowed to send {expected_error}"}
     ]
 
 
@@ -849,7 +851,7 @@ def test_post_sms_notification_returns_400_if_number_not_in_guest_list(
     template = create_template(service=service)
 
     data = {
-        "phone_number": "+327700900855",
+        "phone_number": "+3225484211",
         "template_id": template.id,
     }
 
@@ -868,22 +870,87 @@ def test_post_sms_notification_returns_400_if_number_not_in_guest_list(
     ]
 
 
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        [SMS_TYPE, INTERNATIONAL_SMS_TYPE],
+        [SMS_TYPE, SMS_TO_UK_LANDLINES, INTERNATIONAL_SMS_TYPE],
+    ],
+)
 def test_post_sms_notification_returns_201_if_allowed_to_send_int_sms(
-    sample_service,
-    sample_template,
+    notify_db_session,
     api_client_request,
     mocker,
+    permissions,
 ):
     mocker.patch("app.celery.provider_tasks.deliver_sms.apply_async")
 
-    data = {"phone_number": "20-12-1234-1234", "template_id": sample_template.id}
-
+    service = create_service(service_permissions=permissions)
+    template = create_template(service=service)
+    data = {"phone_number": "20-12-1234-1234", "template_id": template.id}
     api_client_request.post(
-        sample_service.id,
+        service.id,
         "v2_notifications.post_notification",
         notification_type="sms",
         _data=data,
     )
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        [SMS_TYPE, SMS_TO_UK_LANDLINES],
+        [SMS_TYPE, SMS_TO_UK_LANDLINES, INTERNATIONAL_SMS_TYPE],
+    ],
+)
+def test_post_sms_notification_returns_201_if_allowed_to_send_to_uk_landlines(
+    notify_db_session,
+    api_client_request,
+    mocker,
+    permissions,
+):
+    mocker.patch("app.celery.provider_tasks.deliver_sms.apply_async")
+
+    service = create_service(service_permissions=permissions)
+    template = create_template(service=service)
+    data = {"phone_number": "01709510122", "template_id": template.id}
+    resp_json = api_client_request.post(
+        service.id,
+        "v2_notifications.post_notification",
+        notification_type="sms",
+        _data=data,
+    )
+    notifications = Notification.query.all()
+    assert len(notifications) == 1
+    notification_id = notifications[0].id
+    assert "01709510122" == notifications[0].to
+    assert resp_json["id"] == str(notification_id)
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        [SMS_TYPE],
+        [SMS_TYPE, INTERNATIONAL_SMS_TYPE],
+    ],
+)
+def test_post_sms_notification_returns_400_if_not_allowed_to_send_to_uk_landlines(
+    notify_db_session,
+    api_client_request,
+    mocker,
+    permissions,
+):
+    mocker.patch("app.celery.provider_tasks.deliver_sms.apply_async")
+
+    service = create_service(service_permissions=permissions)
+    template = create_template(service=service)
+    data = {"phone_number": "01709510122", "template_id": template.id}
+    error_json = api_client_request.post(
+        service.id, "v2_notifications.post_notification", notification_type="sms", _data=data, _expected_status=400
+    )
+
+    assert error_json["status_code"] == 400
+    assert error_json["errors"] == [{"error": "InvalidPhoneError", "message": "Not a UK mobile number"}]
 
 
 def test_post_sms_should_persist_supplied_sms_number(api_client_request, sample_template_with_placeholders, mocker):
@@ -937,10 +1004,7 @@ def test_post_notification_with_wrong_type_of_sender(
         _expected_status=400,
     )
 
-    assert (
-        "Additional properties are not allowed ({} was unexpected)".format(form_label)
-        in resp_json["errors"][0]["message"]
-    )
+    assert f"Additional properties are not allowed ({form_label} was unexpected)" in resp_json["errors"][0]["message"]
     assert "ValidationError" in resp_json["errors"][0]["error"]
 
 
@@ -988,9 +1052,7 @@ def test_post_email_notification_with_invalid_reply_to_id_returns_400(
     )
 
     assert (
-        "email_reply_to_id {} does not exist in database for service id {}".format(
-            fake_uuid, sample_email_template.service_id
-        )
+        f"email_reply_to_id {fake_uuid} does not exist in database for service id {sample_email_template.service_id}"
         in resp_json["errors"][0]["message"]
     )
     assert "BadRequestError" in resp_json["errors"][0]["error"]
@@ -1018,12 +1080,34 @@ def test_post_email_notification_with_archived_reply_to_id_returns_400(
     )
 
     assert (
-        "email_reply_to_id {} does not exist in database for service id {}".format(
-            archived_reply_to.id, sample_email_template.service_id
-        )
-        in resp_json["errors"][0]["message"]
-    )
+        f"email_reply_to_id {archived_reply_to.id} does not exist in database for service "
+        f"id {sample_email_template.service_id}"
+    ) in resp_json["errors"][0]["message"]
     assert "BadRequestError" in resp_json["errors"][0]["error"]
+
+
+def test_post_email_notification_with_unsubscribe_link_returns_201(api_client_request, sample_email_template, mocker):
+    mocked = mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
+    unsubscribe_link = "https://www.someservice.com/unsubscribe?for=anne@example.com"
+    data = {
+        "email_address": sample_email_template.service.users[0].email_address,
+        "template_id": sample_email_template.id,
+        "one_click_unsubscribe_url": unsubscribe_link,
+    }
+
+    response_json = api_client_request.post(
+        sample_email_template.service_id,
+        "v2_notifications.post_notification",
+        notification_type="email",
+        _data=data,
+    )
+
+    assert validate(response_json, post_email_response) == response_json
+    notification = Notification.query.first()
+    assert response_json["id"] == str(notification.id)
+
+    assert notification.unsubscribe_link == unsubscribe_link == response_json["content"]["one_click_unsubscribe_url"]
+    assert mocked.called
 
 
 @pytest.mark.parametrize(
@@ -1050,8 +1134,10 @@ def test_post_notification_with_document_upload(
     )
 
     mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
-    document_download_mock = mocker.patch("app.v2.notifications.post_notifications.document_download_client")
-    document_download_mock.upload_document.side_effect = lambda service_id, content, is_csv, **kwargs: f"{content}-link"
+    document_download_upload_document_mock = mocker.patch(
+        "app.document_download_client.upload_document",
+        side_effect=lambda service_id, content, is_csv, **kwargs: f"{content}-link",
+    )
 
     data = {
         "email_address": service.users[0].email_address,
@@ -1070,7 +1156,7 @@ def test_post_notification_with_document_upload(
 
     confirmation_email = data["email_address"] if expect_email_confirmation else None
 
-    assert document_download_mock.upload_document.call_args_list == [
+    assert document_download_upload_document_mock.call_args_list == [
         call(
             str(service.id),
             "abababab",
@@ -1103,8 +1189,10 @@ def test_post_notification_with_document_upload_simulated(api_client_request, no
     template = create_template(service=service, template_type="email", content="Document: ((document))")
 
     mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
-    document_download_mock = mocker.patch("app.v2.notifications.post_notifications.document_download_client")
-    document_download_mock.get_upload_url_for_simulated_email.return_value = "https://document-url"
+    mocker.patch(
+        "app.document_download_client.get_upload_url_for_simulated_email",
+        return_value="https://document-url",
+    )
 
     data = {
         "email_address": "simulate-delivered@notifications.service.gov.uk",
@@ -1129,8 +1217,10 @@ def test_post_notification_without_document_upload_permission(api_client_request
     template = create_template(service=service, template_type="email", content="Document: ((document))")
 
     mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
-    document_download_mock = mocker.patch("app.v2.notifications.post_notifications.document_download_client")
-    document_download_mock.upload_document.return_value = "https://document-url/"
+    document_download_upload_document_mock = mocker.patch(
+        "app.document_download_client.upload_document",
+        return_value="https://document-url",
+    )
 
     data = {
         "email_address": service.users[0].email_address,
@@ -1141,6 +1231,7 @@ def test_post_notification_without_document_upload_permission(api_client_request
     api_client_request.post(
         service.id, "v2_notifications.post_notification", notification_type="email", _data=data, _expected_status=400
     )
+    assert document_download_upload_document_mock.call_args_list == []
 
 
 @pytest.mark.parametrize(
@@ -1204,7 +1295,7 @@ def test_post_notification_when_payload_is_invalid_json_returns_400(
         "template_id": "dont-convert-to-json",
     }
     response = client.post(
-        path="/v2/notifications/{}".format(notification_type),
+        path=f"/v2/notifications/{notification_type}",
         data=payload_not_json,
         headers=[("Content-Type", content_type), auth_header],
     )
@@ -1220,7 +1311,7 @@ def test_post_notification_returns_201_when_content_type_is_missing_but_payload_
     client, sample_service, notification_type, mocker
 ):
     template = create_template(service=sample_service, template_type=notification_type)
-    mocker.patch("app.celery.provider_tasks.deliver_{}.apply_async".format(notification_type))
+    mocker.patch(f"app.celery.provider_tasks.deliver_{notification_type}.apply_async")
     auth_header = create_service_authorization_header(service_id=sample_service.id)
 
     valid_json = {
@@ -1231,7 +1322,7 @@ def test_post_notification_returns_201_when_content_type_is_missing_but_payload_
     else:
         valid_json.update({"phone_number": "+447700900855"})
     response = client.post(
-        path="/v2/notifications/{}".format(notification_type),
+        path=f"/v2/notifications/{notification_type}",
         data=json.dumps(valid_json),
         headers=[auth_header],
     )
@@ -1255,152 +1346,19 @@ def test_post_email_notification_when_data_is_empty_returns_400(api_client_reque
         assert error_msg == "email_address is a required property"
 
 
-@pytest.mark.parametrize("notification_type", ("email", "sms"))
-def test_post_notifications_saves_email_or_sms_to_queue(client, notify_db_session, mocker, notification_type):
-    save_task = mocker.patch(f"app.celery.tasks.save_api_{notification_type}.apply_async")
-    mock_send_task = mocker.patch(f"app.celery.provider_tasks.deliver_{notification_type}.apply_async")
-
-    service = create_service(
-        service_name="high volume service",
-    )
-    with set_config_values(
-        current_app,
-        {
-            "HIGH_VOLUME_SERVICE": [str(service.id)],
-        },
-    ):
-        template = create_template(service=service, content="((message))", template_type=notification_type)
-        data = {"template_id": template.id, "personalisation": {"message": "Dear citizen, have a nice day"}}
-        data.update({"email_address": "joe.citizen@example.com"}) if notification_type == EMAIL_TYPE else data.update(
-            {"phone_number": "+447700900855"}
-        )
-
-        response = client.post(
-            path=f"/v2/notifications/{notification_type}",
-            data=json.dumps(data),
-            headers=[("Content-Type", "application/json"), create_service_authorization_header(service_id=service.id)],
-        )
-
-        json_resp = response.get_json()
-
-        assert response.status_code == 201
-        assert json_resp["id"]
-        assert json_resp["content"]["body"] == "Dear citizen, have a nice day"
-        assert json_resp["template"]["id"] == str(template.id)
-        save_task.assert_called_once_with([mock.ANY], queue=f"save-api-{notification_type}-tasks")
-        assert not mock_send_task.called
-        assert len(Notification.query.all()) == 0
-
-
-@pytest.mark.parametrize(
-    "exception",
-    [
-        botocore.exceptions.ClientError({"some": "json"}, "some opname"),
-        botocore.parsers.ResponseParserError("exceeded max HTTP body length"),
-    ],
-)
-@pytest.mark.parametrize("notification_type", ("email", "sms"))
-def test_post_notifications_saves_email_or_sms_normally_if_saving_to_queue_fails(
-    api_client_request, notify_db_session, mocker, notification_type, exception
+def test_post_sms_notification_returns_400_with_correct_error_message_if_empty_string_is_passed_as_phonenumber(
+    notify_db_session,
+    api_client_request,
+    mocker,
 ):
-    save_task = mocker.patch(
-        f"app.celery.tasks.save_api_{notification_type}.apply_async",
-        side_effect=exception,
+    mocker.patch("app.celery.provider_tasks.deliver_sms.apply_async")
+
+    service = create_service(service_permissions=[SMS_TYPE])
+    template = create_template(service=service)
+    data = {"phone_number": "", "template_id": template.id}
+    error_json = api_client_request.post(
+        service.id, "v2_notifications.post_notification", notification_type="sms", _data=data, _expected_status=400
     )
-    mock_send_task = mocker.patch(f"app.celery.provider_tasks.deliver_{notification_type}.apply_async")
 
-    service = create_service(
-        service_name="high volume service",
-    )
-    with set_config_values(
-        current_app,
-        {
-            "HIGH_VOLUME_SERVICE": [str(service.id)],
-        },
-    ):
-        template = create_template(service=service, content="((message))", template_type=notification_type)
-        data = {"template_id": template.id, "personalisation": {"message": "Dear citizen, have a nice day"}}
-        data.update({"email_address": "joe.citizen@example.com"}) if notification_type == EMAIL_TYPE else data.update(
-            {"phone_number": "+447700900855"}
-        )
-
-        json_resp = api_client_request.post(
-            service.id,
-            "v2_notifications.post_notification",
-            notification_type=notification_type,
-            _data=data,
-        )
-
-        assert json_resp["id"]
-        assert json_resp["content"]["body"] == "Dear citizen, have a nice day"
-        assert json_resp["template"]["id"] == str(template.id)
-        save_task.assert_called_once_with([mock.ANY], queue=f"save-api-{notification_type}-tasks")
-        mock_send_task.assert_called_once_with([json_resp["id"]], queue=f"send-{notification_type}-tasks")
-        assert Notification.query.count() == 1
-
-
-@pytest.mark.parametrize("notification_type", ("email", "sms"))
-def test_post_notifications_doesnt_use_save_queue_for_test_notifications(
-    api_client_request, notify_db_session, mocker, notification_type
-):
-    save_task = mocker.patch(f"app.celery.tasks.save_api_{notification_type}.apply_async")
-    mock_send_task = mocker.patch(f"app.celery.provider_tasks.deliver_{notification_type}.apply_async")
-    service = create_service(
-        service_name="high volume service",
-    )
-    with set_config_values(
-        current_app,
-        {
-            "HIGH_VOLUME_SERVICE": [str(service.id)],
-        },
-    ):
-        template = create_template(service=service, content="((message))", template_type=notification_type)
-        data = {"template_id": template.id, "personalisation": {"message": "Dear citizen, have a nice day"}}
-        data.update({"email_address": "joe.citizen@example.com"}) if notification_type == EMAIL_TYPE else data.update(
-            {"phone_number": "+447700900855"}
-        )
-
-        json_resp = api_client_request.post(
-            service.id,
-            "v2_notifications.post_notification",
-            _api_key_type="test",
-            notification_type=notification_type,
-            _data=data,
-        )
-
-        assert json_resp["id"]
-        assert json_resp["content"]["body"] == "Dear citizen, have a nice day"
-        assert json_resp["template"]["id"] == str(template.id)
-        assert mock_send_task.called
-        assert not save_task.called
-        assert len(Notification.query.all()) == 1
-
-
-def test_post_notification_does_not_use_save_queue_for_letters(api_client_request, sample_letter_template, mocker):
-    mock_save = mocker.patch("app.v2.notifications.post_notifications.save_email_or_sms_to_queue")
-    mock_create_pdf_task = mocker.patch("app.celery.letters_pdf_tasks.get_pdf_for_templated_letter.apply_async")
-
-    with set_config_values(
-        current_app,
-        {
-            "HIGH_VOLUME_SERVICE": [str(sample_letter_template.service_id)],
-        },
-    ):
-        data = {
-            "template_id": str(sample_letter_template.id),
-            "personalisation": {
-                "address_line_1": "Her Royal Highness Queen Elizabeth II",
-                "address_line_2": "Buckingham Palace",
-                "address_line_3": "London",
-                "postcode": "SW1 1AA",
-            },
-        }
-        json_resp = api_client_request.post(
-            sample_letter_template.service_id,
-            "v2_notifications.post_notification",
-            notification_type="letter",
-            _data=data,
-        )
-
-        assert not mock_save.called
-        mock_create_pdf_task.assert_called_once_with([str(json_resp["id"])], queue="create-letters-pdf-tasks")
+    assert error_json["status_code"] == 400
+    assert error_json["errors"] == [{"error": "ValidationError", "message": "phone_number Not enough digits"}]

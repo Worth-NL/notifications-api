@@ -14,7 +14,6 @@ from notifications_python_client.errors import (
     TokenExpiredError,
     TokenIssuerError,
 )
-from notifications_utils import request_helper
 from sqlalchemy.orm.exc import NoResultFound
 
 from app.serialised_models import SerialisedService
@@ -37,8 +36,7 @@ class AuthError(Exception):
 
     def __str__(self):
         return (
-            f"AuthError({self.short_message}, {self.code}, "
-            f"service_id={self.service_id}, api_key_id={self.api_key_id})"
+            f"AuthError({self.short_message}, {self.code}, service_id={self.service_id}, api_key_id={self.api_key_id})"
         )
 
     def to_dict_v2(self):
@@ -68,7 +66,6 @@ def requires_internal_auth(expected_client_id):
     if expected_client_id not in current_app.config.get("INTERNAL_CLIENT_API_KEYS"):
         raise TypeError("Unknown client_id for internal auth")
 
-    request_helper.check_proxy_header_before_request()
     auth_token = _get_auth_token(request)
     client_id = _get_token_issuer(auth_token)
 
@@ -85,8 +82,6 @@ def requires_internal_auth(expected_client_id):
 
 
 def requires_auth():
-    request_helper.check_proxy_header_before_request()
-
     auth_token = _get_auth_token(request)
     issuer = _get_token_issuer(auth_token)  # ie the `iss` claim which should be a service ID
 
@@ -109,6 +104,10 @@ def requires_auth():
 
     api_key = _decode_jwt_token(auth_token, service.api_keys, service.id)
 
+    g.api_user = api_key
+    g.service_id = service_id
+    g.authenticated_service = service
+
     current_app.logger.info(
         "API authorised for service %s with api key %s, using issuer %s for URL: %s",
         service_id,
@@ -116,10 +115,6 @@ def requires_auth():
         request.headers.get("User-Agent"),
         request.base_url,
     )
-
-    g.api_user = api_key
-    g.service_id = service_id
-    g.authenticated_service = service
 
 
 def _decode_jwt_token(auth_token, api_keys, service_id=None):

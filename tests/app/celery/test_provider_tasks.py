@@ -1,4 +1,5 @@
 from datetime import datetime
+from uuid import UUID
 
 import boto3
 import pytest
@@ -6,12 +7,13 @@ from botocore.exceptions import ClientError
 from celery.exceptions import MaxRetriesExceededError
 from flask import current_app
 from freezegun import freeze_time
-from moto import mock_s3
-from notifications_utils.postal_address import PostalAddress
+from moto import mock_aws
+from notifications_utils.recipient_validation.postal_address import PostalAddress
 
 import app
 from app.celery import provider_tasks
 from app.celery.provider_tasks import (
+    _get_callback_url,
     deliver_email,
     deliver_letter,
     deliver_sms,
@@ -191,7 +193,9 @@ def test_should_retry_and_log_exception_for_deliver_email_task(sample_notificati
 
 
 def test_if_ses_send_rate_throttle_then_should_retry_and_log_warning(sample_notification, mocker, caplog):
-    error_response = {"Error": {"Code": "Throttling", "Message": "Maximum sending rate exceeded.", "Type": "Sender"}}
+    error_response = {
+        "Error": {"Code": "TooManyRequestsException", "Message": "Maximum sending rate exceeded.", "Type": "Sender"}
+    }
     ex = ClientError(error_response=error_response, operation_name="opname")
     mocker.patch(
         "app.delivery.send_to_providers.send_email_to_provider",
@@ -223,7 +227,7 @@ def test_update_letter_to_sending(sample_letter_template):
     assert letter.sent_by == "dvla"
 
 
-@mock_s3
+@mock_aws
 @freeze_time("2020-02-17 16:00:00")
 def test_deliver_letter(
     mocker,
@@ -231,6 +235,7 @@ def test_deliver_letter(
     sample_organisation,
 ):
     mock_send_letter = mocker.patch("app.celery.provider_tasks.dvla_client.send_letter")
+    mocker.patch("app.celery.provider_tasks._get_callback_url", return_value="example.com?token=1")
 
     letter = create_notification(
         template=sample_letter_template,
@@ -245,7 +250,7 @@ def test_deliver_letter(
     pdf_bucket = current_app.config["S3_BUCKET_LETTERS_PDF"]
     s3 = boto3.client("s3", region_name="eu-west-1")
     s3.create_bucket(Bucket=pdf_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file"),
+    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file")
 
     deliver_letter(letter.id)
 
@@ -257,12 +262,13 @@ def test_deliver_letter(
         service_id=str(letter.service_id),
         organisation_id=str(sample_organisation.id),
         pdf_file=b"file",
+        callback_url="example.com?token=1",
     )
     assert letter.status == NOTIFICATION_SENDING
     assert letter.sent_by == "dvla"
 
 
-@mock_s3
+@mock_aws
 @freeze_time("2020-02-17 16:00:00")
 def test_deliver_letter_when_file_is_not_in_S3_logs_an_error(mocker, sample_letter_template, sample_organisation):
     mock_send_letter = mocker.patch("app.celery.provider_tasks.dvla_client.send_letter")
@@ -299,7 +305,7 @@ def test_deliver_letter_when_file_is_not_in_S3_logs_an_error(mocker, sample_lett
     assert letter.status == NOTIFICATION_TECHNICAL_FAILURE
 
 
-@mock_s3
+@mock_aws
 @freeze_time("2020-02-17 16:00:00")
 @pytest.mark.parametrize(
     "exception_type, error_class",
@@ -335,7 +341,7 @@ def test_deliver_letter_retries_when_there_is_a_retryable_exception(
     pdf_bucket = current_app.config["S3_BUCKET_LETTERS_PDF"]
     s3 = boto3.client("s3", region_name="eu-west-1")
     s3.create_bucket(Bucket=pdf_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file"),
+    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file")
 
     with caplog.at_level("WARNING"):
         deliver_letter(letter.id)
@@ -351,7 +357,7 @@ def test_deliver_letter_retries_when_there_is_a_retryable_exception(
         assert f"RETRY: Letter notification {letter.id} was rate limited by DVLA" in caplog.messages
 
 
-@mock_s3
+@mock_aws
 @freeze_time("2020-02-17 16:00:00")
 def test_deliver_letter_logs_a_warning_when_the_print_request_is_duplicate(
     mocker, sample_letter_template, sample_organisation, caplog
@@ -380,7 +386,7 @@ def test_deliver_letter_logs_a_warning_when_the_print_request_is_duplicate(
     pdf_bucket = current_app.config["S3_BUCKET_LETTERS_PDF"]
     s3 = boto3.client("s3", region_name="eu-west-1")
     s3.create_bucket(Bucket=pdf_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file"),
+    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file")
 
     with caplog.at_level("WARNING"):
         deliver_letter(letter.id)
@@ -428,7 +434,7 @@ def test_deliver_letter_logs_an_error_when_letter_not_created(mocker, sample_let
     assert f"deliver_letter task called for notification {letter.id} in status sending" in caplog.messages
 
 
-@mock_s3
+@mock_aws
 @freeze_time("2020-02-17 16:00:00")
 @pytest.mark.parametrize("exception_class", [DvlaNonRetryableException(), Exception()])
 def test_deliver_letter_when_there_is_a_non_retryable_error(
@@ -458,7 +464,7 @@ def test_deliver_letter_when_there_is_a_non_retryable_error(
     pdf_bucket = current_app.config["S3_BUCKET_LETTERS_PDF"]
     s3 = boto3.client("s3", region_name="eu-west-1")
     s3.create_bucket(Bucket=pdf_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file"),
+    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file")
 
     with pytest.raises(NotificationTechnicalFailureException) as e:
         deliver_letter(letter.id)
@@ -468,7 +474,7 @@ def test_deliver_letter_when_there_is_a_non_retryable_error(
     assert letter.status == NOTIFICATION_TECHNICAL_FAILURE
 
 
-@mock_s3
+@mock_aws
 @freeze_time("2020-02-17 16:00:00")
 def test_deliver_letter_when_max_retries_are_reached(mocker, sample_letter_template, sample_organisation):
     mocker.patch("app.celery.provider_tasks.dvla_client.send_letter", side_effect=DvlaRetryableException())
@@ -495,7 +501,7 @@ def test_deliver_letter_when_max_retries_are_reached(mocker, sample_letter_templ
     pdf_bucket = current_app.config["S3_BUCKET_LETTERS_PDF"]
     s3 = boto3.client("s3", region_name="eu-west-1")
     s3.create_bucket(Bucket=pdf_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
-    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file"),
+    s3.put_object(Bucket=pdf_bucket, Key="2020-02-17/NOTIFY.REF1.D.2.C.20200217150000.PDF", Body=b"file")
 
     with pytest.raises(NotificationTechnicalFailureException) as e:
         deliver_letter(letter.id)
@@ -503,3 +509,14 @@ def test_deliver_letter_when_max_retries_are_reached(mocker, sample_letter_templ
     assert mock_retry.called is True
     assert str(letter.id) in str(e.value)
     assert letter.status == NOTIFICATION_TECHNICAL_FAILURE
+
+
+def test_get_callback_url_returns_unique_callback_for_notification(notify_api, fake_uuid):
+    notification_id = UUID(fake_uuid)
+
+    callback_url = _get_callback_url(notification_id)
+
+    assert callback_url == (
+        "http://localhost:6011/notifications/letter/status?"
+        "token=IjZjZTQ2NmQwLWZkNmEtMTFlNS04MmY1LWUwYWNjYjlkMTFhNiI._E6xCZE858swMk0xoYI_KHoTKd8"
+    )

@@ -18,6 +18,7 @@ NOTIFICATION_RETURNED_LETTER = "returned-letter"
 
 # Raw notification status values grouped into types
 NOTIFICATION_STATUS_TYPES_FAILED = [
+    # if changing this group, update ix_notifications_failed_service_id_composite to match
     NOTIFICATION_TECHNICAL_FAILURE,
     NOTIFICATION_TEMPORARY_FAILURE,
     NOTIFICATION_PERMANENT_FAILURE,
@@ -59,6 +60,14 @@ NOTIFICATION_STATUS_TYPES_BILLABLE_FOR_LETTERS = [
     NOTIFICATION_DELIVERED,
     NOTIFICATION_RETURNED_LETTER,
 ]
+
+NOTIFICATION_STATUS_TYPES_LETTERS_NEVER_SENT = [
+    NOTIFICATION_CANCELLED,
+    NOTIFICATION_TECHNICAL_FAILURE,
+    NOTIFICATION_VALIDATION_FAILED,
+    NOTIFICATION_VIRUS_SCAN_FAILED,
+]
+
 # we don't really have a concept of billable emails - however the ft billing table only includes emails that we have
 # actually sent.
 NOTIFICATION_STATUS_TYPES_SENT_EMAILS = [
@@ -67,6 +76,7 @@ NOTIFICATION_STATUS_TYPES_SENT_EMAILS = [
     NOTIFICATION_TEMPORARY_FAILURE,
     NOTIFICATION_PERMANENT_FAILURE,
 ]
+NOTIFICATION_STATUS_TYPES_DEPRECATED = [NOTIFICATION_FAILED]
 NOTIFICATION_STATUS_TYPES = [
     NOTIFICATION_CANCELLED,
     NOTIFICATION_CREATED,
@@ -88,7 +98,16 @@ NOTIFICATION_STATUS_TYPES_NON_BILLABLE = list(set(NOTIFICATION_STATUS_TYPES) - s
 # Letter statuses according to our print provider
 NOTIFICATION_STATUS_LETTER_ACCEPTED = "accepted"
 NOTIFICATION_STATUS_LETTER_RECEIVED = "received"
-DVLA_RESPONSE_STATUS_SENT = "Sent"
+
+# DVLA letter callback status
+DVLA_NOTIFICATION_DISPATCHED = "DESPATCHED"
+DVLA_NOTIFICATION_REJECTED = "REJECTED"
+
+# Mapping from DVLA status to internal notification status
+DVLA_TO_NOTIFICATION_STATUS_MAP = {
+    DVLA_NOTIFICATION_DISPATCHED: NOTIFICATION_DELIVERED,
+    DVLA_NOTIFICATION_REJECTED: NOTIFICATION_TECHNICAL_FAILURE,
+}
 
 # Letter postage zones
 FIRST_CLASS = "first"
@@ -129,7 +148,7 @@ NOTIFICATION_TYPE = [EMAIL_TYPE, SMS_TYPE, LETTER_TYPE]  # duplicate that can pr
 
 
 # Language options supported for bilingual letter templates
-class LetterLanguageOptions(str, enum.Enum):
+class LetterLanguageOptions(enum.StrEnum):
     english = "english"
     welsh_then_english = "welsh_then_english"
 
@@ -184,6 +203,7 @@ UPLOAD_LETTERS = "upload_letters"
 INTERNATIONAL_LETTERS = "international_letters"
 EXTRA_EMAIL_FORMATTING = "extra_email_formatting"
 EXTRA_LETTER_FORMATTING = "extra_letter_formatting"
+SMS_TO_UK_LANDLINES = "sms_to_uk_landlines"
 SERVICE_PERMISSION_TYPES = [
     EMAIL_TYPE,
     SMS_TYPE,
@@ -200,6 +220,7 @@ SERVICE_PERMISSION_TYPES = [
     INTERNATIONAL_LETTERS,
     EXTRA_EMAIL_FORMATTING,
     EXTRA_LETTER_FORMATTING,
+    SMS_TO_UK_LANDLINES,
 ]
 
 # List of available permissions
@@ -227,7 +248,7 @@ ORGANISATION_PERMISSION_TYPES = [
 
 
 # Organisation user permissions
-class OrganisationUserPermissionTypes(enum.Enum):
+class OrganisationUserPermissionTypes(enum.StrEnum):
     can_make_services_live = "can_make_services_live"
 
 
@@ -244,10 +265,13 @@ WEBAUTHN_AUTH_TYPE = "webauthn_auth"
 USER_AUTH_TYPES = [SMS_AUTH_TYPE, EMAIL_AUTH_TYPE, WEBAUTHN_AUTH_TYPE]
 VERIFY_CODE_TYPES = [EMAIL_TYPE, SMS_TYPE]
 
+
 # Service callbacks
-DELIVERY_STATUS_CALLBACK_TYPE = "delivery_status"
-COMPLAINT_CALLBACK_TYPE = "complaint"
-SERVICE_CALLBACK_TYPES = [DELIVERY_STATUS_CALLBACK_TYPE, COMPLAINT_CALLBACK_TYPE]
+class ServiceCallbackTypes(enum.StrEnum):
+    delivery_status = "delivery_status"
+    complaint = "complaint"
+    returned_letter = "returned_letter"
+
 
 # Branding values
 BRANDING_GOVUK = "govuk"  # Deprecated outside migrations
@@ -274,6 +298,7 @@ ALL_BROADCAST_PROVIDERS = "all"
 JOB_STATUS_PENDING = "pending"
 JOB_STATUS_IN_PROGRESS = "in progress"
 JOB_STATUS_FINISHED = "finished"
+JOB_STATUS_FINISHED_ALL_NOTIFICATIONS_CREATED = "finished all notifications created"
 JOB_STATUS_SENDING_LIMITS_EXCEEDED = "sending limits exceeded"
 JOB_STATUS_SCHEDULED = "scheduled"
 JOB_STATUS_CANCELLED = "cancelled"
@@ -284,6 +309,7 @@ JOB_STATUS_TYPES = [
     JOB_STATUS_PENDING,
     JOB_STATUS_IN_PROGRESS,
     JOB_STATUS_FINISHED,
+    JOB_STATUS_FINISHED_ALL_NOTIFICATIONS_CREATED,
     JOB_STATUS_SENDING_LIMITS_EXCEEDED,
     JOB_STATUS_SCHEDULED,
     JOB_STATUS_CANCELLED,
@@ -318,18 +344,21 @@ class CacheKeys:
     NUMBER_OF_TIMES_OVER_SLOW_SMS_DELIVERY_THRESHOLD = "slow-sms-delivery:number-of-times-over-threshold"
 
 
+SMS_PROVIDER_ERROR_THRESHOLD = 50
+SMS_PROVIDER_ERROR_INTERVAL = 60
+
 # Admin API error codes
 QR_CODE_TOO_LONG = "qr-code-too-long"
 
+# Service Join Request statuses
+SERVICE_JOIN_REQUEST_PENDING = "pending"
+SERVICE_JOIN_REQUEST_APPROVED = "approved"
+SERVICE_JOIN_REQUEST_REJECTED = "rejected"
+SERVICE_JOIN_REQUEST_CANCELLED = "cancelled"
 
-# We updated the content for phone number validation messages in https://github.com/alphagov/notifications-utils/pull/1054,
-# but these are returned from our API. We don't want to make any breaking changes, so we will map them back to our
-# original errors.
-# We can decide as/when we want to remove this and update the messages to end users.
-PHONE_NUMBER_VALIDATION_ERROR_MAP = {
-    "Mobile numbers can only include: 0 1 2 3 4 5 6 7 8 9 ( ) + -": "Must not contain letters or symbols",
-    "Mobile number is too long": "Too many digits",
-    "Mobile number is too short": "Not enough digits",
-    "Country code not found - double check the mobile number you entered": "Not a valid country prefix",
-    "This does not look like a UK mobile number – double check the mobile number you entered": "Not a UK mobile number",
-}
+SERVICE_JOIN_REQUEST_STATUS_TYPES = [
+    SERVICE_JOIN_REQUEST_APPROVED,
+    SERVICE_JOIN_REQUEST_REJECTED,
+    SERVICE_JOIN_REQUEST_PENDING,
+    SERVICE_JOIN_REQUEST_CANCELLED,
+]

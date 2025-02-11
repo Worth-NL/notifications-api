@@ -18,6 +18,8 @@ from notifications_utils.clients.zendesk.zendesk_client import (
 from redis.exceptions import LockError
 
 from app.celery import scheduled_tasks
+from app.celery.letters_pdf_tasks import get_pdf_for_templated_letter
+from app.celery.provider_tasks import deliver_email, deliver_sms
 from app.celery.scheduled_tasks import (
     _check_slow_text_message_delivery_reports_and_raise_error_if_needed,
     change_dvla_api_key,
@@ -38,8 +40,10 @@ from app.celery.scheduled_tasks import (
     run_scheduled_jobs,
     switch_current_sms_provider_on_slow_delivery,
     weekly_dwp_report,
+    weekly_user_research_email,
     zendesk_new_email_branding_report,
 )
+from app.celery.tasks import process_incomplete_jobs, process_job, save_email
 from app.clients.letter.dvla import (
     DvlaNonRetryableException,
     DvlaThrottlingException,
@@ -57,7 +61,7 @@ from app.dao.annual_billing_dao import set_default_free_allowance_for_service
 from app.dao.jobs_dao import dao_get_job_by_id
 from app.dao.notifications_dao import SlowProviderDeliveryReport
 from app.dao.provider_details_dao import get_provider_details_by_identifier
-from app.models import Event, InboundNumber
+from app.models import Event, InboundNumber, Notification
 from tests.app import load_example_csv
 from tests.app.db import (
     create_email_branding,
@@ -67,7 +71,7 @@ from tests.app.db import (
     create_template,
     create_user,
 )
-from tests.conftest import set_config
+from tests.conftest import set_config, set_config_values
 
 
 def test_should_call_delete_codes_on_delete_verify_codes_task(notify_db_session, mocker):
@@ -82,8 +86,8 @@ def test_should_call_delete_invotations_on_delete_invitations_task(notify_db_ses
     assert scheduled_tasks.delete_invitations_created_more_than_two_days_ago.call_count == 1
 
 
-def test_should_update_scheduled_jobs_and_put_on_queue(mocker, sample_template):
-    mocked = mocker.patch("app.celery.tasks.process_job.apply_async")
+def test_should_update_scheduled_jobs_and_put_on_queue(mock_celery_task, sample_template):
+    mocked = mock_celery_task(process_job)
 
     one_minute_in_the_past = datetime.utcnow() - timedelta(minutes=1)
     job = create_job(sample_template, job_status="scheduled", scheduled_for=one_minute_in_the_past)
@@ -95,8 +99,8 @@ def test_should_update_scheduled_jobs_and_put_on_queue(mocker, sample_template):
     mocked.assert_called_with([str(job.id)], queue="job-tasks")
 
 
-def test_should_update_all_scheduled_jobs_and_put_on_queue(sample_template, mocker):
-    mocked = mocker.patch("app.celery.tasks.process_job.apply_async")
+def test_should_update_all_scheduled_jobs_and_put_on_queue(sample_template, mock_celery_task):
+    mocked = mock_celery_task(process_job)
 
     one_minute_in_the_past = datetime.utcnow() - timedelta(minutes=1)
     ten_minutes_in_the_past = datetime.utcnow() - timedelta(minutes=10)
@@ -135,7 +139,7 @@ def test_switch_current_sms_provider_on_slow_delivery_switches_when_one_provider
     switch_current_sms_provider_on_slow_delivery()
 
     mock_is_slow.assert_called_once_with(created_within_minutes=15, delivered_within_minutes=5, threshold=0.15)
-    mock_reduce.assert_called_once_with("firetext", time_threshold=timedelta(minutes=10))
+    mock_reduce.assert_called_once_with("firetext", time_threshold=timedelta(minutes=5))
 
 
 @freeze_time("2017-05-01 14:00:00")
@@ -159,19 +163,19 @@ def test_switch_current_sms_provider_on_slow_delivery_does_nothing_if_no_need(
 
 
 @pytest.mark.parametrize(
-    "environment, expect_check_slow_delivery",
+    "slow_delivery_config_option, expect_check_slow_delivery",
     (
         (
-            "preview",
+            False,
             False,
         ),
         (
-            "production",
+            True,
             True,
         ),
     ),
 )
-def test_generate_sms_delivery_stats(environment, expect_check_slow_delivery, mocker, notify_api):
+def test_generate_sms_delivery_stats(slow_delivery_config_option, expect_check_slow_delivery, mocker, notify_api):
     slow_delivery_reports = [
         SlowProviderDeliveryReport(provider="mmg", slow_ratio=0.4, slow_notifications=40, total_notifications=100),
         SlowProviderDeliveryReport(provider="firetext", slow_ratio=0.8, slow_notifications=80, total_notifications=100),
@@ -185,7 +189,7 @@ def test_generate_sms_delivery_stats(environment, expect_check_slow_delivery, mo
         "app.celery.scheduled_tasks._check_slow_text_message_delivery_reports_and_raise_error_if_needed"
     )
 
-    with set_config(notify_api, "NOTIFY_ENVIRONMENT", environment):
+    with set_config(notify_api, "CHECK_SLOW_TEXT_MESSAGE_DELIVERY", slow_delivery_config_option):
         generate_sms_delivery_stats()
 
     calls = [
@@ -256,8 +260,8 @@ def test_check_slow_text_message_delivery_reports_and_raise_error_if_needed(
             assert mock_incr.call_args_list == [mocker.call("slow-sms-delivery:number-of-times-over-threshold")]
 
 
-def test_check_job_status_task_calls_process_incomplete_jobs(mocker, sample_template):
-    mock_celery = mocker.patch("app.celery.tasks.process_incomplete_jobs.apply_async")
+def test_check_job_status_task_calls_process_incomplete_jobs(mock_celery_task, sample_template):
+    mock_celery = mock_celery_task(process_incomplete_jobs)
     job = create_job(
         template=sample_template,
         notification_count=3,
@@ -272,9 +276,9 @@ def test_check_job_status_task_calls_process_incomplete_jobs(mocker, sample_temp
 
 
 def test_check_job_status_task_calls_process_incomplete_jobs_when_scheduled_job_is_not_complete(
-    mocker, sample_template
+    mock_celery_task, sample_template
 ):
-    mock_celery = mocker.patch("app.celery.tasks.process_incomplete_jobs.apply_async")
+    mock_celery = mock_celery_task(process_incomplete_jobs)
     job = create_job(
         template=sample_template,
         notification_count=3,
@@ -288,8 +292,10 @@ def test_check_job_status_task_calls_process_incomplete_jobs_when_scheduled_job_
     mock_celery.assert_called_once_with([[str(job.id)]], queue=QueueNames.JOBS)
 
 
-def test_check_job_status_task_calls_process_incomplete_jobs_for_pending_scheduled_jobs(mocker, sample_template):
-    mock_celery = mocker.patch("app.celery.tasks.process_incomplete_jobs.apply_async")
+def test_check_job_status_task_calls_process_incomplete_jobs_for_pending_scheduled_jobs(
+    mock_celery_task, sample_template
+):
+    mock_celery = mock_celery_task(process_incomplete_jobs)
     job = create_job(
         template=sample_template,
         notification_count=3,
@@ -304,10 +310,10 @@ def test_check_job_status_task_calls_process_incomplete_jobs_for_pending_schedul
 
 
 def test_check_job_status_task_does_not_call_process_incomplete_jobs_for_non_scheduled_pending_jobs(
-    mocker,
+    mock_celery_task,
     sample_template,
 ):
-    mock_celery = mocker.patch("app.celery.tasks.process_incomplete_jobs.apply_async")
+    mock_celery = mock_celery_task(process_incomplete_jobs)
     create_job(
         template=sample_template,
         notification_count=3,
@@ -319,8 +325,8 @@ def test_check_job_status_task_does_not_call_process_incomplete_jobs_for_non_sch
     assert not mock_celery.called
 
 
-def test_check_job_status_task_calls_process_incomplete_jobs_for_multiple_jobs(mocker, sample_template):
-    mock_celery = mocker.patch("app.celery.tasks.process_incomplete_jobs.apply_async")
+def test_check_job_status_task_calls_process_incomplete_jobs_for_multiple_jobs(mock_celery_task, sample_template):
+    mock_celery = mock_celery_task(process_incomplete_jobs)
     job = create_job(
         template=sample_template,
         notification_count=3,
@@ -342,8 +348,8 @@ def test_check_job_status_task_calls_process_incomplete_jobs_for_multiple_jobs(m
     mock_celery.assert_called_once_with([[str(job.id), str(job_2.id)]], queue=QueueNames.JOBS)
 
 
-def test_check_job_status_task_only_sends_old_tasks(mocker, sample_template):
-    mock_celery = mocker.patch("app.celery.tasks.process_incomplete_jobs.apply_async")
+def test_check_job_status_task_only_sends_old_tasks(mock_celery_task, sample_template):
+    mock_celery = mock_celery_task(process_incomplete_jobs)
     job = create_job(
         template=sample_template,
         notification_count=3,
@@ -372,8 +378,8 @@ def test_check_job_status_task_only_sends_old_tasks(mocker, sample_template):
     mock_celery.assert_called_once_with([[str(job.id)]], queue=QueueNames.JOBS)
 
 
-def test_check_job_status_task_sets_jobs_to_error(mocker, sample_template):
-    mock_celery = mocker.patch("app.celery.tasks.process_incomplete_jobs.apply_async")
+def test_check_job_status_task_sets_jobs_to_error(mock_celery_task, sample_template):
+    mock_celery = mock_celery_task(process_incomplete_jobs)
     job = create_job(
         template=sample_template,
         notification_count=3,
@@ -397,9 +403,9 @@ def test_check_job_status_task_sets_jobs_to_error(mocker, sample_template):
     assert job_2.job_status == JOB_STATUS_IN_PROGRESS
 
 
-def test_replay_created_notifications(notify_db_session, sample_service, mocker):
-    email_delivery_queue = mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
-    sms_delivery_queue = mocker.patch("app.celery.provider_tasks.deliver_sms.apply_async")
+def test_replay_created_notifications(sample_service, mock_celery_task):
+    email_delivery_queue = mock_celery_task(deliver_email)
+    sms_delivery_queue = mock_celery_task(deliver_sms)
 
     sms_template = create_template(service=sample_service, template_type="sms")
     email_template = create_template(service=sample_service, template_type="email")
@@ -427,9 +433,9 @@ def test_replay_created_notifications(notify_db_session, sample_service, mocker)
 
 
 def test_replay_created_notifications_get_pdf_for_templated_letter_tasks_for_letters_not_ready_to_send(
-    sample_letter_template, mocker
+    sample_letter_template, mock_celery_task
 ):
-    mock_task = mocker.patch("app.celery.scheduled_tasks.get_pdf_for_templated_letter.apply_async")
+    mock_task = mock_celery_task(get_pdf_for_templated_letter)
     create_notification(
         template=sample_letter_template, billable_units=0, created_at=datetime.utcnow() - timedelta(hours=4)
     )
@@ -482,14 +488,20 @@ def test_check_if_letters_still_pending_virus_check_restarts_scan_for_stuck_lett
     create_notification(
         template=sample_letter_template,
         status=NOTIFICATION_PENDING_VIRUS_CHECK,
-        created_at=datetime.utcnow() - timedelta(seconds=601),
+        created_at=datetime.utcnow() - timedelta(minutes=10, seconds=1),
         reference="one",
     )
     create_notification(
         template=sample_letter_template,
         status=NOTIFICATION_PENDING_VIRUS_CHECK,
-        created_at=datetime.utcnow() - timedelta(seconds=599),
+        created_at=datetime.utcnow() - timedelta(minutes=9, seconds=59),
         reference="still has time to send",
+    )
+    create_notification(
+        template=sample_letter_template,
+        status=NOTIFICATION_PENDING_VIRUS_CHECK,
+        created_at=datetime.utcnow() - timedelta(minutes=30, seconds=1),
+        reference="too old for us to bother with",
     )
     expected_filename = "NOTIFY.ONE.D.2.C.20190530134959.PDF"
 
@@ -506,7 +518,7 @@ def test_check_if_letters_still_pending_virus_check_restarts_scan_for_stuck_lett
 
 @freeze_time("2019-05-30 14:00:00")
 def test_check_if_letters_still_pending_virus_check_raises_zendesk_if_files_cant_be_found(
-    mocker, sample_letter_template
+    sample_letter_template, mocker
 ):
     mock_file_exists = mocker.patch("app.aws.s3.file_exists", return_value=False)
     mock_create_ticket = mocker.spy(NotifySupportTicket, "__init__")
@@ -557,9 +569,9 @@ def test_check_if_letters_still_pending_virus_check_raises_zendesk_if_files_cant
         ANY,
         subject="[test] Letters still pending virus check",
         message=ANY,
-        ticket_type="incident",
+        ticket_type="task",
         notify_ticket_type=NotifyTicketType.TECHNICAL,
-        ticket_categories=["notify_letters"],
+        notify_task_type="notify_task_letters_pending_scan",
     )
     assert "2 precompiled letters have been pending-virus-check" in mock_create_ticket.call_args.kwargs["message"]
     assert f"{(str(notification_1.id), notification_1.reference)}" in mock_create_ticket.call_args.kwargs["message"]
@@ -568,7 +580,7 @@ def test_check_if_letters_still_pending_virus_check_raises_zendesk_if_files_cant
 
 
 @freeze_time("2019-05-30 14:00:00")
-def test_check_if_letters_still_in_created_during_bst(mocker, sample_letter_template, caplog):
+def test_check_if_letters_still_in_created_during_bst(sample_letter_template, caplog, mocker):
     mock_create_ticket = mocker.spy(NotifySupportTicket, "__init__")
     mock_send_ticket_to_zendesk = mocker.patch(
         "app.celery.scheduled_tasks.zendesk_client.send_ticket_to_zendesk",
@@ -596,15 +608,15 @@ def test_check_if_letters_still_in_created_during_bst(mocker, sample_letter_temp
             "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-letters-still-in-created."
         ),
         subject="[test] Letters still in 'created' status",
-        ticket_type="incident",
+        ticket_type="task",
         notify_ticket_type=NotifyTicketType.TECHNICAL,
-        ticket_categories=["notify_letters"],
+        notify_task_type="notify_task_letters_created_status",
     )
     mock_send_ticket_to_zendesk.assert_called_once()
 
 
 @freeze_time("2019-01-30 14:00:00")
-def test_check_if_letters_still_in_created_during_utc(mocker, sample_letter_template, caplog):
+def test_check_if_letters_still_in_created_during_utc(sample_letter_template, caplog, mocker):
     mock_create_ticket = mocker.spy(NotifySupportTicket, "__init__")
     mock_send_ticket_to_zendesk = mocker.patch(
         "app.celery.scheduled_tasks.zendesk_client.send_ticket_to_zendesk",
@@ -632,9 +644,9 @@ def test_check_if_letters_still_in_created_during_utc(mocker, sample_letter_temp
             "https://github.com/alphagov/notifications-manuals/wiki/Support-Runbook#deal-with-letters-still-in-created."
         ),
         subject="[test] Letters still in 'created' status",
-        ticket_type="incident",
+        ticket_type="task",
         notify_ticket_type=NotifyTicketType.TECHNICAL,
-        ticket_categories=["notify_letters"],
+        notify_task_type="notify_task_letters_created_status",
     )
     mock_send_ticket_to_zendesk.assert_called_once()
 
@@ -658,7 +670,8 @@ def test_check_for_missing_rows_in_completed_jobs_ignores_old_and_new_jobs(
         return_value=(load_example_csv("multiple_email"), {"sender_id": None}),
     )
     mocker.patch("app.signing.encode", return_value="something_encoded")
-    process_row = mocker.patch("app.celery.scheduled_tasks.process_row")
+    get_id_task_args_kwargs_for_job_row = mocker.patch("app.celery.scheduled_tasks.get_id_task_args_kwargs_for_job_row")
+    process_job_row = mocker.patch("app.celery.scheduled_tasks.process_job_row")
 
     job = create_job(
         template=sample_email_template,
@@ -666,84 +679,93 @@ def test_check_for_missing_rows_in_completed_jobs_ignores_old_and_new_jobs(
         job_status=JOB_STATUS_FINISHED,
         processing_finished=datetime.utcnow() - offset,
     )
-    for i in range(0, 4):
+    for i in range(4):
         create_notification(job=job, job_row_number=i)
 
     check_for_missing_rows_in_completed_jobs()
 
-    assert process_row.called is False
+    assert get_id_task_args_kwargs_for_job_row.called is False
+    assert process_job_row.called is False
 
 
-def test_check_for_missing_rows_in_completed_jobs(mocker, sample_email_template):
-    mocker.patch(
-        "app.celery.tasks.s3.get_job_and_metadata_from_s3",
-        return_value=(load_example_csv("multiple_email"), {"sender_id": None}),
-    )
-    mocker.patch("app.signing.encode", return_value="something_encoded")
-    process_row = mocker.patch("app.celery.scheduled_tasks.process_row")
-
+def test_check_for_missing_rows_in_completed_jobs(mocker, sample_email_template, mock_celery_task):
     job = create_job(
         template=sample_email_template,
         notification_count=5,
         job_status=JOB_STATUS_FINISHED,
         processing_finished=datetime.utcnow() - timedelta(minutes=20),
     )
-    for i in range(0, 4):
+    for i in range(4):
         create_notification(job=job, job_row_number=i)
 
-    check_for_missing_rows_in_completed_jobs()
-
-    process_row.assert_called_once_with(mock.ANY, mock.ANY, job, job.service, sender_id=None)
-
-
-def test_check_for_missing_rows_in_completed_jobs_calls_save_email(mocker, sample_email_template):
     mocker.patch(
         "app.celery.tasks.s3.get_job_and_metadata_from_s3",
         return_value=(load_example_csv("multiple_email"), {"sender_id": None}),
     )
-    save_email_task = mocker.patch("app.celery.tasks.save_email.apply_async")
-    mocker.patch("app.signing.encode", return_value="something_encoded")
-    mocker.patch("app.celery.tasks.create_uuid", return_value="uuid")
+    mock_encode = mocker.patch("app.signing.encode", return_value="something_encoded")
+    mocker.patch("app.celery.tasks.create_uuid", return_value="some-uuid")
+    mock_save_email = mock_celery_task(save_email)
 
+    check_for_missing_rows_in_completed_jobs()
+
+    assert mock_encode.mock_calls == [
+        mock.call(
+            {
+                "template": str(job.template_id),
+                "template_version": job.template_version,
+                "job": str(job.id),
+                "to": "test5@test.com",
+                "row_number": 4,
+                "personalisation": {"emailaddress": "test5@test.com"},
+                "client_reference": None,
+            }
+        )
+    ]
+    assert mock_save_email.mock_calls == [
+        mock.call((str(job.service_id), "some-uuid", "something_encoded"), {}, queue="database-tasks")
+    ]
+
+
+def test_check_for_missing_rows_in_completed_jobs_uses_sender_id(
+    mocker, sample_email_template, fake_uuid, mock_celery_task
+):
     job = create_job(
         template=sample_email_template,
         notification_count=5,
         job_status=JOB_STATUS_FINISHED,
         processing_finished=datetime.utcnow() - timedelta(minutes=20),
     )
-    for i in range(0, 4):
+    for i in range(4):
         create_notification(job=job, job_row_number=i)
 
-    check_for_missing_rows_in_completed_jobs()
-    save_email_task.assert_called_once_with(
-        (
-            str(job.service_id),
-            "uuid",
-            "something_encoded",
-        ),
-        {},
-        queue="database-tasks",
-    )
-
-
-def test_check_for_missing_rows_in_completed_jobs_uses_sender_id(mocker, sample_email_template, fake_uuid):
     mocker.patch(
         "app.celery.tasks.s3.get_job_and_metadata_from_s3",
         return_value=(load_example_csv("multiple_email"), {"sender_id": fake_uuid}),
     )
-    mock_process_row = mocker.patch("app.celery.scheduled_tasks.process_row")
-
-    job = create_job(
-        template=sample_email_template,
-        notification_count=5,
-        job_status=JOB_STATUS_FINISHED,
-        processing_finished=datetime.utcnow() - timedelta(minutes=20),
-    )
-    for i in range(0, 4):
-        create_notification(job=job, job_row_number=i)
+    mock_encode = mocker.patch("app.signing.encode", return_value="something_encoded")
+    mocker.patch("app.celery.tasks.create_uuid", return_value="some-uuid")
+    mock_save_email = mock_celery_task(save_email)
 
     check_for_missing_rows_in_completed_jobs()
-    mock_process_row.assert_called_once_with(mock.ANY, mock.ANY, job, job.service, sender_id=fake_uuid)
+
+    assert mock_encode.mock_calls == [
+        mock.call(
+            {
+                "template": str(job.template_id),
+                "template_version": job.template_version,
+                "job": str(job.id),
+                "to": "test5@test.com",
+                "row_number": 4,
+                "personalisation": {"emailaddress": "test5@test.com"},
+                "client_reference": None,
+            }
+        )
+    ]
+    assert mock_save_email.mock_calls == [
+        mock.call(
+            (str(job.service_id), "some-uuid", "something_encoded"), {"sender_id": fake_uuid}, queue="database-tasks"
+        )
+    ]
 
 
 MockServicesSendingToTVNumbers = namedtuple(
@@ -782,7 +804,7 @@ MockServicesWithHighFailureRate = namedtuple(
     ],
 )
 def test_check_for_services_with_high_failure_rates_or_sending_to_tv_numbers(
-    mocker, notify_db_session, failure_rates, sms_to_tv_numbers, expected_log, expected_message, caplog
+    notify_db_session, failure_rates, sms_to_tv_numbers, expected_log, expected_message, caplog, mocker
 ):
     mock_create_ticket = mocker.spy(NotifySupportTicket, "__init__")
     mock_send_ticket_to_zendesk = mocker.patch(
@@ -808,8 +830,9 @@ def test_check_for_services_with_high_failure_rates_or_sending_to_tv_numbers(
         ANY,
         message=expected_message + zendesk_actions,
         subject="[test] High failure rates for sms spotted for services",
-        ticket_type="incident",
+        ticket_type="task",
         notify_ticket_type=NotifyTicketType.TECHNICAL,
+        notify_task_type="notify_task_high_failure",
     )
     mock_send_ticket_to_zendesk.assert_called_once()
 
@@ -831,7 +854,7 @@ def test_delete_old_records_from_events_table(notify_db_session):
 
 
 @freeze_time("2022-11-01 00:30:00", tick=True)
-def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_user, hostnames):
+def test_zendesk_new_email_branding_report(notify_db_session, notify_user, hostnames, mocker):
     org_1 = create_organisation(organisation_id=uuid.UUID("113d51e7-f204-44d0-99c6-020f3542a527"), name="org-1")
     org_2 = create_organisation(organisation_id=uuid.UUID("d6bc2309-9f79-4779-b864-46c2892db90e"), name="org-2")
     email_brand_1 = create_email_branding(
@@ -865,15 +888,16 @@ def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_use
             },
             "group_id": 360000036529,
             "organization_id": 21891972,
-            "ticket_form_id": 1900000284794,
+            "ticket_form_id": 14226867890588,
             "priority": "normal",
             "tags": ["govuk_notify_support"],
             "type": "task",
             "custom_fields": [
-                {"id": "360022836500", "value": ["notify_no_ticket_category"]},
+                {"id": "14229641690396", "value": "notify_task_branding_review"},
                 {"id": "360022943959", "value": None},
                 {"id": "360022943979", "value": None},
                 {"id": "1900000745014", "value": None},
+                {"id": "15925693889308", "value": None},
                 {"id": "1900000744994", "value": "notify_ticket_type_non_technical"},
             ],
         }
@@ -919,7 +943,7 @@ def test_zendesk_new_email_branding_report(notify_db_session, mocker, notify_use
 
 @freeze_time("2022-11-01 00:30:00")
 def test_zendesk_new_email_branding_report_for_unassigned_branding_only(
-    notify_db_session, mocker, notify_user, hostnames
+    notify_db_session, notify_user, hostnames, mocker
 ):
     create_organisation(organisation_id=uuid.UUID("113d51e7-f204-44d0-99c6-020f3542a527"), name="org-1")
     create_organisation(organisation_id=uuid.UUID("d6bc2309-9f79-4779-b864-46c2892db90e"), name="org-2")
@@ -965,7 +989,7 @@ def test_zendesk_new_email_branding_report_for_unassigned_branding_only(
     ),
 )
 def test_zendesk_new_email_branding_report_calculates_last_weekday_correctly(
-    notify_db_session, mocker, task_run_time, earliest_searched_timestamp, expected_last_day_string, notify_user
+    notify_db_session, task_run_time, earliest_searched_timestamp, expected_last_day_string, notify_user, mocker
 ):
     org_1 = create_organisation()
 
@@ -1052,7 +1076,7 @@ def test_check_for_low_available_inbound_sms_numbers_logs_zendesk_ticket_if_too_
             ),
             ticket_type=mock_ticket.TYPE_TASK,
             notify_ticket_type=NotifyTicketType.TECHNICAL,
-            ticket_categories=["notify_no_ticket_category"],
+            notify_task_type="notify_task_request_inbound_SMS",
         )
     ]
     assert mock_send_ticket.call_args_list == [mocker.call(mock_ticket.return_value)]
@@ -1071,6 +1095,48 @@ def test_check_for_low_available_inbound_sms_numbers_does_not_proceed_if_enough_
         check_for_low_available_inbound_sms_numbers()
 
     assert mock_send_ticket.call_args_list == []
+
+
+@freeze_time("2024-08-14T10:00:00")
+def test_weekly_user_research_email(notify_api, user_research_email_for_new_users_template, notify_db_session, mocker):
+    mock_send_email = mocker.patch("app.celery.scheduled_tasks.send_notification_to_queue")
+
+    create_user(email="user1@gov.uk", take_part_in_research=True, created_at=datetime(2024, 7, 29, 12, 0))
+    create_user(email="user2@gov.uk", take_part_in_research=True, created_at=datetime(2024, 8, 1, 14))
+    create_user(email="user3@gov.uk", take_part_in_research=True, created_at=datetime(2024, 8, 4, 23, 59))
+
+    # user does not receive email
+    create_user(email="user4@gov.uk", take_part_in_research=True, created_at=datetime(2024, 8, 5))
+
+    with set_config(notify_api, "WEEKLY_USER_RESEARCH_EMAIL_ENABLED", True):
+        weekly_user_research_email()
+
+    assert mock_send_email.call_args_list == [
+        call(ANY, queue="notify-internal-tasks"),
+        call(ANY, queue="notify-internal-tasks"),
+        call(ANY, queue="notify-internal-tasks"),
+    ]
+
+    notifications = Notification.query.all()
+    assert {email.to for email in notifications} == {"user1@gov.uk", "user2@gov.uk", "user3@gov.uk"}
+
+
+@freeze_time("2024-08-14T10:00:00")
+def test_weekly_user_research_email_skips_environments_with_setting_disabled(
+    notify_api, user_research_email_for_new_users_template, notify_db_session, caplog, mocker
+):
+    mock_send_email = mocker.patch("app.celery.scheduled_tasks.send_notification_to_queue")
+
+    create_user(email="user1@gov.uk", take_part_in_research=True, created_at=datetime(2024, 7, 29, 12, 0))
+    create_user(email="user2@gov.uk", take_part_in_research=True, created_at=datetime(2024, 8, 1, 14))
+    create_user(email="user3@gov.uk", take_part_in_research=True, created_at=datetime(2024, 8, 4, 23, 59))
+    create_user(email="user4@gov.uk", take_part_in_research=True, created_at=datetime(2024, 8, 5))
+
+    with set_config(notify_api, "WEEKLY_USER_RESEARCH_EMAIL_ENABLED", False):
+        weekly_user_research_email()
+
+    assert "Skipping weekly user research email run in test" in caplog.messages
+    assert not mock_send_email.called
 
 
 class TestChangeDvlaPasswordTask:
@@ -1129,34 +1195,34 @@ class TestChangeDvlaApiKeyTask:
 
 class TestWeeklyDWPReport:
     @pytest.fixture(scope="function")
-    def mock_zendesk_update_ticket(self, mocker):
+    def mock_zendesk_update_ticket(self, notify_api, mocker):
         yield mocker.patch("app.celery.scheduled_tasks.zendesk_client.update_ticket")
 
     @pytest.fixture(scope="function")
-    def mock_prod_notify_api(self, mocker, notify_api):
-        with set_config(notify_api, "NOTIFY_ENVIRONMENT", "production"):
+    def mock_env_with_zendesk_alerts_enabled(self, notify_api, mocker):
+        with set_config(notify_api, "SEND_ZENDESK_ALERTS_ENABLED", True):
             yield notify_api
 
     @pytest.mark.parametrize(
-        "environment, should_run",
+        "environment, send_zendesk_alerts_enabled, should_run",
         (
-            ("test", True),
-            ("local", False),
-            ("preview", False),
-            ("staging", False),
-            ("production", True),
+            ("example-env-1", False, False),
+            ("example-env-2", True, True),
         ),
     )
-    def test_skips_non_prod_environments(
+    def test_skips_environments_with_zendesk_alerts_disabled(
         self,
         notify_api,
         notify_db_session,
         mock_zendesk_update_ticket,
         caplog,
         environment,
+        send_zendesk_alerts_enabled,
         should_run,
     ):
-        with set_config(notify_api, "NOTIFY_ENVIRONMENT", environment), caplog.at_level("INFO"):
+        with set_config_values(
+            notify_api, {"NOTIFY_ENVIRONMENT": environment, "SEND_ZENDESK_ALERTS_ENABLED": send_zendesk_alerts_enabled}
+        ):
             weekly_dwp_report()
 
         assert (f"Skipping DWP report run in {environment}" in caplog.messages) != should_run
@@ -1174,18 +1240,20 @@ class TestWeeklyDWPReport:
         ],
     )
     def test_requires_zendesk_reporting_config(
-        self, mock_prod_notify_api, notify_db_session, mock_zendesk_update_ticket, caplog, report_config
+        self, mock_env_with_zendesk_alerts_enabled, notify_db_session, mock_zendesk_update_ticket, caplog, report_config
     ):
-        with set_config(mock_prod_notify_api, "ZENDESK_REPORTING", report_config):
+        with set_config(mock_env_with_zendesk_alerts_enabled, "ZENDESK_REPORTING", report_config):
             weekly_dwp_report()
 
         assert "Skipping DWP report run - invalid configuration." in caplog.messages
         assert mock_zendesk_update_ticket.call_args_list == []
 
     @freeze_time("2022-01-01T09:00:00")
-    def test_successful_run(self, mocker, mock_prod_notify_api, notify_db_session, mock_zendesk_update_ticket):
+    def test_successful_run(
+        self, mock_env_with_zendesk_alerts_enabled, notify_db_session, mock_zendesk_update_ticket, mocker
+    ):
         with set_config(
-            mock_prod_notify_api,
+            mock_env_with_zendesk_alerts_enabled,
             "ZENDESK_REPORTING",
             {
                 "weekly-dwp-report": {

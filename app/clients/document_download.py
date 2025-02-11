@@ -1,5 +1,3 @@
-from typing import Optional
-
 import requests
 from flask import current_app, request
 from flask.ctx import has_request_context
@@ -18,10 +16,11 @@ class DocumentDownloadError(Exception):
 
 
 class DocumentDownloadClient:
-    def init_app(self, app):
+    def __init__(self, app):
         self.api_host_external = app.config["DOCUMENT_DOWNLOAD_API_HOST"]
         self.api_host_internal = app.config["DOCUMENT_DOWNLOAD_API_HOST_INTERNAL"]
         self.auth_token = app.config["DOCUMENT_DOWNLOAD_API_KEY"]
+        self.requests_session = requests.Session()
 
     def get_upload_url_for_simulated_email(self, service_id):
         """
@@ -41,9 +40,9 @@ class DocumentDownloadClient:
         service_id,
         file_contents,
         is_csv=None,
-        confirmation_email: Optional[str] = None,
-        retention_period: Optional[str] = None,
-        filename: Optional[str] = None,
+        confirmation_email: str | None = None,
+        retention_period: str | None = None,
+        filename: str | None = None,
     ):
         try:
             data = {
@@ -60,11 +59,11 @@ class DocumentDownloadClient:
             if filename:
                 data["filename"] = filename
 
-            headers = {"Authorization": "Bearer {}".format(self.auth_token)}
+            headers = {"Authorization": f"Bearer {self.auth_token}"}
             if has_request_context() and hasattr(request, "get_onwards_request_headers"):
                 headers.update(request.get_onwards_request_headers())
 
-            response = requests.post(
+            response = self.requests_session.post(
                 self._get_upload_url(service_id),
                 headers=headers,
                 json=data,

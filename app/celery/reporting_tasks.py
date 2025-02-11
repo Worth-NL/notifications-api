@@ -19,18 +19,28 @@ from app.dao.notifications_dao import get_service_ids_with_notifications_on_date
 
 @notify_celery.task(name="create-nightly-billing")
 @cronitor("create-nightly-billing")
-def create_nightly_billing(day_start=None):
-    # day_start is a datetime.date() object. e.g.
-    # up to 4 days of data counting back from day_start is consolidated
+def create_nightly_billing(
+    day_start=None,
+    n_days=10,
+    stagger_total_period_seconds=timedelta(minutes=5).seconds,
+):
+    # day_start is a datetime.date() object. i.e. up to n_days days of data counting
+    # back from day_start is consolidated
     if day_start is None:
         day_start = convert_utc_to_bst(datetime.utcnow()).date() - timedelta(days=1)
     else:
         # When calling the task its a string in the format of "YYYY-MM-DD"
         day_start = datetime.strptime(day_start, "%Y-%m-%d").date()
-    for i in range(0, 10):
+    for i in range(n_days):
         process_day = (day_start - timedelta(days=i)).isoformat()
 
-        create_or_update_ft_billing_for_day.apply_async(kwargs={"process_day": process_day}, queue=QueueNames.REPORTING)
+        create_or_update_ft_billing_for_day.apply_async(
+            kwargs={"process_day": process_day},
+            queue=QueueNames.REPORTING,
+            # starting all the spawned queries at the same time uses a lot of
+            # database resources
+            countdown=stagger_total_period_seconds * i / n_days,
+        )
         current_app.logger.info(
             "create-nightly-billing task: create-or-update-ft-billing-for-day task created for %s", process_day
         )
@@ -84,7 +94,7 @@ def create_or_update_ft_billing_letter_despatch_for_day(process_day: str):
     current_app.logger.info(
         "create-or-update-ft-billing-letter-despatch-for-day task for %(date)s: task complete. "
         "%(deleted)s old row(s) deleted, and %(created)s row(s) created.",
-        dict(date=process_date, deleted=deleted, created=created),
+        {"date": process_date, "deleted": deleted, "created": created},
     )
 
 
@@ -148,5 +158,5 @@ def create_nightly_notification_status_for_service_and_day(process_day, service_
             "create-nightly-notification-status-for-service-and-day task update for "
             "%(service_id)s, %(type)s for %(date)s: updated in %(duration)s seconds"
         ),
-        dict(service_id=service_id, type=notification_type, date=process_day, duration=(end - start).seconds),
+        {"service_id": service_id, "type": notification_type, "date": process_day, "duration": (end - start).seconds},
     )

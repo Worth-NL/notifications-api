@@ -5,12 +5,14 @@ from notifications_utils.clients.redis import (
     daily_limit_cache_key,
     rate_limit_cache_key,
 )
-from notifications_utils.postal_address import PostalAddress
-from notifications_utils.recipients import (
+from notifications_utils.recipient_validation.email_address import validate_and_format_email_address
+from notifications_utils.recipient_validation.errors import InvalidPhoneError
+from notifications_utils.recipient_validation.phone_number import (
+    PhoneNumber,
     get_international_phone_info,
-    validate_and_format_email_address,
     validate_and_format_phone_number,
 )
+from notifications_utils.recipient_validation.postal_address import PostalAddress
 from sqlalchemy.orm.exc import NoResultFound
 
 from app import redis_store
@@ -21,7 +23,7 @@ from app.constants import (
     KEY_TYPE_TEAM,
     KEY_TYPE_TEST,
     LETTER_TYPE,
-    PHONE_NUMBER_VALIDATION_ERROR_MAP,
+    SMS_TO_UK_LANDLINES,
     SMS_TYPE,
 )
 from app.dao.service_email_reply_to_dao import dao_get_reply_to_by_id
@@ -96,7 +98,7 @@ def check_rate_limiting(service, api_key, notification_type):
 
 def check_template_is_for_notification_type(notification_type, template_type):
     if notification_type != template_type:
-        message = "{0} template is not suitable for {1} notification".format(template_type, notification_type)
+        message = f"{template_type} template is not suitable for {notification_type} notification"
         raise BadRequestError(fields=[{"template": message}], message=message)
 
 
@@ -114,14 +116,10 @@ def service_can_send_to_recipient(send_to, key_type, service, allow_guest_list_r
         raise BadRequestError(message=message)
 
 
-def service_has_permission(notify_type, permissions):
-    return notify_type in permissions
-
-
-def check_service_has_permission(notify_type, permissions):
-    if not service_has_permission(notify_type, permissions):
+def check_service_has_permission(service, permission):
+    if not service.has_permission(permission):
         raise BadRequestError(
-            message="Service is not allowed to send {}".format(get_public_notify_type_text(notify_type, plural=True))
+            message=f"Service is not allowed to send {get_public_notify_type_text(permission, plural=True)}"
         )
 
 
@@ -140,7 +138,22 @@ def validate_and_format_recipient(send_to, key_type, service, notification_type,
     service_can_send_to_recipient(send_to, key_type, service, allow_guest_list_recipients)
 
     if notification_type == SMS_TYPE:
-        international_phone_info = check_if_service_can_send_to_number(service, send_to)
+        if service.has_permission(SMS_TO_UK_LANDLINES):
+            try:
+                phone_number = PhoneNumber(send_to)
+                phone_number.validate(
+                    allow_international_number=service.has_permission(INTERNATIONAL_SMS_TYPE),
+                    allow_uk_landline=service.has_permission(SMS_TO_UK_LANDLINES),
+                )
+                return phone_number.get_normalised_format()
+            except InvalidPhoneError as e:
+                if e.code == InvalidPhoneError.Codes.NOT_A_UK_MOBILE:
+                    raise BadRequestError(message="Cannot send to international mobile numbers") from e
+                else:
+                    raise
+
+        else:
+            international_phone_info = check_if_service_can_send_to_number(service, send_to)
 
         return validate_and_format_phone_number(number=send_to, international=international_phone_info.international)
     elif notification_type == EMAIL_TYPE:
@@ -157,8 +170,7 @@ def check_if_service_can_send_to_number(service, number):
 
     if (
         # if number is international and not a crown dependency
-        international_phone_info.international
-        and not international_phone_info.crown_dependency
+        international_phone_info.international and not international_phone_info.crown_dependency
     ) and INTERNATIONAL_SMS_TYPE not in permissions:
         raise BadRequestError(message="Cannot send to international mobile numbers")
     else:
@@ -226,9 +238,7 @@ def check_service_email_reply_to_id(service_id, reply_to_id, notification_type):
         try:
             return dao_get_reply_to_by_id(reply_to_id=reply_to_id, service_id=service_id).email_address
         except NoResultFound as e:
-            message = "email_reply_to_id {} does not exist in database for service id {}".format(
-                reply_to_id, service_id
-            )
+            message = f"email_reply_to_id {reply_to_id} does not exist in database for service id {service_id}"
             raise BadRequestError(message=message) from e
 
 
@@ -237,7 +247,7 @@ def check_service_sms_sender_id(service_id, sms_sender_id, notification_type):
         try:
             return dao_get_service_sms_senders_by_id(service_id, sms_sender_id).sms_sender
         except NoResultFound as e:
-            message = "sms_sender_id {} does not exist in database for service id {}".format(sms_sender_id, service_id)
+            message = f"sms_sender_id {sms_sender_id} does not exist in database for service id {service_id}"
             raise BadRequestError(message=message) from e
 
 
@@ -246,9 +256,7 @@ def check_service_letter_contact_id(service_id, letter_contact_id, notification_
         try:
             return dao_get_letter_contact_by_id(service_id, letter_contact_id).contact_block
         except NoResultFound as e:
-            message = "letter_contact_id {} does not exist in database for service id {}".format(
-                letter_contact_id, service_id
-            )
+            message = f"letter_contact_id {letter_contact_id} does not exist in database for service id {service_id}"
             raise BadRequestError(message=message) from e
 
 
@@ -271,6 +279,8 @@ def validate_address(service, letter_data):
         raise ValidationError(
             message="Address lines must not start with any of the following characters: @ ( ) = [ ] ” \\ / , < >"
         )
+    if address.has_no_fixed_abode_address:
+        raise ValidationError(message="Must be a real address")
     if address.international:
         return address.postage
     else:
@@ -282,7 +292,3 @@ def check_template_can_contain_documents(template_type, personalisation):
         isinstance(v, dict) and "file" in v for v in (personalisation or {}).values()
     ):
         raise BadRequestError(message="Can only send a file by email")
-
-
-def remap_phone_number_validation_messages(error_message):
-    return PHONE_NUMBER_VALIDATION_ERROR_MAP.get(error_message, error_message)

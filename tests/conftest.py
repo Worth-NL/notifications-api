@@ -8,7 +8,7 @@ import freezegun
 import pytest
 import sqlalchemy
 
-from app import create_app, db
+from app import create_app, db, reset_memos
 from app.authentication.auth import requires_admin_auth, requires_no_auth
 from app.dao.provider_details_dao import get_provider_details_by_identifier
 from app.notify_api_flask_app import NotifyApiFlaskApp
@@ -43,7 +43,7 @@ def notify_api():
             error_handlers[None] = {
                 exc_class: error_handler
                 for exc_class, error_handler in error_handlers[None].items()
-                if exc_class != Exception
+                if exc_class is not Exception
             }
             if error_handlers[None] == []:
                 error_handlers.pop(None)
@@ -54,6 +54,7 @@ def notify_api():
     yield app
 
     ctx.pop()
+    reset_memos()
 
 
 @pytest.fixture(scope="function")
@@ -71,7 +72,7 @@ def create_test_db(database_uri):
         postgres_db_uri, echo=False, isolation_level="AUTOCOMMIT", client_encoding="utf8"
     )
     try:
-        result = postgres_db.execute(sqlalchemy.sql.text("CREATE DATABASE {}".format(db_uri_parts[-1])))
+        result = postgres_db.execute(sqlalchemy.sql.text(f"CREATE DATABASE {db_uri_parts[-1]}"))
         result.close()
     except sqlalchemy.exc.ProgrammingError:
         # database "test_notification_api_master" already exists
@@ -80,7 +81,7 @@ def create_test_db(database_uri):
         postgres_db.dispose()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="session", autouse=True)
 def _notify_db(notify_api, worker_id):
     """
     Manages the connection to the database. Generally this shouldn't be used, instead you should use the
@@ -95,20 +96,30 @@ def _notify_db(notify_api, worker_id):
     # create a database for this worker thread -
     current_app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
 
+    # get rid of the old SQLAlchemy instance because we can’t have multiple on the same app
+    notify_api.extensions.pop("sqlalchemy")
+
     # reinitalise the db so it picks up on the new test database name
     db.init_app(notify_api)
     create_test_db(current_app.config["SQLALCHEMY_DATABASE_URI"])
 
     # Run this in a subprocess - alembic loads a lot of logging config that will otherwise splatter over our desired
     # app logging config and breaks pytest.caplog.
-    subprocess.run(
+    result = subprocess.run(
         ["flask", "db", "upgrade"],
         env={
             **os.environ,
             "SQLALCHEMY_DATABASE_URI": current_app.config["SQLALCHEMY_DATABASE_URI"],
             "FLASK_APP": "application:application",
         },
+        capture_output=True,
     )
+    assert result.returncode == 0, result.stderr.decode()
+
+    # now db is initialised, run cleanup on it to remove any artifacts from migrations (such as the notify service and
+    # templates). Otherwise the very first test executed by a worker will be running on a different db setup to
+    # other tests that run later.
+    _clean_database(db)
 
     with notify_api.app_context():
         yield db
@@ -138,8 +149,12 @@ def notify_db_session(_notify_db, sms_providers):
     """
     yield _notify_db.session
 
-    _notify_db.session.remove()
-    for tbl in reversed(_notify_db.metadata.sorted_tables):
+    _clean_database(_notify_db)
+
+
+def _clean_database(_db):
+    _db.session.remove()
+    for tbl in reversed(_db.metadata.sorted_tables):
         if tbl.name not in [
             "provider_details",
             "key_types",
@@ -159,8 +174,30 @@ def notify_db_session(_notify_db, sms_providers):
             "broadcast_provider_types",
             "default_annual_allowance",
         ]:
-            _notify_db.engine.execute(tbl.delete())
-    _notify_db.session.commit()
+            _db.engine.execute(tbl.delete())
+    _db.session.commit()
+
+
+# based on https://github.com/sqlalchemy/sqlalchemy/issues/5709#issuecomment-729689097
+@pytest.fixture(scope="function")
+def notify_db_session_log(notify_db_session):
+    queries = []
+
+    def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        queries.append(
+            (
+                statement,
+                parameters,
+                context,
+                executemany,
+            )
+        )
+
+    sqlalchemy.event.listen(sqlalchemy.engine.Engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        yield queries
+    finally:
+        sqlalchemy.event.remove(sqlalchemy.engine.Engine, "before_cursor_execute", before_cursor_execute)
 
 
 @pytest.fixture
@@ -234,4 +271,4 @@ class Matcher:
         return self.key(other)
 
     def __repr__(self):
-        return "<Matcher: {}>".format(self.description)
+        return f"<Matcher: {self.description}>"

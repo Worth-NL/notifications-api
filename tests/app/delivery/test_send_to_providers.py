@@ -2,11 +2,12 @@ import json
 import uuid
 from collections import namedtuple
 from datetime import datetime, timedelta
-from unittest.mock import ANY
+from unittest.mock import ANY, call
 
 import pytest
 from flask import current_app
-from notifications_utils.recipients import validate_and_format_phone_number
+from freezegun import freeze_time
+from notifications_utils.recipient_validation.phone_number import validate_and_format_phone_number
 from requests import HTTPError
 
 import app
@@ -18,6 +19,8 @@ from app.constants import (
     KEY_TYPE_NORMAL,
     KEY_TYPE_TEAM,
     KEY_TYPE_TEST,
+    SMS_PROVIDER_ERROR_INTERVAL,
+    SMS_PROVIDER_ERROR_THRESHOLD,
 )
 from app.dao import notifications_dao
 from app.dao.provider_details_dao import get_provider_details_by_identifier
@@ -129,7 +132,7 @@ def test_should_send_personalised_template_to_correct_sms_provider_and_persist(s
 
     mmg_client.send_sms.assert_called_once_with(
         to="447234123123",
-        content="Sample service: Hello Jo\nHere is <em>some HTML</em> & entities",
+        content="Hello Jo\nHere is <em>some HTML</em> & entities",
         reference=str(db_notification.id),
         sender=current_app.config["FROM_NUMBER"],
         international=False,
@@ -159,11 +162,12 @@ def test_should_send_personalised_template_to_correct_email_provider_and_persist
     send_to_providers.send_email_to_provider(db_notification)
 
     app.aws_ses_client.send_email.assert_called_once_with(
-        '"Sample service" <sample.service@test.notify.com>',
-        "jo.smith@example.com",
-        "Jo <em>some HTML</em>",
+        from_address='"Sample service" <sample.service@test.notify.com>',
+        to_address="jo.smith@example.com",
+        subject="Jo <em>some HTML</em>",
         body="Hello Jo\nThis is an email from GOV.\u200bUK with <em>some HTML</em>\n",
         html_body=ANY,
+        headers=[],
         reply_to_address=None,
     )
 
@@ -250,9 +254,7 @@ def test_send_sms_should_use_template_version_from_notification_not_latest(sampl
     assert not persisted_notification.personalisation
 
 
-def test_should_call_send_sms_response_task_if_test_api_key(
-    notify_db_session, sample_service, sample_notification, mocker
-):
+def test_should_call_send_sms_response_task_if_test_api_key(notify_db_session, sample_notification, mocker):
     mocker.patch("app.mmg_client.send_sms")
     mocker.patch("app.delivery.send_to_providers.send_sms_response")
 
@@ -332,7 +334,7 @@ def test_send_sms_should_use_service_sms_sender(sample_service, sample_template,
     )
 
 
-def test_send_email_to_provider_should_call_response_task_if_test_key(sample_service, sample_email_template, mocker):
+def test_send_email_to_provider_should_call_response_task_if_test_key(sample_email_template, mocker):
     notification = create_notification(
         template=sample_email_template, to_field="john@smith.com", key_type=KEY_TYPE_TEST, billable_units=0
     )
@@ -378,7 +380,13 @@ def test_send_email_should_use_service_reply_to_email(sample_service, sample_ema
     )
 
     app.aws_ses_client.send_email.assert_called_once_with(
-        ANY, ANY, ANY, body=ANY, html_body=ANY, reply_to_address="foo@bar.com"
+        from_address=ANY,
+        to_address=ANY,
+        subject=ANY,
+        body=ANY,
+        html_body=ANY,
+        headers=[],
+        reply_to_address="foo@bar.com",
     )
 
 
@@ -394,7 +402,13 @@ def test_send_email_works_with_and_without_email_branding(request, service_fixtu
     )
 
     app.aws_ses_client.send_email.assert_called_once_with(
-        ANY, ANY, ANY, body=ANY, html_body=ANY, reply_to_address="foo@bar.com"
+        from_address=ANY,
+        to_address=ANY,
+        subject=ANY,
+        body=ANY,
+        html_body=ANY,
+        headers=[],
+        reply_to_address="foo@bar.com",
     )
 
 
@@ -559,12 +573,34 @@ def test_should_update_billable_units_and_status_according_to_and_key_type(
     assert notification.status == expected_status
 
 
-def test_should_set_notification_billable_units_and_reduces_provider_priority_if_sending_to_provider_fails(
+@freeze_time("2034-03-26 23:01")
+def test_should_set_notification_billable_units_if_sending_to_provider_fails_and_error_rate_limit_not_exceeded(
     sample_notification,
     mocker,
 ):
     mocker.patch("app.mmg_client.send_sms", side_effect=Exception())
     mock_reduce = mocker.patch("app.delivery.send_to_providers.dao_reduce_sms_provider_priority")
+    mock_redis = mocker.patch("app.delivery.send_to_providers.redis_store.exceeded_rate_limit", return_value=False)
+
+    sample_notification.billable_units = 0
+    assert sample_notification.sent_by is None
+
+    with pytest.raises(Exception):  # noqa
+        send_to_providers.send_sms_to_provider(sample_notification)
+
+    assert sample_notification.billable_units == 1
+    assert not mock_reduce.called
+    mock_redis.assert_called_once_with("mmg-error-rate", SMS_PROVIDER_ERROR_THRESHOLD, SMS_PROVIDER_ERROR_INTERVAL)
+
+
+@freeze_time("2034-03-26 23:01")
+def test_should_set_notification_billable_units_and_reduce_provider_priority_if_sending_fails_and_error_limit_exceeded(
+    sample_notification,
+    mocker,
+):
+    mocker.patch("app.mmg_client.send_sms", side_effect=Exception())
+    mock_reduce = mocker.patch("app.delivery.send_to_providers.dao_reduce_sms_provider_priority")
+    mock_redis = mocker.patch("app.delivery.send_to_providers.redis_store.exceeded_rate_limit", return_value=True)
 
     sample_notification.billable_units = 0
     assert sample_notification.sent_by is None
@@ -574,9 +610,10 @@ def test_should_set_notification_billable_units_and_reduces_provider_priority_if
 
     assert sample_notification.billable_units == 1
     mock_reduce.assert_called_once_with("mmg", time_threshold=timedelta(minutes=1))
+    mock_redis.assert_called_once_with("mmg-error-rate", SMS_PROVIDER_ERROR_THRESHOLD, SMS_PROVIDER_ERROR_INTERVAL)
 
 
-def test_should_send_sms_to_international_providers(sample_template, sample_user, mocker):
+def test_should_send_sms_to_international_providers(sample_template, mocker):
     mocker.patch("app.mmg_client.send_sms")
     mocker.patch("app.firetext_client.send_sms")
 
@@ -608,7 +645,7 @@ def test_should_send_sms_to_international_providers(sample_template, sample_user
     assert notification_international.sent_by == "mmg"
 
 
-def test_should_send_non_international_sms_to_default_provider(sample_template, sample_user, mocker):
+def test_should_send_non_international_sms_to_default_provider(sample_template, mocker):
     mocker.patch("app.mmg_client.send_sms")
     mocker.patch("app.firetext_client.send_sms")
 
@@ -677,7 +714,13 @@ def test_send_email_to_provider_uses_reply_to_from_notification(sample_email_tem
     )
 
     app.aws_ses_client.send_email.assert_called_once_with(
-        ANY, ANY, ANY, body=ANY, html_body=ANY, reply_to_address="test@test.com"
+        from_address=ANY,
+        to_address=ANY,
+        subject=ANY,
+        body=ANY,
+        html_body=ANY,
+        headers=[],
+        reply_to_address="test@test.com",
     )
 
 
@@ -688,11 +731,12 @@ def test_send_email_to_provider_uses_custom_email_sender_name_if_set(sample_emai
     send_to_providers.send_email_to_provider(sample_email_notification)
 
     app.aws_ses_client.send_email.assert_called_once_with(
-        '"Custom Sender Name" <custom.sender.name@test.notify.com>',
-        ANY,
-        ANY,
+        from_address='"Custom Sender Name" <custom.sender.name@test.notify.com>',
+        to_address=ANY,
+        subject=ANY,
         body=ANY,
         html_body=ANY,
+        headers=[],
         reply_to_address=ANY,
     )
 
@@ -718,7 +762,13 @@ def test_send_email_to_provider_should_user_normalised_to(mocker, client, sample
 
     send_to_providers.send_email_to_provider(notification)
     send_mock.assert_called_once_with(
-        ANY, notification.normalised_to, ANY, body=ANY, html_body=ANY, reply_to_address=notification.reply_to_text
+        from_address=ANY,
+        to_address=notification.normalised_to,
+        subject=ANY,
+        body=ANY,
+        html_body=ANY,
+        headers=[],
+        reply_to_address=notification.reply_to_text,
     )
 
 
@@ -776,7 +826,13 @@ def test_send_email_to_provider_should_return_template_if_found_in_redis(mocker,
     assert mock_get_template.called is False
     assert mock_get_service.called is False
     send_mock.assert_called_once_with(
-        ANY, notification.normalised_to, ANY, body=ANY, html_body=ANY, reply_to_address=notification.reply_to_text
+        from_address=ANY,
+        to_address=notification.normalised_to,
+        subject=ANY,
+        body=ANY,
+        html_body=ANY,
+        headers=[],
+        reply_to_address=notification.reply_to_text,
     )
 
 
@@ -809,3 +865,84 @@ def test_get_html_email_options_add_email_branding_from_service(sample_service):
         "brand_text": branding.text,
         "brand_alt_text": branding.alt_text,
     }
+
+
+@pytest.mark.parametrize(
+    "template_has_unsubscribe_link, expected_link_in_email_body",
+    (
+        (True, "https://www.notify.example.com"),
+        (False, None),
+    ),
+)
+def test_send_email_to_provider_sends_unsubscribe_link(
+    sample_service,
+    mocker,
+    template_has_unsubscribe_link,
+    expected_link_in_email_body,
+):
+    mocker.patch("app.aws_ses_client.send_email", return_value="reference")
+    mock_html_email = mocker.patch("app.delivery.send_to_providers.HTMLEmailTemplate")
+    mock_plain_text_email = mocker.patch("app.delivery.send_to_providers.PlainTextEmailTemplate")
+    mocker.patch(
+        "app.models.url_with_token",
+        return_value="https://www.notify.example.com",
+    )
+
+    template = create_template(
+        service=sample_service,
+        template_type="email",
+        has_unsubscribe_link=template_has_unsubscribe_link,
+    )
+
+    db_notification = create_notification(template=template, unsubscribe_link="https://example.com")
+
+    expected_headers = [
+        {"Name": "List-Unsubscribe", "Value": "<https://example.com>"},
+        {"Name": "List-Unsubscribe-Post", "Value": "List-Unsubscribe=One-Click"},
+    ]
+
+    send_to_providers.send_email_to_provider(
+        db_notification,
+    )
+    app.aws_ses_client.send_email.assert_called_once()
+    assert app.aws_ses_client.send_email.call_args[1]["headers"] == expected_headers
+
+    assert mock_html_email.call_args[1]["unsubscribe_link"] == expected_link_in_email_body
+    assert mock_plain_text_email.call_args[1]["unsubscribe_link"] == expected_link_in_email_body
+
+
+def test_send_email_to_provider_sends_unsubscribe_link_if_template_is_unsubscribable(sample_service, mocker):
+    mocker.patch("app.aws_ses_client.send_email", return_value="reference")
+    mock_url_with_token = mocker.patch(
+        "app.models.url_with_token",
+        side_effect=[
+            "https://www.notify.example.com",
+            "https://api.notify.example.com",
+        ],
+    )
+    mock_html_email = mocker.patch("app.delivery.send_to_providers.HTMLEmailTemplate")
+    mock_plain_text_email = mocker.patch("app.delivery.send_to_providers.PlainTextEmailTemplate")
+
+    template = create_template(
+        service=sample_service,
+        template_type="email",
+        has_unsubscribe_link=True,
+    )
+
+    db_notification = create_notification(template=template)
+
+    send_to_providers.send_email_to_provider(db_notification)
+    app.aws_ses_client.send_email.assert_called_once()
+
+    assert mock_url_with_token.call_args_list == [
+        call("test@example.com", url=f"/unsubscribe/{db_notification.id}/", base_url="http://localhost:6012"),
+        call("test@example.com", url=f"/unsubscribe/{db_notification.id}/", base_url="http://localhost:6011"),
+    ]
+
+    assert app.aws_ses_client.send_email.call_args[1]["headers"] == [
+        {"Name": "List-Unsubscribe", "Value": "<https://api.notify.example.com>"},
+        {"Name": "List-Unsubscribe-Post", "Value": "List-Unsubscribe=One-Click"},
+    ]
+
+    assert mock_html_email.call_args[1]["unsubscribe_link"] == "https://www.notify.example.com"
+    assert mock_plain_text_email.call_args[1]["unsubscribe_link"] == "https://www.notify.example.com"

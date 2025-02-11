@@ -4,6 +4,8 @@ from unittest.mock import ANY
 import pytest
 from flask import json
 
+from app.celery.letters_pdf_tasks import get_pdf_for_templated_letter
+from app.celery.research_mode_tasks import create_fake_letter_callback
 from app.config import QueueNames
 from app.constants import (
     EMAIL_TYPE,
@@ -60,11 +62,11 @@ def test_post_letter_notification_returns_201(api_client_request, sample_letter_
     assert resp_json["reference"] == reference
     assert resp_json["content"]["subject"] == sample_letter_template.subject
     assert resp_json["content"]["body"] == sample_letter_template.content
-    assert "v2/notifications/{}".format(notification.id) in resp_json["uri"]
+    assert f"v2/notifications/{notification.id}" in resp_json["uri"]
     assert resp_json["template"]["id"] == str(sample_letter_template.id)
     assert resp_json["template"]["version"] == sample_letter_template.version
     assert (
-        "services/{}/templates/{}".format(sample_letter_template.service_id, sample_letter_template.id)
+        f"services/{sample_letter_template.service_id}/templates/{sample_letter_template.id}"
         in resp_json["template"]["uri"]
     )
     assert not resp_json["scheduled_for"]
@@ -146,7 +148,7 @@ def test_post_letter_notification_stores_country(api_client_request, notify_db_s
     assert notification.personalisation["address_line_2"] == "Kronprinzenpalais"
     assert notification.personalisation["address_line_5"] == "   deutschland   "
     # In the to field we store the whole address with the canonical country
-    assert notification.to == ("Kaiser Wilhelm II\n" "Kronprinzenpalais\n" "Germany")
+    assert notification.to == ("Kaiser Wilhelm II\nKronprinzenpalais\nGermany")
     assert notification.postage == "europe"
     assert notification.international
 
@@ -209,6 +211,16 @@ def test_post_letter_notification_international_sets_rest_of_world(api_client_re
             },
             "Last line of address must be a real UK postcode or another country",
         ),
+        (
+            [LETTER_TYPE],
+            {
+                "address_line_1": "No fixed abode",
+                "address_line_2": "Buckingham Palace",
+                "postcode": "SW1A 1AA",
+                "name": "Unknown",
+            },
+            "Must be a real address",
+        ),
     ),
 )
 def test_post_letter_notification_throws_error_for_bad_address(
@@ -227,9 +239,8 @@ def test_post_letter_notification_throws_error_for_bad_address(
     assert error_json["errors"] == [{"error": "ValidationError", "message": expected_error}]
 
 
-@pytest.mark.parametrize("env", ["staging", "production"])
 def test_post_letter_notification_with_test_key_creates_pdf_and_sets_status_to_delivered(
-    notify_api, api_client_request, sample_letter_template, mocker, env
+    notify_api, api_client_request, sample_letter_template, mock_celery_task
 ):
     data = {
         "template_id": str(sample_letter_template.id),
@@ -243,12 +254,10 @@ def test_post_letter_notification_with_test_key_creates_pdf_and_sets_status_to_d
         "reference": "foo",
     }
 
-    fake_create_letter_task = mocker.patch("app.celery.letters_pdf_tasks.get_pdf_for_templated_letter.apply_async")
-    fake_create_dvla_response_task = mocker.patch(
-        "app.celery.research_mode_tasks.create_fake_letter_response_file.apply_async"
-    )
+    fake_create_letter_task = mock_celery_task(get_pdf_for_templated_letter)
+    fake_create_dvla_response_task = mock_celery_task(create_fake_letter_callback)
 
-    with set_config_values(notify_api, {"NOTIFY_ENVIRONMENT": env}):
+    with set_config_values(notify_api, {"SEND_LETTERS_ENABLED": True}):
         api_client_request.post(
             sample_letter_template.service_id,
             "v2_notifications.post_notification",
@@ -265,15 +274,8 @@ def test_post_letter_notification_with_test_key_creates_pdf_and_sets_status_to_d
     assert notification.updated_at is not None
 
 
-@pytest.mark.parametrize(
-    "env",
-    [
-        "development",
-        "preview",
-    ],
-)
 def test_post_letter_notification_with_test_key_creates_pdf_and_sets_status_to_sending_and_sends_fake_response_file(
-    notify_api, api_client_request, sample_letter_template, mocker, env
+    notify_api, api_client_request, sample_letter_template, mock_celery_task
 ):
     data = {
         "template_id": str(sample_letter_template.id),
@@ -287,11 +289,9 @@ def test_post_letter_notification_with_test_key_creates_pdf_and_sets_status_to_s
         "reference": "foo",
     }
 
-    fake_create_letter_task = mocker.patch("app.celery.letters_pdf_tasks.get_pdf_for_templated_letter.apply_async")
-    fake_create_dvla_response_task = mocker.patch(
-        "app.celery.research_mode_tasks.create_fake_letter_response_file.apply_async"
-    )
-    with set_config_values(notify_api, {"NOTIFY_ENVIRONMENT": env}):
+    fake_create_letter_task = mock_celery_task(get_pdf_for_templated_letter)
+    fake_create_dvla_response_task = mock_celery_task(create_fake_letter_callback)
+    with set_config_values(notify_api, {"SEND_LETTERS_ENABLED": False}):
         api_client_request.post(
             sample_letter_template.service_id,
             "v2_notifications.post_notification",
@@ -339,8 +339,8 @@ def test_post_letter_notification_returns_400_for_empty_personalisation(
     )
 
     assert error_json["status_code"] == 400
-    assert all([e["error"] == "ValidationError" for e in error_json["errors"]])
-    assert set([e["message"] for e in error_json["errors"]]) == {
+    assert all(e["error"] == "ValidationError" for e in error_json["errors"])
+    assert {e["message"] for e in error_json["errors"]} == {
         "Address must be at least 3 lines",
     }
 
@@ -676,13 +676,13 @@ def test_post_precompiled_letter_notification_if_s3_upload_fails_notification_is
     assert Notification.query.count() == 0
 
 
-def test_post_letter_notification_throws_error_for_invalid_postage(api_client_request, mocker):
+def test_post_letter_notification_throws_error_for_invalid_postage(api_client_request):
     sample_service = create_service(service_permissions=["letter"])
-    data = {"reference": "letter-reference", "content": "bGV0dGVyLWNvbnRlbnQ=", "postage": "space unicorn"}
+    data = {"reference": "letter-reference", "content": "bGV0dGVyLWNvbnRlbnQ=", "postage": "europe"}
     resp_json = api_client_request.post(
         sample_service.id, "v2_notifications.post_precompiled_letter_notification", _data=data, _expected_status=400
     )
-    assert resp_json["errors"][0]["message"] == "postage invalid. It must be first, second, europe or rest-of-world."
+    assert resp_json["errors"][0]["message"] == "postage invalid. It must be either first or second."
 
     assert not Notification.query.first()
 

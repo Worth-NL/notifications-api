@@ -4,10 +4,13 @@ from itertools import product
 from freezegun import freeze_time
 
 from app import db
+from app.constants import KEY_TYPE_NORMAL
+from app.dao.inbound_numbers_dao import dao_get_inbound_number_for_service
 from app.dao.inbound_sms_dao import (
     dao_count_inbound_sms_for_service,
     dao_get_inbound_sms_by_id,
     dao_get_inbound_sms_for_service,
+    dao_get_most_recent_inbound_usage_date,
     dao_get_paginated_inbound_sms_for_service_for_public_api,
     dao_get_paginated_most_recent_inbound_sms_by_user_number_for_service,
     delete_inbound_sms_older_than_retention,
@@ -15,8 +18,11 @@ from app.dao.inbound_sms_dao import (
 from app.models import InboundSmsHistory
 from tests.app.db import (
     create_inbound_sms,
+    create_job,
+    create_notification,
     create_service,
     create_service_data_retention,
+    create_template,
 )
 from tests.conftest import set_config
 
@@ -299,7 +305,7 @@ def test_most_recent_inbound_sms_only_returns_most_recent_for_each_number(notify
         with freeze_time("2017-01-02"):
             res = dao_get_paginated_most_recent_inbound_sms_by_user_number_for_service(
                 sample_service.id, limit_days=7, page=1
-            )  # noqa
+            )
 
     assert len(res.items) == 2
     assert res.has_next is False
@@ -323,7 +329,7 @@ def test_most_recent_inbound_sms_paginates_properly(notify_api, sample_service):
             # first page has most recent 444 and 333
             res = dao_get_paginated_most_recent_inbound_sms_by_user_number_for_service(
                 sample_service.id, limit_days=7, page=1
-            )  # noqa
+            )
             assert len(res.items) == 2
             assert res.has_next is True
             assert res.per_page == 2
@@ -333,7 +339,7 @@ def test_most_recent_inbound_sms_paginates_properly(notify_api, sample_service):
             # second page has no 444 or 333 - just most recent 222 and 111
             res = dao_get_paginated_most_recent_inbound_sms_by_user_number_for_service(
                 sample_service.id, limit_days=7, page=2
-            )  # noqa
+            )
             assert len(res.items) == 2
             assert res.has_next is False
             assert res.items[0].content == "222 2"
@@ -349,7 +355,58 @@ def test_most_recent_inbound_sms_only_returns_values_within_7_days(sample_servic
     with freeze_time("Monday 10th April 2017 12:00:00"):
         res = dao_get_paginated_most_recent_inbound_sms_by_user_number_for_service(
             sample_service.id, limit_days=7, page=1
-        )  # noqa
+        )
 
     assert len(res.items) == 1
     assert res.items[0].content == "new"
+
+
+def test_dao_get_most_recent_inbound_usage_date_notifications_table(sample_service, sample_inbound_numbers):
+    template = create_template(service=sample_service)
+    job = create_job(template=template)
+    inbound = dao_get_inbound_number_for_service(sample_service.id)
+
+    notification_time = datetime.utcnow()
+
+    create_notification(
+        template=template,
+        job=job,
+        job_row_number=None,
+        to_field=None,
+        status="created",
+        reference=None,
+        created_at=notification_time,
+        sent_at=None,
+        billable_units=1,
+        personalisation=None,
+        api_key=None,
+        key_type=KEY_TYPE_NORMAL,
+        reply_to_text=inbound.number,
+    )
+
+    most_recent_date = dao_get_most_recent_inbound_usage_date(sample_service.id, inbound)
+    assert most_recent_date == notification_time
+
+
+def test_dao_get_most_recent_inbound_usage_date_inbound_sms_table(sample_service, sample_inbound_numbers):
+    sms_time = datetime.utcnow()
+    create_inbound_sms(sample_service, created_at=sms_time)
+    inbound = dao_get_inbound_number_for_service(sample_service.id)
+
+    most_recent_date = dao_get_most_recent_inbound_usage_date(sample_service.id, inbound)
+    assert most_recent_date == sms_time
+
+
+def test_dao_get_most_recent_inbound_usage_date_inbound_sms_history_table(
+    sample_service, sample_inbound_numbers, sample_inbound_sms_history
+):
+    inbound = next((x for x in sample_inbound_numbers if x.service_id == sample_service.id), None)
+    most_recent_date = dao_get_most_recent_inbound_usage_date(sample_service.id, inbound)
+
+    assert most_recent_date is not None
+    assert most_recent_date.date() == sample_inbound_sms_history.created_at.date()
+
+
+def test_dao_get_most_recent_inbound_usage_date_no_recent_notifications(sample_service, sample_inbound_numbers):
+    inbound = next((x for x in sample_inbound_numbers if x.service_id == sample_service.id), None)
+    assert dao_get_most_recent_inbound_usage_date(sample_service.id, inbound) is None

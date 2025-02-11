@@ -326,7 +326,7 @@ def test_update_organisation_updates_services_with_new_crown_type(sample_service
     assert not Service.query.get(sample_service.id).crown
 
 
-@freeze_time("2022-05-17 11:09")
+@freeze_time("2022-05-17 11:09:16")
 def test_dao_archive_organisation(sample_organisation, fake_uuid):
     email_branding = create_email_branding(id=fake_uuid)
     letter_branding = create_letter_branding()
@@ -346,7 +346,7 @@ def test_dao_archive_organisation(sample_organisation, fake_uuid):
     assert not sample_organisation.letter_branding
     assert not sample_organisation.domains
     assert sample_organisation.active is False
-    assert sample_organisation.name == f"_archived_2022-05-17_{org_name}"
+    assert sample_organisation.name == f"_archived_2022-05-17-11:09:16_{org_name}"
 
 
 def test_add_service_to_organisation(sample_service, sample_organisation):
@@ -472,7 +472,7 @@ def test_get_organisation_by_email_address(domain, expected_org, notify_db_sessi
     create_domain("cabinet-office.gov.uk", another_org.id)
     create_domain("cabinetoffice.gov.uk", another_org.id)
 
-    found_org = dao_get_organisation_by_email_address("test@{}".format(domain))
+    found_org = dao_get_organisation_by_email_address(f"test@{domain}")
 
     if expected_org:
         assert found_org is org

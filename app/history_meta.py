@@ -14,7 +14,9 @@ Lastly when to create a version is done manually in dao_utils version decorator 
 session events.
 
 """
+
 import datetime
+import uuid
 
 from sqlalchemy import Column, Integer, Table, util
 from sqlalchemy.ext.declarative import declared_attr
@@ -33,7 +35,7 @@ def _is_versioning_col(col):
     return "version_meta" in col.info
 
 
-def _history_mapper(local_mapper):  # noqa (C901 too complex)
+def _history_mapper(local_mapper):
     cls = local_mapper.class_
 
     # set the "active_history" flag
@@ -85,7 +87,7 @@ def _history_mapper(local_mapper):  # noqa (C901 too complex)
     local_mapper.add_property("version", local_mapper.local_table.c.version)
 
 
-class Versioned(object):
+class Versioned:
     @declared_attr
     def __mapper_cls__(cls):
         def map(cls, *arg, **kw):
@@ -115,6 +117,10 @@ def create_history(obj, history_cls=None):
         # be in the dict.  force it them load no matter what by using getattr().
         if prop.key not in obj_state.dict:
             getattr(obj, prop.key)
+
+        # Ensure the object has an ID before creating the corresponding history object
+        if prop.key == "id" and obj.id is None:
+            obj.id = uuid.uuid4()
 
         # if prop is a normal col just set it on history model
         if isinstance(prop, ColumnProperty):

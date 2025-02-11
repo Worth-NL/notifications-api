@@ -1,4 +1,5 @@
 import itertools
+import uuid
 from datetime import datetime
 
 from flask import Blueprint, current_app, jsonify, request
@@ -19,8 +20,10 @@ from app.constants import (
     LETTER_TYPE,
     MOBILE_TYPE,
     NOTIFICATION_CANCELLED,
+    NOTIFICATION_TYPES,
+    SERVICE_JOIN_REQUEST_APPROVED,
 )
-from app.dao import fact_notification_status_dao, notifications_dao
+from app.dao import fact_billing_dao, fact_notification_status_dao, notifications_dao
 from app.dao.annual_billing_dao import set_default_free_allowance_for_service
 from app.dao.api_key_dao import (
     expire_api_key,
@@ -42,7 +45,6 @@ from app.dao.returned_letters_dao import (
     fetch_most_recent_returned_letter,
     fetch_recent_returned_letter_count,
     fetch_returned_letter_summary,
-    fetch_returned_letters,
 )
 from app.dao.service_contact_list_dao import (
     dao_archive_contact_list,
@@ -68,6 +70,12 @@ from app.dao.service_guest_list_dao import (
     dao_add_and_commit_guest_list_contacts,
     dao_fetch_service_guest_list,
     dao_remove_service_guest_list,
+)
+from app.dao.service_join_requests_dao import (
+    dao_cancel_pending_service_join_requests,
+    dao_create_service_join_request,
+    dao_get_service_join_request_by_id,
+    dao_update_service_join_request,
 )
 from app.dao.service_letter_contact_dao import (
     add_letter_contact_for_service,
@@ -98,8 +106,18 @@ from app.dao.services_dao import (
     get_services_by_partial_name,
 )
 from app.dao.templates_dao import dao_get_template_by_id
-from app.dao.users_dao import get_user_by_id
+from app.dao.unsubscribe_request_dao import (
+    assign_unbatched_unsubscribe_requests_to_report_dao,
+    create_unsubscribe_request_reports_dao,
+    get_latest_unsubscribe_request_date_dao,
+    get_unsubscribe_request_report_by_id_dao,
+    get_unsubscribe_requests_data_for_download_dao,
+    get_unsubscribe_requests_statistics_dao,
+    update_unsubscribe_request_report_processed_by_date_dao,
+)
+from app.dao.users_dao import get_user_by_id, save_user_attribute
 from app.errors import InvalidRequest, register_errors
+from app.letters.rest import fetch_returned_letter_data
 from app.letters.utils import adjust_daily_service_limits_for_cancelled_letters, letter_print_day
 from app.models import (
     EmailBranding,
@@ -107,11 +125,14 @@ from app.models import (
     Permission,
     Service,
     ServiceContactList,
+    Template,
+    UnsubscribeRequestReport,
 )
 from app.notifications.process_notifications import (
     persist_notification,
     send_notification_to_queue,
 )
+from app.one_click_unsubscribe.rest import create_unsubscribe_request_reports_summary
 from app.schema_validation import validate
 from app.schemas import (
     api_key_schema,
@@ -135,6 +156,7 @@ from app.service.service_data_retention_schema import (
     add_service_data_retention_request,
     update_service_data_retention_request,
 )
+from app.service.service_join_request_schema import service_join_request_schema, service_join_request_update_schema
 from app.service.service_senders_schema import (
     add_service_email_reply_to_request,
     add_service_letter_contact_block_request,
@@ -147,7 +169,9 @@ from app.utils import (
     DATETIME_FORMAT_NO_TIMEZONE,
     get_prev_next_pagination_links,
     midnight_n_days_ago,
+    utc_string_to_bst_string,
 )
+from app.v2.errors import ValidationError
 
 service_blueprint = Blueprint("service", __name__)
 
@@ -160,7 +184,7 @@ def handle_integrity_error(exc):
     Handle integrity errors caused by the unique constraint on ix_organisation_name
     """
     if any(
-        'duplicate key value violates unique constraint "{}"'.format(constraint) in str(exc)
+        f'duplicate key value violates unique constraint "{constraint}"' in str(exc)
         for constraint in {"services_name_key", "services_normalised_service_name_key"}
     ):
         duplicate_name = exc.params.get("name") or exc.params.get("normalised_service_name")
@@ -250,7 +274,6 @@ def create_service():
     if not data.get("user_id"):
         errors = {"user_id": ["Missing data for required field."]}
         raise InvalidRequest(errors, status_code=400)
-    data.pop("service_domain", None)
 
     # validate json with marshmallow
     service_schema.load(data)
@@ -294,9 +317,6 @@ def update_service(service_id):
             template_id=current_app.config["SERVICE_NOW_LIVE_TEMPLATE_ID"],
             personalisation={
                 "service_name": current_data["name"],
-                "email_message_limit": current_data["email_message_limit"],
-                "sms_message_limit": current_data["sms_message_limit"],
-                "letter_message_limit": current_data["letter_message_limit"],
             },
             include_user_fields=["name"],
         )
@@ -331,7 +351,7 @@ def get_api_keys(service_id, key_id=None):
         else:
             api_keys = get_model_api_keys(service_id=service_id)
     except NoResultFound as e:
-        error = "API key not found for id: {}".format(service_id)
+        error = f"API key not found for id: {service_id}"
         raise InvalidRequest(error, status_code=404) from e
 
     return jsonify(apiKeys=api_key_schema.dump(api_keys, many=True)), 200
@@ -349,7 +369,7 @@ def add_user_to_service(service_id, user_id):
     user = get_user_by_id(user_id=user_id)
 
     if user in service.users:
-        error = "User id: {} already part of service id: {}".format(user_id, service_id)
+        error = f"User id: {user_id} already part of service id: {service_id}"
         raise InvalidRequest(error, status_code=400)
 
     data = request.get_json()
@@ -411,6 +431,42 @@ def get_service_history(service_id):
     return jsonify(data=data)
 
 
+@service_blueprint.route("/<uuid:service_id>/notifications/csv", methods=["GET", "POST"])
+def get_all_notifications_for_service_for_csv(service_id):
+    data = notifications_filter_schema.load(request.args)
+
+    older_than = data.get("older_than")
+    page_size = data["page_size"] if "page_size" in data else current_app.config.get("PAGE_SIZE")
+    limit_days = data.get("limit_days")
+
+    current_notifications_batch = notifications_dao.get_notifications_for_service(
+        service_id,
+        filter_dict=data,
+        older_than=older_than,
+        page_size=page_size,
+        count_pages=False,
+        limit_days=limit_days,
+        error_out=False,
+        with_personalisation=False,
+        include_jobs=True,
+        include_from_test_key=False,
+        include_one_off=True,
+    )
+
+    kwargs = request.args.to_dict()
+    kwargs["service_id"] = service_id
+
+    notifications = [notification.serialize_for_csv() for notification in current_notifications_batch.items]
+
+    return (
+        jsonify(
+            notifications=notifications,
+            page_size=page_size,
+        ),
+        200,
+    )
+
+
 @service_blueprint.route("/<uuid:service_id>/notifications", methods=["GET", "POST"])
 def get_all_notifications_for_service(service_id):
     if request.method == "GET":
@@ -428,18 +484,16 @@ def get_all_notifications_for_service(service_id):
             statuses=data.get("status"),
             notification_type=notification_type,
         )
-    page = data["page"] if "page" in data else 1
+
+    page = data.get("page", 1)
+
     page_size = data["page_size"] if "page_size" in data else current_app.config.get("PAGE_SIZE")
     limit_days = data.get("limit_days")
     include_jobs = data.get("include_jobs", True)
     include_from_test_key = data.get("include_from_test_key", False)
     include_one_off = data.get("include_one_off", True)
 
-    # count_pages is not being used for whether to count the number of pages, but instead as a flag
-    # for whether to show pagination links
-    count_pages = data.get("count_pages", True)
-
-    pagination = notifications_dao.get_notifications_for_service(
+    current_notifications_batch = notifications_dao.get_notifications_for_service(
         service_id,
         filter_dict=data,
         page=page,
@@ -454,10 +508,7 @@ def get_all_notifications_for_service(service_id):
     kwargs = request.args.to_dict()
     kwargs["service_id"] = service_id
 
-    if data.get("format_for_csv"):
-        notifications = [notification.serialize_for_csv() for notification in pagination.items]
-    else:
-        notifications = notification_with_template_schema.dump(pagination.items, many=True)
+    notifications = notification_with_template_schema.dump(current_notifications_batch.items, many=True)
 
     # We try and get the next page of results to work out if we need provide a pagination link to the next page
     # in our response if it exists. Note, this could be done instead by changing `count_pages` in the previous
@@ -465,7 +516,7 @@ def get_all_notifications_for_service(service_id):
     # this way is much more performant for services with many results (unlike Flask SqlAlchemy, this approach
     # doesn't do an additional query to count all the results of which there could be millions but instead only
     # asks for a single extra page of results).
-    next_page_of_pagination = notifications_dao.get_notifications_for_service(
+    next_notifications_batch = notifications_dao.get_notifications_for_service(
         service_id,
         filter_dict=data,
         page=page + 1,
@@ -478,18 +529,48 @@ def get_all_notifications_for_service(service_id):
         error_out=False,  # False so that if there are no results, it doesn't end in aborting with a 404
     )
 
+    # count_pages is not being used for whether to count the number of pages, but instead as a flag
+    # for whether to show pagination links
+    count_pages = data.get("count_pages", True)
+
+    links = {}
+    if count_pages:
+        links = get_prev_next_pagination_links(
+            page, len(next_notifications_batch.items), ".get_all_notifications_for_service", **kwargs
+        )
+
     return (
         jsonify(
             notifications=notifications,
             page_size=page_size,
-            links=get_prev_next_pagination_links(
-                page, len(next_page_of_pagination.items), ".get_all_notifications_for_service", **kwargs
-            )
-            if count_pages
-            else {},
+            links=links,
         ),
         200,
     )
+
+
+@service_blueprint.route("/<uuid:service_id>/notifications/count", methods=["GET"])
+def count_notifications_for_service(service_id):
+    data = notifications_filter_schema.load(request.args)
+    limit_days = data.get("limit_days")
+    multidict = MultiDict(data)
+
+    template_types = multidict.getlist("template_type")
+
+    # set default values for template_types and limit_days
+    if not limit_days:
+        limit_days = 7
+
+    if not template_types:
+        template_types = NOTIFICATION_TYPES
+
+    notification_count = fact_billing_dao.get_count_of_notifications_sent(
+        service_id=service_id,
+        template_types=template_types,
+        limit_days=limit_days,
+    )
+
+    return jsonify({"notifications_sent_count": notification_count}), 200
 
 
 @service_blueprint.route("/<uuid:service_id>/notifications/<uuid:notification_id>", methods=["GET"])
@@ -518,7 +599,7 @@ def cancel_notification_for_service(service_id, notification_id):
     elif not letter_can_be_cancelled(notification.status, notification.created_at):
         print_day = letter_print_day(notification.created_at)
         if too_late_to_cancel_letter(notification.created_at):
-            message = "It’s too late to cancel this letter. Printing started {} at 5.30pm".format(print_day)
+            message = f"It’s too late to cancel this letter. Printing started {print_day} at 5.30pm"
         elif notification.status == "cancelled":
             message = "This letter has already been cancelled."
         else:
@@ -674,7 +755,7 @@ def update_guest_list(service_id):
     except ValueError as e:
         current_app.logger.exception(e)
         dao_rollback()
-        msg = "{} is not a valid email address or phone number".format(str(e))
+        msg = f"{str(e)} is not a valid email address or phone number"
         raise InvalidRequest(msg, 400) from e
     else:
         dao_add_and_commit_guest_list_contacts(guest_list_objects)
@@ -702,7 +783,7 @@ def get_monthly_template_usage(service_id):
     try:
         start_date, end_date = get_financial_year(int(request.args.get("year", "NaN")))
         data = fetch_monthly_template_usage_for_service(start_date=start_date, end_date=end_date, service_id=service_id)
-        stats = list()
+        stats = []
         for i in data:
             stats.append(
                 {
@@ -865,7 +946,7 @@ def update_service_sms_sender(service_id, sms_sender_id):
 
     sms_sender_to_update = dao_get_service_sms_senders_by_id(service_id=service_id, service_sms_sender_id=sms_sender_id)
     if sms_sender_to_update.inbound_number_id and form["sms_sender"] != sms_sender_to_update.sms_sender:
-        raise InvalidRequest("You can not change the inbound number for service {}".format(service_id), status_code=400)
+        raise InvalidRequest(f"You can not change the inbound number for service {service_id}", status_code=400)
 
     new_sms_sender = dao_update_service_sms_sender(
         service_id=service_id,
@@ -948,9 +1029,7 @@ def modify_service_data_retention(service_id, data_retention_id):
     )
     if update_count == 0:
         raise InvalidRequest(
-            message="The service data retention for id: {} was not found for service: {}".format(
-                data_retention_id, service_id
-            ),
+            message=f"The service data retention for id: {data_retention_id} was not found for service: {service_id}",
             status_code=404,
         )
 
@@ -1036,30 +1115,130 @@ def returned_letter_summary(service_id):
 
 @service_blueprint.route("/<uuid:service_id>/returned-letters", methods=["GET"])
 def get_returned_letters(service_id):
-    results = fetch_returned_letters(service_id=service_id, report_date=request.args.get("reported_at"))
-
-    json_results = [
-        {
-            "notification_id": x.notification_id,
-            # client reference can only be added on API letters
-            "client_reference": x.client_reference if x.api_key_id else None,
-            "reported_at": x.reported_at.strftime(DATE_FORMAT),
-            "created_at": x.created_at.strftime(DATETIME_FORMAT_NO_TIMEZONE),
-            # it doesn't make sense to show hidden/precompiled templates
-            "template_name": x.template_name if not x.hidden else None,
-            "template_id": x.template_id if not x.hidden else None,
-            "template_version": x.template_version if not x.hidden else None,
-            "user_name": x.user_name or "API",
-            "email_address": x.email_address or "API",
-            "original_file_name": x.original_file_name,
-            "job_row_number": x.job_row_number,
-            # the file name for a letter uploaded via the UI
-            "uploaded_letter_file_name": x.client_reference if x.hidden and not x.api_key_id else None,
-        }
-        for x in results
-    ]
+    report_date = request.args.get("reported_at")
+    json_results = fetch_returned_letter_data(service_id, report_date)
 
     return jsonify(sorted(json_results, key=lambda i: i["created_at"], reverse=True))
+
+
+@service_blueprint.route("/<uuid:service_id>/unsubscribe-request-reports-summary", methods=["GET"])
+def get_unsubscribe_request_reports_summary(service_id):
+    """
+    This returns report summaries for both batched and un-batched unsubscribe requests.
+
+    In the case of un-batched unsubscribe requests:
+    - is_a_batched_result has a value of False.
+    - the latest_timestamp value is the date of the newest unsubscribe request in the report
+    - the earliest_timestamp value is the date of the oldest unsubscribe request in the report
+
+    parameter: uuid service_id
+
+    return: reports_summary = []
+
+    """
+    return jsonify(create_unsubscribe_request_reports_summary(service_id))
+
+
+@service_blueprint.route("/<uuid:service_id>/unsubscribe-request-statistics", methods=["GET"])
+def get_unsubscribe_requests_statistics(service_id):
+    data = {}
+    if unsubscribe_statistics := get_unsubscribe_requests_statistics_dao(service_id):
+        data = {
+            "unsubscribe_requests_count": unsubscribe_statistics.unsubscribe_requests_count,
+            "datetime_of_latest_unsubscribe_request": unsubscribe_statistics.datetime_of_latest_unsubscribe_request,
+        }
+    elif latest_unsubscribe_request := get_latest_unsubscribe_request_date_dao(service_id):
+        data = {
+            "unsubscribe_requests_count": 0,
+            "datetime_of_latest_unsubscribe_request": latest_unsubscribe_request.datetime_of_latest_unsubscribe_request,
+        }
+
+    return jsonify(data), 200
+
+
+@service_blueprint.route("/<uuid:service_id>/process-unsubscribe-request-report/<uuid:batch_id>", methods=["POST"])
+def process_unsubscribe_request_report(service_id, batch_id):
+    """
+    This endpoint processes unsubscribe_request_reports by updating the processed_by_service_at
+    field
+    """
+    if data := request.get_json():
+        report_has_been_processed = data["report_has_been_processed"]
+    else:
+        raise InvalidRequest(
+            message={"marked_as_completed": "missing data for required field"},
+            status_code=400,
+        )
+    if report := get_unsubscribe_request_report_by_id_dao(batch_id):
+        update_unsubscribe_request_report_processed_by_date_dao(report, report_has_been_processed)
+    else:
+        raise InvalidRequest(
+            message={"batch_id": f"No UnsubscribeRequestReport found for id:{batch_id}"},
+            status_code=400,
+        )
+
+    return "", 204
+
+
+@service_blueprint.route("/<uuid:service_id>/create-unsubscribe-request-report", methods=["POST"])
+def create_unsubscribe_request_report(service_id):
+    summary_data = request.get_json()
+    if summary_data:
+        unsubscribe_request_report = UnsubscribeRequestReport(
+            id=uuid.uuid4(),
+            count=summary_data["count"],
+            earliest_timestamp=summary_data["earliest_timestamp"],
+            latest_timestamp=summary_data["latest_timestamp"],
+            service_id=service_id,
+        )
+        create_unsubscribe_request_reports_dao(unsubscribe_request_report)
+        assign_unbatched_unsubscribe_requests_to_report_dao(
+            report_id=unsubscribe_request_report.id,
+            service_id=unsubscribe_request_report.service_id,
+            earliest_timestamp=unsubscribe_request_report.earliest_timestamp,
+            latest_timestamp=unsubscribe_request_report.latest_timestamp,
+        )
+        return (
+            jsonify(
+                {
+                    "report_id": unsubscribe_request_report.id,
+                }
+            ),
+            201,
+        )
+    else:
+        raise InvalidRequest(
+            message={"summary_data": "summary data needed to create an unsubscribe request report is missing"},
+            status_code=400,
+        )
+
+
+@service_blueprint.route("/<uuid:service_id>/unsubscribe-request-report/<uuid:batch_id>", methods=["GET"])
+def get_unsubscribe_request_report_for_download(service_id, batch_id):
+    if report := get_unsubscribe_request_report_by_id_dao(batch_id):
+        data = {
+            "batch_id": report.id,
+            "earliest_timestamp": report.earliest_timestamp,
+            "latest_timestamp": report.latest_timestamp,
+            "unsubscribe_requests": [
+                {
+                    "email_address": unsubscribe_request.email_address,
+                    "template_name": unsubscribe_request.template_name,
+                    "original_file_name": unsubscribe_request.original_file_name,
+                    "template_sent_at": utc_string_to_bst_string(unsubscribe_request.template_sent_at),
+                    "unsubscribe_request_received_at": utc_string_to_bst_string(
+                        unsubscribe_request.unsubscribe_request_received_at
+                    ),
+                }
+                for unsubscribe_request in get_unsubscribe_requests_data_for_download_dao(service_id, report.id)
+            ],
+        }
+        return jsonify(data), 200
+    else:
+        raise InvalidRequest(
+            message=f"No report available for {batch_id}",
+            status_code=400,
+        )
 
 
 @service_blueprint.route("/<uuid:service_id>/contact-list", methods=["GET"])
@@ -1099,3 +1278,112 @@ def create_contact_list(service_id):
     save_service_contact_list(list_to_save)
 
     return jsonify(list_to_save.serialize()), 201
+
+
+@service_blueprint.route("<uuid:service_id>/service-join-request", methods=["POST"])
+def create_service_join_request(service_id: uuid.UUID):
+    data = request.get_json()
+
+    try:
+        validate(data, service_join_request_schema)
+    except ValidationError as err:
+        raise InvalidRequest(message=err.messages, status_code=400) from err
+
+    new_request = dao_create_service_join_request(
+        requester_id=data["requester_id"],
+        service_id=service_id,
+        contacted_user_ids=data["contacted_user_ids"],
+    )
+
+    return jsonify({"service_join_request_id": str(new_request.id)}), 201
+
+
+@service_blueprint.route("/service-join-request/<uuid:request_id>", methods=["GET"])
+def get_service_join_request(request_id: uuid.UUID):
+    service_join_request = dao_get_service_join_request_by_id(request_id)
+
+    if not service_join_request:
+        raise InvalidRequest(message=f"Service join request with ID {request_id} not found.", status_code=404)
+
+    return jsonify(service_join_request.serialize()), 200
+
+
+@service_blueprint.route("/update-service-join-request-status/<uuid:request_id>", methods=["POST"])
+def update_service_join_request(request_id: uuid.UUID):
+    data = request.get_json()
+
+    validate(data, service_join_request_update_schema)
+
+    status = data["status"]
+    status_changed_by_id = data["status_changed_by_id"]
+    reason = data.get("reason", None)
+
+    updated_request = dao_update_service_join_request(request_id, status, status_changed_by_id, reason)
+
+    if updated_request is None:
+        return jsonify({"message": "Service join request not found"}), 404
+
+    if status == SERVICE_JOIN_REQUEST_APPROVED:
+        permissions = data.get("permissions", None)
+
+        if permissions:
+            permissions = [
+                Permission(service_id=updated_request.service_id, user_id=updated_request.requester_id, permission=p)
+                for p in permissions
+            ]
+
+        requester_user = get_user_by_id(updated_request.requester_id)
+        approver_user = get_user_by_id(updated_request.status_changed_by_id)
+        service = dao_fetch_service_by_id(updated_request.service_id)
+        folder_permissions = data.get("folder_permissions", [])
+
+        dao_add_user_to_service(service, requester_user, permissions, folder_permissions)
+
+        updated_auth_type = data.get("auth_type")
+        _update_auth_type(updated_auth_type, requester_user)
+
+        send_service_join_request_decision_email(
+            requester_email_address=requester_user.email_address,
+            template=dao_get_template_by_id(current_app.config["SERVICE_JOIN_REQUEST_APPROVED_TEMPLATE_ID"]),
+            personalisation=create_personalisation(requester_user.name, approver_user.name, service.name, service.id),
+        )
+
+        dao_cancel_pending_service_join_requests(requester_user.id, approver_user.id, service.id)
+
+    return jsonify(updated_request.serialize()), 200
+
+
+def create_personalisation(requester_name: str, approver_name: str, service_name: str, service_id: uuid):
+    admin_base_url = current_app.config["ADMIN_BASE_URL"]
+    return {
+        "requester_name": requester_name,
+        "approver_name": approver_name,
+        "service_name": service_name,
+        "dashboard_url": f"{admin_base_url}/services/{service_id}",
+    }
+
+
+def send_service_join_request_decision_email(requester_email_address: str, template: Template, personalisation: dict):
+    notify_service = dao_fetch_service_by_id(current_app.config["NOTIFY_SERVICE_ID"])
+
+    saved_notification = persist_notification(
+        template_id=template.id,
+        template_version=template.version,
+        recipient=requester_email_address,
+        service=notify_service,
+        personalisation=personalisation,
+        notification_type=EMAIL_TYPE,
+        api_key_id=None,
+        key_type=KEY_TYPE_NORMAL,
+        reply_to_text=notify_service.get_default_reply_to_email_address(),
+    )
+
+    send_notification_to_queue(saved_notification, queue=QueueNames.NOTIFY)
+
+
+def _update_auth_type(updated_auth_type, user):
+    if updated_auth_type and updated_auth_type != user.auth_type:
+        if updated_auth_type == "sms_auth" and not user.mobile_number:
+            return
+
+        save_user_attribute(user, update_dict={"auth_type": updated_auth_type})

@@ -61,11 +61,17 @@ def test_send_email_handles_reply_to_address(notify_api, mocker, reply_to_addres
 
     with notify_api.app_context():
         aws_ses_client.send_email(
-            source=Mock(), to_addresses="to@address.com", subject=Mock(), body=Mock(), reply_to_address=reply_to_address
+            from_address=Mock(),
+            to_address="to@address.com",
+            subject=Mock(),
+            body=Mock(),
+            html_body=Mock(),
+            headers=Mock(),
+            reply_to_address=reply_to_address,
         )
 
     boto_mock.send_email.assert_called_once_with(
-        Source=ANY, Destination=ANY, Message=ANY, ReplyToAddresses=expected_value
+        FromEmailAddress=ANY, Destination=ANY, Content=ANY, ReplyToAddresses=expected_value
     )
 
 
@@ -74,13 +80,54 @@ def test_send_email_handles_punycode_to_address(notify_api, mocker):
     mocker.patch.object(aws_ses_client, "statsd_client", create=True)
 
     with notify_api.app_context():
-        aws_ses_client.send_email(Mock(), to_addresses="føøøø@bååååår.com", subject=Mock(), body=Mock())
+        aws_ses_client.send_email(
+            from_address=Mock(),
+            to_address="føøøø@bååååår.com",
+            subject=Mock(),
+            body=Mock(),
+            html_body=Mock(),
+            reply_to_address=None,
+            headers=Mock(),
+        )
 
     boto_mock.send_email.assert_called_once_with(
-        Source=ANY,
+        FromEmailAddress=ANY,
         Destination={"ToAddresses": ["føøøø@xn--br-yiaaaaa.com"], "CcAddresses": [], "BccAddresses": []},
-        Message=ANY,
+        Content=ANY,
         ReplyToAddresses=ANY,
+    )
+
+
+def test_send_email_sends_content_correctly(notify_api, mocker):
+    boto_mock = mocker.patch.object(aws_ses_client, "_client", create=True)
+    mocker.patch.object(aws_ses_client, "statsd_client", create=True)
+
+    mock_subject = Mock()
+    mock_body = Mock()
+    mock_html_body = Mock()
+    mock_headers = Mock()
+    with notify_api.app_context():
+        aws_ses_client.send_email(
+            from_address=Mock(),
+            to_address="foo@bar.com",
+            reply_to_address=None,
+            subject=mock_subject,
+            body=mock_body,
+            html_body=mock_html_body,
+            headers=mock_headers,
+        )
+
+    boto_mock.send_email.assert_called_once_with(
+        FromEmailAddress=ANY,
+        Destination=ANY,
+        ReplyToAddresses=ANY,
+        Content={
+            "Simple": {
+                "Subject": {"Data": mock_subject},
+                "Body": {"Text": {"Data": mock_body}, "Html": {"Data": mock_html_body}},
+                "Headers": mock_headers,
+            }
+        },
     )
 
 
@@ -95,7 +142,13 @@ def test_send_email_raises_invalid_parameter_value_error_as_EmailClientNonRetrya
 
     with pytest.raises(EmailClientNonRetryableException) as excinfo:
         aws_ses_client.send_email(
-            source=Mock(), to_addresses="definitely@invalid_email.com", subject=Mock(), body=Mock()
+            from_address=Mock(),
+            to_address="definitely@invalid_email.com",
+            subject=Mock(),
+            body=Mock(),
+            html_body=Mock(),
+            reply_to_address=None,
+            headers=Mock(),
         )
 
     assert "some error message from amazon" in str(excinfo.value)
@@ -104,21 +157,41 @@ def test_send_email_raises_invalid_parameter_value_error_as_EmailClientNonRetrya
 def test_send_email_raises_send_rate_throttling_as_AwsSesClientThrottlingSendRateException(mocker):
     boto_mock = mocker.patch.object(aws_ses_client, "_client", create=True)
     mocker.patch.object(aws_ses_client, "statsd_client", create=True)
-    error_response = {"Error": {"Code": "Throttling", "Message": "Maximum sending rate exceeded.", "Type": "Sender"}}
+    error_response = {
+        "Error": {"Code": "TooManyRequestsException", "Message": "Maximum sending rate exceeded.", "Type": "Sender"}
+    }
     boto_mock.send_email.side_effect = botocore.exceptions.ClientError(error_response, "opname")
 
     with pytest.raises(AwsSesClientThrottlingSendRateException):
-        aws_ses_client.send_email(source=Mock(), to_addresses="foo@bar.com", subject=Mock(), body=Mock())
+        aws_ses_client.send_email(
+            from_address=Mock(),
+            to_address="foo@bar.com",
+            subject=Mock(),
+            body=Mock(),
+            html_body=Mock(),
+            reply_to_address=None,
+            headers=Mock(),
+        )
 
 
 def test_send_email_does_not_raise_AwsSesClientThrottlingSendRateException_if_non_send_rate_throttling(mocker):
     boto_mock = mocker.patch.object(aws_ses_client, "_client", create=True)
     mocker.patch.object(aws_ses_client, "statsd_client", create=True)
-    error_response = {"Error": {"Code": "Throttling", "Message": "Daily message quota exceeded", "Type": "Sender"}}
+    error_response = {
+        "Error": {"Code": "TooManyRequestsException", "Message": "Daily message quota exceeded", "Type": "Sender"}
+    }
     boto_mock.send_email.side_effect = botocore.exceptions.ClientError(error_response, "opname")
 
     with pytest.raises(AwsSesClientException):
-        aws_ses_client.send_email(source=Mock(), to_addresses="foo@bar.com", subject=Mock(), body=Mock())
+        aws_ses_client.send_email(
+            from_address=Mock(),
+            to_address="foo@bar.com",
+            subject=Mock(),
+            body=Mock(),
+            html_body=Mock(),
+            reply_to_address=None,
+            headers=Mock(),
+        )
 
 
 def test_send_email_raises_other_errs_as_AwsSesClientException(mocker):
@@ -131,6 +204,14 @@ def test_send_email_raises_other_errs_as_AwsSesClientException(mocker):
     mocker.patch.object(aws_ses_client, "statsd_client", create=True)
 
     with pytest.raises(AwsSesClientException) as excinfo:
-        aws_ses_client.send_email(source=Mock(), to_addresses="foo@bar.com", subject=Mock(), body=Mock())
+        aws_ses_client.send_email(
+            from_address=Mock(),
+            to_address="foo@bar.com",
+            subject=Mock(),
+            body=Mock(),
+            html_body=Mock(),
+            reply_to_address=None,
+            headers=Mock(),
+        )
 
     assert "some error message from amazon" in str(excinfo.value)

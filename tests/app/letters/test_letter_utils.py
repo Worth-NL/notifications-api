@@ -6,7 +6,7 @@ import dateutil
 import pytest
 from flask import current_app
 from freezegun import freeze_time
-from moto import mock_s3
+from moto import mock_aws
 
 from app.constants import (
     KEY_TYPE_NORMAL,
@@ -52,7 +52,7 @@ def _sample_precompiled_letter_notification_using_test_key(sample_precompiled_le
     return sample_precompiled_letter_notification
 
 
-@mock_s3
+@mock_aws
 def test_find_letter_pdf_in_s3_returns_object(sample_notification):
     bucket_name = current_app.config["S3_BUCKET_LETTERS_PDF"]
     s3 = boto3.client("s3", region_name="eu-west-1")
@@ -64,7 +64,7 @@ def test_find_letter_pdf_in_s3_returns_object(sample_notification):
     assert find_letter_pdf_in_s3(sample_notification).key == f"{prefix}-and-then-some"
 
 
-@mock_s3
+@mock_aws
 def test_find_letter_pdf_in_s3_raises_if_not_found(sample_notification):
     bucket_name = current_app.config["S3_BUCKET_LETTERS_PDF"]
     s3 = boto3.client("s3", region_name="eu-west-1")
@@ -88,10 +88,7 @@ def test_get_bucket_name_and_prefix_for_notification_valid_notification(sample_n
     bucket, bucket_prefix = get_bucket_name_and_prefix_for_notification(sample_notification)
 
     assert bucket == current_app.config["S3_BUCKET_LETTERS_PDF"]
-    assert (
-        bucket_prefix
-        == "{folder}/NOTIFY.{reference}".format(folder=folder, reference=sample_notification.reference).upper()
-    )
+    assert bucket_prefix == f"{folder}/NOTIFY.{sample_notification.reference}".upper()
 
 
 def test_get_bucket_name_and_prefix_for_notification_is_tomorrow_after_17_30(sample_notification):
@@ -130,7 +127,7 @@ def test_get_bucket_name_and_prefix_for_notification_precompiled_letter_using_te
     )
 
     assert bucket == current_app.config["S3_BUCKET_TEST_LETTERS"]
-    assert bucket_prefix == "NOTIFY.{}".format(sample_precompiled_letter_notification_using_test_key.reference).upper()
+    assert bucket_prefix == f"NOTIFY.{sample_precompiled_letter_notification_using_test_key.reference}".upper()
 
 
 @freeze_time(FROZEN_DATE_TIME)
@@ -140,7 +137,7 @@ def test_get_bucket_name_and_prefix_for_notification_templated_letter_using_test
     bucket, bucket_prefix = get_bucket_name_and_prefix_for_notification(sample_letter_notification)
 
     assert bucket == current_app.config["S3_BUCKET_TEST_LETTERS"]
-    assert bucket_prefix == "NOTIFY.{}".format(sample_letter_notification.reference).upper()
+    assert bucket_prefix == f"NOTIFY.{sample_letter_notification.reference}".upper()
 
 
 @freeze_time(FROZEN_DATE_TIME)
@@ -149,7 +146,7 @@ def test_get_bucket_name_and_prefix_for_failed_validation(sample_precompiled_let
     bucket, bucket_prefix = get_bucket_name_and_prefix_for_notification(sample_precompiled_letter_notification)
 
     assert bucket == current_app.config["S3_BUCKET_INVALID_PDF"]
-    assert bucket_prefix == "NOTIFY.{}".format(sample_precompiled_letter_notification.reference).upper()
+    assert bucket_prefix == f"NOTIFY.{sample_precompiled_letter_notification.reference}".upper()
 
 
 @freeze_time(FROZEN_DATE_TIME)
@@ -162,7 +159,7 @@ def test_get_bucket_name_and_prefix_for_test_noti_with_failed_validation(
     )
 
     assert bucket == current_app.config["S3_BUCKET_INVALID_PDF"]
-    assert bucket_prefix == "NOTIFY.{}".format(sample_precompiled_letter_notification_using_test_key.reference).upper()
+    assert bucket_prefix == f"NOTIFY.{sample_precompiled_letter_notification_using_test_key.reference}".upper()
 
 
 def test_get_bucket_name_and_prefix_for_notification_invalid_notification():
@@ -181,7 +178,7 @@ def test_generate_letter_pdf_filename_returns_correct_postage_for_filename(notif
     created_at = datetime(2017, 12, 4, 17, 29)
     filename = generate_letter_pdf_filename(reference="foo", created_at=created_at, postage=postage)
 
-    assert filename == "2017-12-04/NOTIFY.FOO.D.{}.C.20171204172900.PDF".format(expected_postage)
+    assert filename == f"2017-12-04/NOTIFY.FOO.D.{expected_postage}.C.20171204172900.PDF"
 
 
 def test_generate_letter_pdf_filename_returns_correct_filename_for_test_letters(notify_api, mocker):
@@ -191,14 +188,14 @@ def test_generate_letter_pdf_filename_returns_correct_filename_for_test_letters(
     assert filename == "NOTIFY.FOO.D.2.C.20171204172900.PDF"
 
 
-def test_generate_letter_pdf_filename_returns_tomorrows_filename(notify_api, mocker):
+def test_generate_letter_pdf_filename_returns_tomorrows_filename(notify_api):
     created_at = datetime(2017, 12, 4, 17, 31)
     filename = generate_letter_pdf_filename(reference="foo", created_at=created_at)
 
     assert filename == "2017-12-05/NOTIFY.FOO.D.2.C.20171204173100.PDF"
 
 
-@mock_s3
+@mock_aws
 @pytest.mark.parametrize(
     "bucket_config_name,filename_format",
     [
@@ -253,8 +250,8 @@ def test_upload_letter_pdf_to_correct_bucket(
     )
 
 
-@pytest.mark.parametrize("postage,expected_postage", [("second", 2), ("first", 1)])
-def test_upload_letter_pdf_uses_postage_from_notification(sample_letter_template, mocker, postage, expected_postage):
+@pytest.mark.parametrize("postage", ["second", "first"])
+def test_upload_letter_pdf_uses_postage_from_notification(sample_letter_template, mocker, postage):
     letter_notification = create_notification(template=sample_letter_template, postage=postage)
     mock_s3 = mocker.patch("app.letters.utils.s3upload")
 
@@ -275,7 +272,7 @@ def test_upload_letter_pdf_uses_postage_from_notification(sample_letter_template
     )
 
 
-@mock_s3
+@mock_aws
 @freeze_time(FROZEN_DATE_TIME)
 def test_move_failed_pdf_error(notify_api):
     filename = "test.pdf"
@@ -293,7 +290,7 @@ def test_move_failed_pdf_error(notify_api):
     assert filename not in [o.key for o in bucket.objects.all()]
 
 
-@mock_s3
+@mock_aws
 @freeze_time(FROZEN_DATE_TIME)
 def test_move_failed_pdf_scan_failed(notify_api):
     filename = "test.pdf"
@@ -334,8 +331,8 @@ def test_get_folder_name_in_british_summer_time(notify_api, timestamp, expected_
     assert folder_name == expected_folder_name
 
 
-@mock_s3
-def test_move_sanitised_letter_to_live_pdf_bucket(notify_api, mocker):
+@mock_aws
+def test_move_sanitised_letter_to_live_pdf_bucket(notify_api):
     filename = "my_letter.pdf"
     source_bucket_name = current_app.config["S3_BUCKET_LETTER_SANITISE"]
     target_bucket_name = current_app.config["S3_BUCKET_LETTERS_PDF"]
@@ -355,12 +352,12 @@ def test_move_sanitised_letter_to_live_pdf_bucket(notify_api, mocker):
         filename=filename, is_test_letter=False, created_at=datetime.utcnow(), new_filename=filename
     )
 
-    assert not [x for x in source_bucket.objects.all()]
-    assert len([x for x in target_bucket.objects.all()]) == 1
+    assert not list(source_bucket.objects.all())
+    assert len(list(target_bucket.objects.all())) == 1
 
 
-@mock_s3
-def test_move_sanitised_letter_to_test_pdf_bucket(notify_api, mocker):
+@mock_aws
+def test_move_sanitised_letter_to_test_pdf_bucket(notify_api):
     filename = "my_letter.pdf"
     source_bucket_name = current_app.config["S3_BUCKET_LETTER_SANITISE"]
     target_bucket_name = current_app.config["S3_BUCKET_TEST_LETTERS"]
@@ -380,8 +377,8 @@ def test_move_sanitised_letter_to_test_pdf_bucket(notify_api, mocker):
         filename=filename, is_test_letter=True, created_at=datetime.utcnow(), new_filename=filename
     )
 
-    assert not [x for x in source_bucket.objects.all()]
-    assert len([x for x in target_bucket.objects.all()]) == 1
+    assert not list(source_bucket.objects.all())
+    assert len(list(target_bucket.objects.all())) == 1
 
 
 @freeze_time("2017-07-07 20:00:00")

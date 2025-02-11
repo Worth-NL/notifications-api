@@ -1,14 +1,16 @@
 from datetime import datetime, timedelta
-from typing import Optional
+from itertools import islice
+from urllib.parse import urljoin
 
 import pytz
-from flask import url_for
+from flask import current_app, url_for
 from notifications_utils.template import (
     HTMLEmailTemplate,
     LetterPrintTemplate,
     SMSMessageTemplate,
 )
-from notifications_utils.timezones import convert_bst_to_utc
+from notifications_utils.timezones import convert_bst_to_utc, utc_string_to_aware_gmt_datetime
+from notifications_utils.url_safe_token import generate_token
 from sqlalchemy import func
 
 from app.constants import (
@@ -39,23 +41,36 @@ def pagination_links(pagination, endpoint, **kwargs):
     return links
 
 
+# Not sure those links ever get utilised beyond checking if they exist - changing the mocks to nonsense in admin
+# didn't break any tests, and admin does its own page counting - so maybe a bit redundant code here?
 def get_prev_next_pagination_links(current_page, next_page_exists, endpoint, **kwargs):
     if "page" in kwargs:
         kwargs.pop("page", None)
     links = {}
     if current_page > 1:
-        links["prev"] = url_for(endpoint, page=current_page - 1, **kwargs)
+        links["prev"] = True
     if next_page_exists:
-        links["next"] = url_for(endpoint, page=current_page + 1, **kwargs)
+        links["next"] = True
     return links
 
 
-def url_with_token(data, url, config, base_url=None):
-    from notifications_utils.url_safe_token import generate_token
+# "approximate equivalent" of itertools.batched from python 3.12's documentation. remove once we upgrade
+# past python 3.12 and use itertools' version instead
+def batched(iterable, n, *, strict=False):
+    # batched('ABCDEFG', 3) → ABC DEF G
+    if n < 1:
+        raise ValueError("n must be at least one")
+    iterator = iter(iterable)
+    while batch := tuple(islice(iterator, n)):
+        if strict and len(batch) != n:
+            raise ValueError("batched(): incomplete batch")
+        yield batch
 
-    token = generate_token(data, config["SECRET_KEY"], config["DANGEROUS_SALT"])
-    base_url = (base_url or config["ADMIN_BASE_URL"]) + url
-    return base_url + token
+
+def url_with_token(data, url, base_url=None):
+    token = generate_token(data, current_app.config["SECRET_KEY"], current_app.config["DANGEROUS_SALT"])
+    base_url = (base_url or current_app.config["ADMIN_BASE_URL"]) + url
+    return urljoin(base_url, token)
 
 
 def get_template_instance(template, values):
@@ -118,7 +133,7 @@ def midnight_n_days_ago(number_of_days):
 
 def escape_special_characters(string):
     for special_character in ("\\", "_", "%", "/"):
-        string = string.replace(special_character, r"\{}".format(special_character))
+        string = string.replace(special_character, rf"\{special_character}")
     return string
 
 
@@ -134,8 +149,8 @@ def email_address_is_nhs(email_address):
 
 
 def get_archived_db_column_value(column):
-    date = datetime.utcnow().strftime("%Y-%m-%d")
-    return f"_archived_{date}_{column}"
+    date_time = datetime.utcnow().strftime("%Y-%m-%d-%H:%M:%S")
+    return f"_archived_{date_time}_{column}"
 
 
 def get_dt_string_or_none(val):
@@ -150,10 +165,14 @@ def format_sequential_number(sequential_number):
     return format(sequential_number, "x").zfill(8)
 
 
-def get_ft_billing_data_for_today_updated_at() -> Optional[str]:
+def get_ft_billing_data_for_today_updated_at() -> str | None:
     from app import redis_store
 
     if updated_at_utc_isoformat := redis_store.get(CacheKeys.FT_BILLING_FOR_TODAY_UPDATED_AT_UTC_ISOFORMAT):
         return updated_at_utc_isoformat.decode()
 
     return None
+
+
+def utc_string_to_bst_string(utc_string):
+    return utc_string_to_aware_gmt_datetime(utc_string).strftime("%Y-%m-%d %H:%M:%S")

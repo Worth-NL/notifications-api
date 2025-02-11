@@ -1,7 +1,8 @@
 from flask import current_app, json, jsonify
 from jsonschema import ValidationError as JsonSchemaValidationError
 from marshmallow import ValidationError
-from notifications_utils.recipients import InvalidEmailError
+from notifications_utils.eventlet import EventletTimeout
+from notifications_utils.recipient_validation.errors import InvalidRecipientError
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm.exc import NoResultFound
 
@@ -40,10 +41,8 @@ class InvalidRequest(Exception):
 
 
 def register_errors(blueprint):  # noqa: C901
-    @blueprint.errorhandler(InvalidEmailError)
+    @blueprint.errorhandler(InvalidRecipientError)
     def invalid_format(error):
-        # Please not that InvalidEmailError is re-raised for InvalidEmail or InvalidPhone,
-        # work should be done in the utils app to tidy up these errors.
         return jsonify(result="error", message=str(error)), 400
 
     @blueprint.errorhandler(AuthError)
@@ -98,6 +97,11 @@ def register_errors(blueprint):  # noqa: C901
     def no_result_found(e):
         current_app.logger.info(e)
         return jsonify(result="error", message="No result found"), 404
+
+    @blueprint.errorhandler(EventletTimeout)
+    def eventlet_timeout(error):
+        current_app.logger.exception(error)
+        return jsonify(result="error", message="Timeout serving request"), 504
 
     # this must be defined after all other error handlers since it catches the generic Exception object
     @blueprint.app_errorhandler(500)

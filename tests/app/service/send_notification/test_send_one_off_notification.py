@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 from notifications_utils import SMS_CHAR_COUNT_LIMIT
-from notifications_utils.recipients import InvalidPhoneError
+from notifications_utils.recipient_validation.errors import InvalidPhoneError
 
 from app.constants import (
     EMAIL_TYPE,
@@ -85,6 +85,7 @@ def test_send_one_off_notification_calls_persist_correctly_for_sms(persist_mock,
         reference=None,
         postage=None,
         client_reference=None,
+        template_has_unsubscribe_link=False,
     )
 
 
@@ -116,6 +117,7 @@ def test_send_one_off_notification_calls_persist_correctly_for_email(persist_moc
         template_type=EMAIL_TYPE,
         subject="Test subject",
         content="Hello (( Name))\nYour thing is due soon",
+        has_unsubscribe_link=True,
     )
 
     post_data = {
@@ -141,6 +143,7 @@ def test_send_one_off_notification_calls_persist_correctly_for_email(persist_moc
         reference=None,
         postage=None,
         client_reference=None,
+        template_has_unsubscribe_link=True,
     )
 
 
@@ -188,6 +191,7 @@ def test_send_one_off_notification_calls_persist_correctly_for_letter(
         reference="this-is-random-in-real-life",
         postage="first",
         client_reference=None,
+        template_has_unsubscribe_link=False,
     )
 
 

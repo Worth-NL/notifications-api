@@ -5,6 +5,7 @@ Revises: 0297_template_redacted_fix
 Create Date: 2019-05-22 16:58:52.929661
 
 """
+
 from alembic import op
 from flask import current_app
 
@@ -25,10 +26,6 @@ templates = [
             "",
             "If you need another copy of the agreement you can download it here: ((mou_link))",
             "",
-            "If you need to add Cabinet Office as a supplier, here are the details you need:",
-            "",
-            "TO BE ADDED MANUALLY",
-            "",
             "Thanks,",
             "GOV.​UK Notify team",
             "",
@@ -46,10 +43,6 @@ templates = [
             "((org_name)) has accepted the GOV.​UK Notify data sharing and financial agreement. We’ve emailed ((on_behalf_of_name)) to let them know too.",
             "",
             "If you need another copy of the agreement you can download it here: ((mou_link))",
-            "",
-            "If you need to add Cabinet Office as a supplier, here are the details you need:",
-            "",
-            "TO BE ADDED MANUALLY",
             "",
             "Thanks,",
             "GOV.​UK Notify team",
@@ -70,10 +63,6 @@ templates = [
             "GOV.​UK Notify lets teams in the public sector send emails, text messages and letters. It’s built and run by a team in the Government Digital Service (part of Cabinet Office).",
             "",
             "If you need another copy of the agreement you can download it here: ((mou_link))",
-            "",
-            "If you need to add Cabinet Office as a supplier, here are the details you need.",
-            "",
-            "TO BE ADDED MANUALLY",
             "",
             "Thanks,",
             "GOV.​UK Notify team",

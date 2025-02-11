@@ -157,8 +157,8 @@ def archive_organisation(organisation_id):
 
     organisation = dao_get_organisation_by_id(organisation_id)
 
-    if organisation.services:
-        raise InvalidRequest("Cannot archive an organisation with services", 400)
+    if any(service.active for service in organisation.services):
+        raise InvalidRequest("Cannot archive an organisation with active services", 400)
 
     pending_invited_users = [
         user for user in get_invited_org_users_for_organisation(organisation_id) if user.status == INVITE_PENDING
@@ -301,7 +301,9 @@ def remove_letter_branding_from_organisation_pool(organisation_id, letter_brandi
 
 @organisation_blueprint.route("/notify-users-of-request-to-go-live/<uuid:service_id>", methods=["POST"])
 def notify_users_of_request_to_go_live(service_id):
-    template = dao_get_template_by_id(current_app.config["GO_LIVE_NEW_REQUEST_FOR_ORG_USERS_TEMPLATE_ID"])
+    approver_template = dao_get_template_by_id(current_app.config["GO_LIVE_NEW_REQUEST_FOR_ORG_APPROVERS_TEMPLATE_ID"])
+    requester_template = dao_get_template_by_id(current_app.config["GO_LIVE_NEW_REQUEST_FOR_ORG_REQUESTER_TEMPLATE_ID"])
+
     service = dao_fetch_service_by_id(service_id)
     organisation = service.organisation
     make_service_live_link = f"{current_app.config['ADMIN_BASE_URL']}/services/{service.id}/make-service-live"
@@ -309,7 +311,9 @@ def notify_users_of_request_to_go_live(service_id):
 
     send_notification_to_organisation_users(
         organisation=organisation,
-        template=template,
+        service=service,
+        approver_template=approver_template,
+        requester_template=requester_template,
         reply_to_text=service.go_live_user.email_address,
         with_permission=OrganisationUserPermissionTypes.can_make_services_live,
         personalisation={

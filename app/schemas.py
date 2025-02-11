@@ -14,20 +14,18 @@ from marshmallow import (
     validates_schema,
 )
 from marshmallow_sqlalchemy import field_for
-from notifications_utils.recipients import (
-    InvalidEmailError,
-    InvalidPhoneError,
+from notifications_utils.recipient_validation.email_address import validate_email_address
+from notifications_utils.recipient_validation.errors import InvalidEmailError, InvalidPhoneError
+from notifications_utils.recipient_validation.phone_number import (
     validate_and_format_phone_number,
-    validate_email_address,
     validate_phone_number,
 )
 
 import app.constants
-from app import ma, models
+from app import db, ma, models
 from app.dao.permissions_dao import permission_dao
 from app.models import ServicePermission
-from app.notifications.validators import remap_phone_number_validation_messages
-from app.utils import DATETIME_FORMAT_NO_TIMEZONE, get_template_instance
+from app.utils import DATETIME_FORMAT_NO_TIMEZONE
 
 
 def _validate_positive_number(value, msg="Not a positive integer"):
@@ -71,10 +69,11 @@ class BaseSchema(ma.SQLAlchemyAutoSchema):
         load_instance = True
         include_relationships = True
         unknown = EXCLUDE
+        sqla_session = db.session
 
     def __init__(self, load_json=False, *args, **kwargs):
         self.load_json = load_json
-        super(BaseSchema, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     @post_load
     def make_instance(self, data, **kwargs):
@@ -85,7 +84,7 @@ class BaseSchema(ma.SQLAlchemyAutoSchema):
         """
         if self.load_json:
             return data
-        return super(BaseSchema, self).make_instance(data)
+        return super().make_instance(data)
 
 
 class OrganisationSchema(BaseSchema, UUIDsAsStringsMixin):
@@ -169,8 +168,7 @@ class UserSchema(BaseSchema):
             if value is not None:
                 validate_phone_number(value, international=True)
         except InvalidPhoneError as error:
-            error_message = remap_phone_number_validation_messages(str(error))
-            raise ValidationError(f"Invalid phone number: {error_message}") from error
+            raise ValidationError(f"Invalid phone number: {error.get_legacy_v2_api_error_message()}") from error
 
 
 class UserUpdateAttributeSchema(BaseSchema):
@@ -210,14 +208,13 @@ class UserUpdateAttributeSchema(BaseSchema):
             if value is not None:
                 validate_phone_number(value, international=True)
         except InvalidPhoneError as error:
-            error_message = remap_phone_number_validation_messages(str(error))
-            raise ValidationError(f"Invalid phone number: {error_message}") from error
+            raise ValidationError(f"Invalid phone number: {error.get_legacy_v2_api_error_message()}") from error
 
     @validates_schema(pass_original=True)
     def check_unknown_fields(self, data, original_data, **kwargs):
         for key in original_data:
             if key not in self.fields:
-                raise ValidationError("Unknown field name {}".format(key))
+                raise ValidationError(f"Unknown field name {key}")
 
 
 class UserUpdatePasswordSchema(BaseSchema):
@@ -228,7 +225,7 @@ class UserUpdatePasswordSchema(BaseSchema):
     def check_unknown_fields(self, data, original_data, **kwargs):
         for key in original_data:
             if key not in self.fields:
-                raise ValidationError("Unknown field name {}".format(key))
+                raise ValidationError(f"Unknown field name {key}")
 
 
 class ProviderDetailsSchema(BaseSchema):
@@ -270,7 +267,7 @@ class ServiceSchema(BaseSchema, UUIDsAsStringsMixin):
         return [
             callback.id
             for callback in service.service_callback_api
-            if callback.callback_type == app.constants.DELIVERY_STATUS_CALLBACK_TYPE
+            if callback.callback_type == app.constants.ServiceCallbackTypes.delivery_status.value
         ]
 
     def _get_allowed_broadcast_provider(self, service):
@@ -326,6 +323,8 @@ class ServiceSchema(BaseSchema, UUIDsAsStringsMixin):
             "templates",
             "updated_at",
             "users",
+            "unsubscribe_request_reports",
+            "unsubscribe_requests",
             "version",
             "_name",
             "_normalised_service_name",
@@ -338,11 +337,11 @@ class ServiceSchema(BaseSchema, UUIDsAsStringsMixin):
         permissions = [v.permission for v in value]
         for p in permissions:
             if p not in app.constants.SERVICE_PERMISSION_TYPES:
-                raise ValidationError("Invalid Service Permission: '{}'".format(p))
+                raise ValidationError(f"Invalid Service Permission: '{p}'")
 
         if len(set(permissions)) != len(permissions):
-            duplicates = list(set([x for x in permissions if permissions.count(x) > 1]))
-            raise ValidationError("Duplicate Service Permission: {}".format(duplicates))
+            duplicates = list({x for x in permissions if permissions.count(x) > 1})
+            raise ValidationError(f"Duplicate Service Permission: {duplicates}")
 
     @pre_load()
     def format_for_data_model(self, in_data, **kwargs):
@@ -373,7 +372,7 @@ class DetailedServiceSchema(BaseSchema):
         return [
             callback.id
             for callback in service.service_callback_api
-            if callback.callback_type == app.constants.DELIVERY_STATUS_CALLBACK_TYPE
+            if callback.callback_type == app.constants.ServiceCallbackTypes.delivery_status.value
         ]
 
     class Meta(BaseSchema.Meta):
@@ -450,7 +449,7 @@ class BaseTemplateSchema(BaseSchema):
 
     class Meta(BaseSchema.Meta):
         model = models.Template
-        exclude = ("service_id", "jobs", "service_letter_contact_id")
+        exclude = ("service_id", "jobs", "service_letter_contact_id", "unsubscribe_requests")
 
 
 class TemplateSchema(BaseTemplateSchema, UUIDsAsStringsMixin):
@@ -483,6 +482,7 @@ class TemplateSchemaNoDetail(TemplateSchema):
             "created_at",
             "created_by",
             "created_by_id",
+            "has_unsubscribe_link",
             "hidden",
             "letter_attachment",
             "postage",
@@ -610,30 +610,12 @@ class SmsNotificationSchema(NotificationSchema):
         try:
             validate_phone_number(value, international=True)
         except InvalidPhoneError as error:
-            error_message = remap_phone_number_validation_messages(str(error))
-            raise ValidationError(f"Invalid phone number: {error_message}") from error
+            raise ValidationError(f"Invalid phone number: {error.get_legacy_v2_api_error_message()}") from error
 
     @post_load
     def format_phone_number(self, item, **kwargs):
         item["to"] = validate_and_format_phone_number(item["to"], international=True)
         return item
-
-
-class EmailNotificationSchema(NotificationSchema):
-    to = fields.Str(required=True)
-    template = fields.Str(required=True)
-
-    @validates("to")
-    def validate_to(self, value):
-        try:
-            validate_email_address(value)
-        except InvalidEmailError as e:
-            raise ValidationError(str(e)) from e
-
-
-class SmsTemplateNotificationSchema(SmsNotificationSchema):
-    template = fields.Str(required=True)
-    job = fields.String()
 
 
 class NotificationWithTemplateSchema(BaseSchema):
@@ -658,6 +640,7 @@ class NotificationWithTemplateSchema(BaseSchema):
             "letter_languages",
             "letter_welsh_subject",
             "letter_welsh_content",
+            "has_unsubscribe_link",
         ],
         dump_only=True,
     )
@@ -677,66 +660,6 @@ class NotificationWithTemplateSchema(BaseSchema):
             in_data.key_name = in_data.api_key.name
         else:
             in_data.key_name = None
-        return in_data
-
-
-class NotificationWithPersonalisationSchema(NotificationWithTemplateSchema):
-    template_history = fields.Nested(
-        TemplateHistorySchema,
-        attribute="template",
-        only=["id", "name", "template_type", "content", "subject", "version"],
-        dump_only=True,
-    )
-
-    class Meta(NotificationWithTemplateSchema.Meta):
-        # mark as many fields as possible as required since this is a public api.
-        # WARNING: Does _not_ reference fields computed in handle_template_merge, such as
-        # 'body', 'subject' [for emails], and 'content_char_count'
-        fields = (
-            # db rows
-            "billable_units",
-            "created_at",
-            "id",
-            "job_row_number",
-            "notification_type",
-            "reference",
-            "sent_at",
-            "sent_by",
-            "status",
-            "template_version",
-            "to",
-            "updated_at",
-            # computed fields
-            "personalisation",
-            # relationships
-            "api_key",
-            "job",
-            "service",
-            "template_history",
-        )
-        # Overwrite the `NotificationWithTemplateSchema` base class to not exclude `_personalisation`, which
-        # isn't a defined field for this class
-        exclude = ()
-
-    @pre_dump
-    def handle_personalisation_property(self, in_data, **kwargs):
-        self.personalisation = in_data.personalisation
-        return in_data
-
-    @post_dump
-    def handle_template_merge(self, in_data, **kwargs):
-        in_data["template"] = in_data.pop("template_history")
-        template = get_template_instance(in_data["template"], in_data["personalisation"])
-        in_data["body"] = template.content_with_placeholders_filled_in
-        if in_data["template"]["template_type"] != app.constants.SMS_TYPE:
-            in_data["subject"] = template.subject
-            in_data["content_char_count"] = None
-        else:
-            in_data["content_char_count"] = template.content_count
-
-        in_data.pop("personalisation", None)
-        in_data["template"].pop("content", None)
-        in_data["template"].pop("subject", None)
         return in_data
 
 
@@ -788,6 +711,7 @@ class NotificationsFilterSchema(ma.Schema):
     limit_days = fields.Int(required=False)
     include_jobs = fields.Boolean(required=False)
     include_from_test_key = fields.Boolean(required=False)
+    paginate_by_older_than = fields.Boolean(required=False)
     older_than = fields.UUID(required=False)
     format_for_csv = fields.String()
     to = fields.String()
@@ -797,7 +721,7 @@ class NotificationsFilterSchema(ma.Schema):
     @pre_load
     def handle_multidict(self, in_data, **kwargs):
         if isinstance(in_data, dict) and hasattr(in_data, "getlist"):
-            out_data = dict([(k, in_data.get(k)) for k in in_data.keys()])
+            out_data = {k: in_data.get(k) for k in in_data.keys()}
             if "template_type" in in_data:
                 out_data["template_type"] = [{"template_type": x} for x in in_data.getlist("template_type")]
             if "status" in in_data:
@@ -880,11 +804,8 @@ template_schema = TemplateSchema()
 template_schema_no_detail = TemplateSchemaNoDetail()
 api_key_schema = ApiKeySchema()
 job_schema = JobSchema()
-sms_template_notification_schema = SmsTemplateNotificationSchema()
-email_notification_schema = EmailNotificationSchema()
 notification_schema = NotificationModelSchema()
 notification_with_template_schema = NotificationWithTemplateSchema()
-notification_with_personalisation_schema = NotificationWithPersonalisationSchema()
 invited_user_schema = InvitedUserSchema()
 email_data_request_schema = EmailDataSchema()
 partial_email_data_request_schema = EmailDataSchema(partial_email=True)

@@ -29,8 +29,10 @@ from app.dao.notifications_dao import (
     dao_get_letters_to_be_printed,
     dao_get_notification_by_reference,
     dao_get_notification_count_for_job_id,
+    dao_get_notification_or_history_by_id,
     dao_get_notification_or_history_by_reference,
     dao_get_notifications_by_recipient_or_reference,
+    dao_record_letter_despatched_on_by_id,
     dao_timeout_notifications,
     dao_update_notification,
     dao_update_notifications_by_reference,
@@ -43,7 +45,7 @@ from app.dao.notifications_dao import (
     notifications_not_yet_sent,
     update_notification_status_by_id,
 )
-from app.models import Job, Notification, NotificationHistory
+from app.models import Job, LetterCostThreshold, Notification, NotificationHistory, NotificationLetterDespatch
 from tests.app.db import (
     create_ft_notification_status,
     create_job,
@@ -81,7 +83,7 @@ def test_should_not_update_status_by_id_if_not_sending_and_does_not_update_job(s
     assert sample_job == Job.query.get(notification.job_id)
 
 
-def test_should_update_status_by_id_if_created(sample_template, sample_notification):
+def test_should_update_status_by_id_if_created(sample_notification):
     assert Notification.query.get(sample_notification.id).status == "created"
     updated = update_notification_status_by_id(sample_notification.id, "failed")
     assert Notification.query.get(sample_notification.id).status == "failed"
@@ -356,6 +358,29 @@ def test_save_notification_with_no_job(sample_template, mmg_provider):
     assert notification_from_db.status == "created"
 
 
+@pytest.mark.parametrize(
+    "template_type, unsubscribe_link",
+    [
+        ("email", None),
+        ("email", "https://unsub.com"),
+        pytest.param("sms", "https://unsub.com", marks=pytest.mark.xfail(raises=IntegrityError)),
+    ],
+)
+def test_dao_create_notification_with_unsubscribe_link(
+    sample_template, sample_email_template, template_type, unsubscribe_link
+):
+    template_data = {"email": sample_email_template, "sms": sample_template}
+    notification_data = _notification_json(template_data[template_type])
+    notification_data["unsubscribe_link"] = unsubscribe_link
+    notification = Notification(**notification_data)
+
+    dao_create_notification(notification)
+
+    assert Notification.query.count() == 1
+    notification_from_db = Notification.query.all()[0]
+    assert notification_from_db.unsubscribe_link == unsubscribe_link
+
+
 def test_get_notification_with_personalisation_by_id(sample_template):
     notification = create_notification(template=sample_template, status="created")
     notification_from_db = get_notification_with_personalisation(
@@ -414,7 +439,7 @@ def test_save_notification_no_job_id(sample_template):
 
 
 def test_get_all_notifications_for_job(sample_job):
-    for _ in range(0, 5):
+    for _ in range(5):
         try:
             create_notification(template=sample_job.template, job=sample_job)
         except IntegrityError:
@@ -476,7 +501,7 @@ def test_should_limit_notifications_return_by_day_limit_plus_one(sample_template
 
     # create one notification a day between 1st and 9th
     for i in range(1, 11):
-        past_date = "2016-01-{0:02d}".format(i)
+        past_date = f"2016-01-{i:02d}"
         with freeze_time(past_date):
             create_notification(sample_template, created_at=datetime.utcnow(), status="failed")
 
@@ -773,6 +798,106 @@ def test_get_notifications_with_a_team_api_key_type(
         sample_job.service_id, limit_days=1, include_jobs=True, key_type=KEY_TYPE_TEAM
     ).items
     assert len(all_notifications) == 1
+
+
+def test_get_notifications_by_status(sample_job):
+    notifications = partial(get_notifications_for_service, sample_job.service.id)
+
+    for status in NOTIFICATION_STATUS_TYPES:
+        create_notification(template=sample_job.template, status=status)
+
+    assert len(notifications().items) == len(NOTIFICATION_STATUS_TYPES)
+
+    for status in NOTIFICATION_STATUS_TYPES:
+        if status == "failed":
+            assert len(notifications(filter_dict={"status": status}).items) == len(NOTIFICATION_STATUS_TYPES_FAILED)
+        else:
+            assert len(notifications(filter_dict={"status": status}).items) == 1
+
+    assert len(notifications(filter_dict={"status": NOTIFICATION_STATUS_TYPES[:3]}).items) == 3
+
+    # perhaps surprising, but this is because we've detected that we're including
+    # "all" status types and omitting the filter entirely. but this causes us to
+    # also return the "failed" notification. in real life we don't have any "failed"
+    # notifications anymore so this should never be observed - we're just abusing
+    # this quirk for the test
+    assert len(notifications(filter_dict={"status": list(set(NOTIFICATION_STATUS_TYPES) - {"failed"})}).items) == len(
+        NOTIFICATION_STATUS_TYPES
+    )
+
+
+@pytest.mark.parametrize("with_personalisation", (False, True))
+@pytest.mark.parametrize("with_template", (False, True))
+def test_get_notifications_for_service_optional_loading(
+    notify_db_session,
+    notify_db_session_log,
+    sample_job,
+    sample_api_key,
+    sample_team_api_key,
+    with_personalisation,
+    with_template,
+):
+    create_notification(template=sample_job.template, created_at=datetime.utcnow(), job=sample_job)
+    create_notification(
+        template=sample_job.template,
+        created_at=datetime.utcnow(),
+        api_key=sample_api_key,
+        key_type=sample_api_key.key_type,
+        personalisation={
+            "foo": "bar",
+            "baz": "123",
+        },
+    )
+    create_notification(
+        template=sample_job.template,
+        created_at=datetime.utcnow(),
+        api_key=sample_team_api_key,
+        key_type=sample_team_api_key.key_type,
+        personalisation={
+            "foo": "bar",
+            "baz": "123",
+        },
+    )
+
+    notifications = get_notifications_for_service(
+        sample_job.service_id,
+        count_pages=False,
+        with_personalisation=with_personalisation,
+        with_template=with_template,
+    ).items
+    assert len(notifications) == 2
+
+    notify_db_session_log[:] = []
+    assert notifications[0].personalisation == {
+        "foo": "bar",
+        "baz": "123",
+    }
+    assert len(notify_db_session_log) == 0 if with_personalisation else 1
+
+    notify_db_session_log[:] = []
+    assert notifications[0].template
+    assert len(notify_db_session_log) == 0 if with_template else 1
+
+    notify_db_session_log[:] = []
+    assert notifications[0].api_key
+    assert len(notify_db_session_log) == 0  # api_key always joinedload
+
+    notify_db_session_log[:] = []
+    assert notifications[1].personalisation == {
+        "foo": "bar",
+        "baz": "123",
+    }
+    assert len(notify_db_session_log) == 0 if with_personalisation else 1
+
+    notify_db_session_log[:] = []
+    assert notifications[1].template
+    # both notifications share the same template, sqlalchemy's identity map knows
+    # a re-fetch is not needed
+    assert len(notify_db_session_log) == 0
+
+    notify_db_session_log[:] = []
+    assert notifications[1].api_key
+    assert len(notify_db_session_log) == 0  # api_key always joinedload
 
 
 def test_should_exclude_test_key_notifications_by_default(
@@ -1344,7 +1469,7 @@ def test_dao_get_last_notification_added_for_job_id_no_notifications(sample_temp
     assert dao_get_last_notification_added_for_job_id(job.id) is None
 
 
-def test_dao_get_last_notification_added_for_job_id_no_job(sample_template, fake_uuid):
+def test_dao_get_last_notification_added_for_job_id_no_job(fake_uuid):
     assert dao_get_last_notification_added_for_job_id(fake_uuid) is None
 
 
@@ -1496,47 +1621,27 @@ def test_notifications_not_yet_sent_return_no_rows(sample_service, notification_
     assert len(results) == 0
 
 
-def test_letters_to_be_printed_sort_by_service(notify_db_session):
+def test_letters_to_be_printed_returns_ids(notify_db_session):
     first_service = create_service(service_name="first service", service_id="3a5cea08-29fd-4bb9-b582-8dedd928b149")
     second_service = create_service(service_name="second service", service_id="642bf33b-54b5-45f2-8c13-942a46616704")
     first_template = create_template(service=first_service, template_type="letter", postage="second")
     second_template = create_template(service=second_service, template_type="letter", postage="second")
-    letters_ordered_by_service_then_time = [
-        create_notification(template=first_template, created_at=datetime(2020, 12, 1, 9, 30)),
-        create_notification(template=first_template, created_at=datetime(2020, 12, 1, 12, 30)),
-        create_notification(template=first_template, created_at=datetime(2020, 12, 1, 13, 30)),
-        create_notification(template=first_template, created_at=datetime(2020, 12, 1, 14, 30)),
-        create_notification(template=first_template, created_at=datetime(2020, 12, 1, 15, 30)),
-        create_notification(template=second_template, created_at=datetime(2020, 12, 1, 8, 30)),
-        create_notification(template=second_template, created_at=datetime(2020, 12, 1, 8, 31)),
-        create_notification(template=second_template, created_at=datetime(2020, 12, 1, 8, 32)),
-        create_notification(template=second_template, created_at=datetime(2020, 12, 1, 8, 33)),
-        create_notification(template=second_template, created_at=datetime(2020, 12, 1, 8, 34)),
-    ]
+    email_template = create_template(service=first_service, template_type="email")
 
-    results = list(
-        dao_get_letters_to_be_printed(
-            print_run_deadline_local=datetime(2020, 12, 1, 17, 30), postage="second", query_limit=4
-        )
-    )
-    assert [x.id for x in results] == [x.id for x in letters_ordered_by_service_then_time]
+    printed_notifications = {
+        create_notification(first_template, created_at=datetime(2020, 12, 1, 9, 30)),
+        create_notification(second_template, created_at=datetime(2020, 12, 1, 8, 30)),
+    }
+    # unprinted_notifications
+    create_notification(first_template, created_at=datetime(2020, 12, 1, 17, 31))  # too late
+    create_notification(first_template, created_at=datetime(2020, 12, 1, 9, 30), key_type="test")  # wrong keytype
+    create_notification(first_template, created_at=datetime(2020, 12, 1, 9, 30), key_type="test")  # wrong keytype
+    create_notification(email_template, created_at=datetime(2020, 12, 1, 9, 30))  # email
+    # no billable units (probably still in virus scan/sanitsation phase)
+    create_notification(template=first_template, created_at=datetime(2020, 12, 1, 9, 31), billable_units=0)
 
-
-def test_letters_to_be_printed_does_not_include_letters_without_billable_units_set(
-    notify_db_session, sample_letter_template
-):
-    included_letter = create_notification(
-        template=sample_letter_template, created_at=datetime(2020, 12, 1, 9, 30), billable_units=3
-    )
-    create_notification(template=sample_letter_template, created_at=datetime(2020, 12, 1, 9, 31), billable_units=0)
-
-    results = list(
-        dao_get_letters_to_be_printed(
-            print_run_deadline_local=datetime(2020, 12, 1, 17, 30), postage="second", query_limit=4
-        )
-    )
-    assert len(results) == 1
-    assert results[0].id == included_letter.id
+    results = list(dao_get_letters_to_be_printed(print_run_deadline_local=datetime(2020, 12, 1, 17, 30), query_limit=4))
+    assert sorted(x.id for x in results) == sorted(x.id for x in printed_notifications)
 
 
 def test_dao_get_letters_and_sheets_volume_by_postage(notify_db_session):
@@ -1598,3 +1703,34 @@ def test_get_service_ids_with_notifications_on_date_checks_ft_status(
 
     assert len(get_service_ids_with_notifications_on_date(SMS_TYPE, date(2022, 1, 1))) == 1
     assert len(get_service_ids_with_notifications_on_date(SMS_TYPE, date(2022, 1, 2))) == 1
+
+
+def test_dao_get_notification_or_history_by_id_when_notification_exists(sample_notification):
+    notification = dao_get_notification_or_history_by_id(sample_notification.id)
+
+    assert sample_notification == notification
+
+
+def test_dao_get_notification_or_history_by_id_when_notification_history_exists(sample_notification_history):
+    notification = dao_get_notification_or_history_by_id(sample_notification_history.id)
+
+    assert sample_notification_history == notification
+
+
+def test_dao_record_letter_despatched_on_by_id(notify_db_session):
+    notification_id = uuid.uuid4()
+
+    dao_record_letter_despatched_on_by_id(notification_id, date(2024, 3, 7), LetterCostThreshold("sorted"))
+    letter_despatch = NotificationLetterDespatch.query.one()
+
+    assert letter_despatch.notification_id == notification_id
+    assert letter_despatch.despatched_on == date(2024, 3, 7)
+    assert letter_despatch.cost_threshold == LetterCostThreshold.sorted
+
+    # Calling the function with a notification_id that already exists updates the row
+    dao_record_letter_despatched_on_by_id(notification_id, date(2024, 3, 8), LetterCostThreshold("unsorted"))
+    letter_despatch = NotificationLetterDespatch.query.one()
+
+    assert letter_despatch.notification_id == notification_id
+    assert letter_despatch.despatched_on == date(2024, 3, 8)
+    assert letter_despatch.cost_threshold == LetterCostThreshold.unsorted

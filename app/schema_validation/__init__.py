@@ -5,14 +5,9 @@ from uuid import UUID
 
 from iso8601 import ParseError, iso8601
 from jsonschema import Draft7Validator, FormatChecker, ValidationError
-from notifications_utils.recipients import (
-    InvalidEmailError,
-    InvalidPhoneError,
-    validate_email_address,
-    validate_phone_number,
-)
-
-from app.notifications.validators import remap_phone_number_validation_messages
+from notifications_utils.recipient_validation.email_address import validate_email_address
+from notifications_utils.recipient_validation.errors import InvalidEmailError, InvalidPhoneError
+from notifications_utils.recipient_validation.phone_number import PhoneNumber
 
 format_checker = FormatChecker()
 
@@ -24,13 +19,18 @@ def validate_uuid(instance):
     return True
 
 
-@format_checker.checks("phone_number", raises=InvalidPhoneError)
+@format_checker.checks("phone_number", raises=ValidationError)
 def validate_schema_phone_number(instance):
     if isinstance(instance, str):
         try:
-            validate_phone_number(instance, international=True)
-        except InvalidPhoneError as error:
-            raise InvalidPhoneError(remap_phone_number_validation_messages(str(error))) from error
+            number = PhoneNumber(instance)
+            number.validate(
+                allow_international_number=True,
+                allow_uk_landline=True,
+            )
+        except InvalidPhoneError as e:
+            legacy_message = e.get_legacy_v2_api_error_message()
+            raise ValidationError(legacy_message) from None
     return True
 
 
@@ -43,6 +43,20 @@ def validate_schema_email_address(instance):
 
 @format_checker.checks("postage", raises=ValidationError)
 def validate_schema_postage(instance):
+    """
+    For validating postage on templates and user requests, where postage can only be `first` or `second`
+    """
+    if isinstance(instance, str):
+        if instance not in ["first", "second"]:
+            raise ValidationError("invalid. It must be either first or second.")
+    return True
+
+
+@format_checker.checks("postage_including_international", raises=ValidationError)
+def validate_schema_postage_including_international(instance):
+    """
+    For validating postage sent by admin when sending a precompiled letter, where postage can include international
+    """
     if isinstance(instance, str):
         if instance not in ["first", "second", "europe", "rest-of-world"]:
             raise ValidationError("invalid. It must be first, second, europe or rest-of-world.")
@@ -112,17 +126,13 @@ def send_a_file_confirm_email_before_download(instance):
     )
 
 
-@format_checker.checks("datetime", raises=ValidationError)
-def validate_schema_datetime(instance):
+@format_checker.checks("letter_production_run_date", raises=ValidationError)
+def validate_letter_production_run_date(instance):
     if isinstance(instance, str):
-        try:
-            iso8601.parse_date(instance)
-        except ParseError as e:
-            raise ValidationError(
-                "datetime format is invalid. It must be a valid ISO8601 date time format, "
-                "https://en.wikipedia.org/wiki/ISO_8601"
-            ) from e
-    return True
+        if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+", instance):
+            return True
+
+    raise ValidationError("Datetime format is invalid. It must be in the format %Y-%m-%d %H:%M:%S.%f")
 
 
 def validate(json_to_validate, schema):
@@ -175,6 +185,6 @@ def __format_message(e):
     path = get_path(e)
     message = get_error_message(e)
     if path:
-        return "{} {}".format(path, message)
+        return f"{path} {message}"
     else:
-        return "{}".format(message)
+        return f"{message}"

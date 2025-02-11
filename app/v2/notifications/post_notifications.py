@@ -3,30 +3,26 @@ import functools
 import uuid
 from datetime import datetime
 
-import botocore
 from flask import abort, current_app, jsonify, request
 from gds_metrics import Histogram
-from notifications_utils.recipients import try_validate_and_format_phone_number
+from notifications_utils.recipient_validation.phone_number import try_validate_and_format_phone_number
 
 from app import (
     api_user,
     authenticated_service,
     document_download_client,
     notify_celery,
-    signing,
 )
 from app.celery.letters_pdf_tasks import (
     get_pdf_for_templated_letter,
     sanitise_letter,
 )
-from app.celery.research_mode_tasks import create_fake_letter_response_file
-from app.celery.tasks import save_api_email, save_api_sms
+from app.celery.research_mode_tasks import create_fake_letter_callback
 from app.clients.document_download import DocumentDownloadError
 from app.config import QueueNames, TaskNames
 from app.constants import (
     DEFAULT_DOCUMENT_DOWNLOAD_RETENTION_PERIOD,
     EMAIL_TYPE,
-    KEY_TYPE_NORMAL,
     KEY_TYPE_TEAM,
     KEY_TYPE_TEST,
     LETTER_TYPE,
@@ -39,7 +35,6 @@ from app.constants import (
 from app.dao.dao_utils import transaction
 from app.dao.templates_dao import get_precompiled_letter_template
 from app.letters.utils import upload_letter_pdf
-from app.models import Notification
 from app.notifications.process_letter_notifications import (
     create_letter_notification,
 )
@@ -60,7 +55,6 @@ from app.notifications.validators import (
     validate_template,
 )
 from app.schema_validation import validate
-from app.utils import DATETIME_FORMAT
 from app.v2.errors import BadRequestError
 from app.v2.notifications import v2_notification_blueprint
 from app.v2.notifications.create_response import (
@@ -83,7 +77,7 @@ POST_NOTIFICATION_JSON_PARSE_DURATION_SECONDS = Histogram(
 )
 
 
-@v2_notification_blueprint.route("/{}".format(LETTER_TYPE), methods=["POST"])
+@v2_notification_blueprint.route(f"/{LETTER_TYPE}", methods=["POST"])
 def post_precompiled_letter_notification():
     request_json = get_valid_json()
     if "content" not in (request_json or {}):
@@ -91,8 +85,7 @@ def post_precompiled_letter_notification():
 
     form = validate(request_json, post_precompiled_letter_request)
 
-    # Check permission to send letters
-    check_service_has_permission(LETTER_TYPE, authenticated_service.permissions)
+    check_service_has_permission(authenticated_service, LETTER_TYPE)
 
     check_rate_limiting(authenticated_service, api_user, notification_type=LETTER_TYPE)
 
@@ -129,7 +122,7 @@ def post_notification(notification_type):
         else:
             abort(404)
 
-    check_service_has_permission(notification_type, authenticated_service.permissions)
+    check_service_has_permission(authenticated_service, notification_type)
 
     check_rate_limiting(authenticated_service, api_user, notification_type=notification_type)
 
@@ -161,6 +154,7 @@ def post_notification(notification_type):
             template_process_type=template.process_type,
             service=authenticated_service,
             reply_to_text=reply_to,
+            unsubscribe_link=form.get("one_click_unsubscribe_url", None),
         )
 
     return jsonify(notification), 201
@@ -175,6 +169,7 @@ def process_sms_or_email_notification(
     template_process_type,
     service,
     reply_to_text=None,
+    unsubscribe_link=None,
 ):
     notification_id = uuid.uuid4()
     form_send_to = form["email_address"] if notification_type == EMAIL_TYPE else form["phone_number"]
@@ -199,7 +194,7 @@ def process_sms_or_email_notification(
     # validate content length after url is replaced in personalisation.
     check_is_message_too_long(template_with_content)
 
-    resp = create_response_for_post_notification(
+    response = create_response_for_post_notification(
         notification_id=notification_id,
         client_reference=form.get("reference", None),
         template_id=template.id,
@@ -207,35 +202,9 @@ def process_sms_or_email_notification(
         service_id=service.id,
         notification_type=notification_type,
         reply_to=reply_to_text,
+        unsubscribe_link=unsubscribe_link,
         template_with_content=template_with_content,
     )
-
-    if service.high_volume and api_user.key_type == KEY_TYPE_NORMAL and notification_type in [EMAIL_TYPE, SMS_TYPE]:
-        # Put service with high volumes of notifications onto a queue
-        # To take the pressure off the db for API requests put the notification for our high volume service onto a queue
-        # the task will then save the notification, then call send_notification_to_queue.
-        # NOTE: The high volume service should be aware that the notification is not immediately
-        # available by a GET request, it is recommend they use callbacks to keep track of status updates.
-        try:
-            save_email_or_sms_to_queue(
-                form=form,
-                notification_id=str(notification_id),
-                notification_type=notification_type,
-                api_key=api_user,
-                template=template,
-                service_id=service.id,
-                personalisation=personalisation,
-                document_download_count=document_download_count,
-                reply_to_text=reply_to_text,
-            )
-            return resp
-        except (botocore.exceptions.ClientError, botocore.parsers.ResponseParserError):
-            # If SQS cannot put the task on the queue, it's probably because the notification body was too long and it
-            # went over SQS's 256kb message limit. If the body is very large, it may exceed the HTTP max content length;
-            # the exception we get here isn't handled correctly by botocore - we get a ResponseParserError instead.
-            current_app.logger.info(
-                "Notification %s failed to save to high volume queue. Using normal flow instead", notification_id
-            )
 
     persist_notification(
         notification_id=notification_id,
@@ -250,6 +219,7 @@ def process_sms_or_email_notification(
         client_reference=form.get("reference", None),
         simulated=simulated,
         reply_to_text=reply_to_text,
+        unsubscribe_link=unsubscribe_link,
         document_download_count=document_download_count,
     )
 
@@ -262,45 +232,7 @@ def process_sms_or_email_notification(
     else:
         current_app.logger.debug("POST simulated notification for id: %s", notification_id)
 
-    return resp
-
-
-def save_email_or_sms_to_queue(
-    *,
-    notification_id,
-    form,
-    notification_type,
-    api_key,
-    template,
-    service_id,
-    personalisation,
-    document_download_count,
-    reply_to_text=None,
-):
-    data = {
-        "id": notification_id,
-        "template_id": str(template.id),
-        "template_version": template.version,
-        "to": form["email_address"] if notification_type == EMAIL_TYPE else form["phone_number"],
-        "service_id": str(service_id),
-        "personalisation": personalisation,
-        "notification_type": notification_type,
-        "api_key_id": str(api_key.id),
-        "key_type": api_key.key_type,
-        "client_reference": form.get("reference", None),
-        "reply_to_text": reply_to_text,
-        "document_download_count": document_download_count,
-        "status": NOTIFICATION_CREATED,
-        "created_at": datetime.utcnow().strftime(DATETIME_FORMAT),
-    }
-    encoded = signing.encode(data)
-
-    if notification_type == EMAIL_TYPE:
-        save_api_email.apply_async([encoded], queue=QueueNames.SAVE_API_EMAIL)
-    elif notification_type == SMS_TYPE:
-        save_api_sms.apply_async([encoded], queue=QueueNames.SAVE_API_SMS)
-
-    return Notification(**data)
+    return response
 
 
 def process_document_uploads(personalisation_data, service, send_to: str, simulated=False):
@@ -376,7 +308,7 @@ def process_letter_notification(
     updated_at = None
     if test_key:
         # if we don't want to actually send the letter, then start it off in SENDING so we don't pick it up
-        if current_app.config["NOTIFY_ENVIRONMENT"] in ["preview", "development"]:
+        if not current_app.config["SEND_LETTERS_ENABLED"]:
             status = NOTIFICATION_SENDING
         # mark test letter as delivered and do not create a fake response later
         else:
@@ -398,8 +330,11 @@ def process_letter_notification(
 
     get_pdf_for_templated_letter.apply_async([str(notification.id)], queue=queue)
 
-    if test_key and current_app.config["NOTIFY_ENVIRONMENT"] in ["preview", "development"]:
-        create_fake_letter_response_file.apply_async((notification.reference,), queue=queue)
+    if test_key and not current_app.config["SEND_LETTERS_ENABLED"]:
+        create_fake_letter_callback.apply_async(
+            [notification.id, notification.billable_units, notification.postage],
+            queue=queue,
+        )
 
     resp = create_response_for_post_notification(
         notification_id=notification.id,
@@ -483,6 +418,7 @@ def create_response_for_post_notification(
     notification_type,
     reply_to,
     template_with_content,
+    unsubscribe_link=None,
 ):
     if notification_type == SMS_TYPE:
         create_resp_partial = functools.partial(
@@ -494,13 +430,14 @@ def create_response_for_post_notification(
             create_post_email_response_from_notification,
             subject=template_with_content.subject,
             email_from=f"{authenticated_service.email_sender_local_part}@{current_app.config['NOTIFY_EMAIL_DOMAIN']}",
+            unsubscribe_link=unsubscribe_link,
         )
     elif notification_type == LETTER_TYPE:
         create_resp_partial = functools.partial(
             create_post_letter_response_from_notification,
             subject=template_with_content.subject,
         )
-    resp = create_resp_partial(
+    response = create_resp_partial(
         notification_id,
         client_reference,
         template_id,
@@ -509,4 +446,4 @@ def create_response_for_post_notification(
         url_root=request.url_root,
         content=template_with_content.content_with_placeholders_filled_in,
     )
-    return resp
+    return response

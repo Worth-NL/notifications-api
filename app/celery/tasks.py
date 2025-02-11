@@ -1,22 +1,17 @@
-import json
-from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Sequence
 from datetime import datetime
 
 from flask import current_app
 from notifications_utils.insensitive_dict import InsensitiveDict
-from notifications_utils.postal_address import PostalAddress
+from notifications_utils.recipient_validation.postal_address import PostalAddress
 from notifications_utils.recipients import RecipientCSV
-from notifications_utils.timezones import convert_utc_to_bst
-from requests import HTTPError, RequestException, request
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 
 from app import create_random_identifier, create_uuid, notify_celery, signing
 from app.aws import s3
 from app.celery import letters_pdf_tasks, provider_tasks
 from app.config import QueueNames
 from app.constants import (
-    DVLA_RESPONSE_STATUS_SENT,
     EMAIL_TYPE,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_FINISHED,
@@ -25,40 +20,31 @@ from app.constants import (
     KEY_TYPE_NORMAL,
     LETTER_TYPE,
     NOTIFICATION_CREATED,
-    NOTIFICATION_DELIVERED,
     NOTIFICATION_RETURNED_LETTER,
-    NOTIFICATION_TEMPORARY_FAILURE,
     SMS_TYPE,
 )
-from app.dao.daily_sorted_letter_dao import (
-    dao_create_or_update_daily_sorted_letter,
-)
-from app.dao.inbound_sms_dao import dao_get_inbound_sms_by_id
 from app.dao.jobs_dao import dao_get_job_by_id, dao_update_job
 from app.dao.notifications_dao import (
     dao_get_last_notification_added_for_job_id,
-    dao_get_notification_or_history_by_reference,
-    dao_record_letter_despatched_on,
     dao_update_notifications_by_reference,
     get_notification_by_id,
 )
 from app.dao.returned_letters_dao import insert_returned_letters
 from app.dao.service_email_reply_to_dao import dao_get_reply_to_by_id
-from app.dao.service_inbound_api_dao import get_service_inbound_api_for_service
 from app.dao.service_sms_sender_dao import dao_get_service_sms_senders_by_id
 from app.dao.templates_dao import dao_get_template_by_id
-from app.exceptions import DVLAException
-from app.models import DailySortedLetter, LetterCostThreshold
 from app.notifications.process_notifications import persist_notification
 from app.notifications.validators import check_service_over_daily_message_limit
 from app.serialised_models import SerialisedService, SerialisedTemplate
 from app.service.utils import service_allowed_to_send_to
-from app.utils import DATETIME_FORMAT
+from app.utils import batched
 from app.v2.errors import TooManyRequestsError
+
+DEFAULT_SHATTER_JOB_ROWS_BATCH_SIZE = 32
 
 
 @notify_celery.task(name="process-job")
-def process_job(job_id, sender_id=None):
+def process_job(job_id, sender_id=None, shatter_batch_size=DEFAULT_SHATTER_JOB_ROWS_BATCH_SIZE):
     start = datetime.utcnow()
     job = dao_get_job_by_id(job_id)
     current_app.logger.info("Starting process-job task for job id %s with status: %s", job_id, job.job_status)
@@ -85,10 +71,42 @@ def process_job(job_id, sender_id=None):
 
     current_app.logger.info("Starting job %s processing %s notifications", job_id, job.notification_count)
 
-    for row in recipient_csv.get_rows():
-        process_row(row, template, job, service, sender_id=sender_id)
+    for shatter_batch in batched(recipient_csv.get_rows(), n=shatter_batch_size):
+        batch_args_kwargs = [
+            get_id_task_args_kwargs_for_job_row(row, template, job, service, sender_id=sender_id)[1]
+            for row in shatter_batch
+        ]
+        shatter_job_rows.apply_async(
+            (
+                template.template_type,
+                batch_args_kwargs,
+            ),
+            queue=QueueNames.JOBS,
+        )
 
     job_complete(job, start=start)
+
+
+@notify_celery.task(name="shatter-job-rows")
+def shatter_job_rows(
+    template_type: str,
+    args_kwargs_seq: Sequence,
+):
+    for task_args_kwargs in args_kwargs_seq:
+        process_job_row(template_type, task_args_kwargs)
+
+
+def process_job_row(template_type, task_args_kwargs):
+    send_fn = {
+        SMS_TYPE: save_sms,
+        EMAIL_TYPE: save_email,
+        LETTER_TYPE: save_letter,
+    }[template_type]
+
+    send_fn.apply_async(
+        *task_args_kwargs,
+        queue=QueueNames.DATABASE,
+    )
 
 
 def job_complete(job, resumed=False, start=None):
@@ -116,8 +134,7 @@ def get_recipient_csv_and_template_and_sender_id(job):
     return recipient_csv, template, meta_data.get("sender_id")
 
 
-def process_row(row, template, job, service, sender_id=None):
-    template_type = template.template_type
+def get_id_task_args_kwargs_for_job_row(row, template, job, service, sender_id=None):
     encoded = signing.encode(
         {
             "template": str(template.id),
@@ -131,25 +148,18 @@ def process_row(row, template, job, service, sender_id=None):
         }
     )
 
-    send_fns = {SMS_TYPE: save_sms, EMAIL_TYPE: save_email, LETTER_TYPE: save_letter}
-
-    send_fn = send_fns[template_type]
+    notification_id = create_uuid()
+    task_args = (
+        str(service.id),
+        notification_id,
+        encoded,
+    )
 
     task_kwargs = {}
     if sender_id:
         task_kwargs["sender_id"] = sender_id
 
-    notification_id = create_uuid()
-    send_fn.apply_async(
-        (
-            str(service.id),
-            notification_id,
-            encoded,
-        ),
-        task_kwargs,
-        queue=QueueNames.DATABASE,
-    )
-    return notification_id
+    return notification_id, (task_args, task_kwargs)
 
 
 def __sending_limits_for_job_exceeded(service, job, job_id):
@@ -254,6 +264,7 @@ def save_email(self, service_id, notification_id, encoded_notification, sender_i
         saved_notification = persist_notification(
             template_id=notification["template"],
             template_version=notification["template_version"],
+            template_has_unsubscribe_link=template.has_unsubscribe_link,
             recipient=notification["to"],
             service=service,
             personalisation=notification.get("personalisation"),
@@ -276,57 +287,6 @@ def save_email(self, service_id, notification_id, encoded_notification, sender_i
         current_app.logger.debug("Email %s created at %s", saved_notification.id, saved_notification.created_at)
     except SQLAlchemyError as e:
         handle_exception(self, notification, notification_id, e)
-
-
-@notify_celery.task(bind=True, name="save-api-email", max_retries=5, default_retry_delay=300)
-def save_api_email(self, encoded_notification):
-    save_api_email_or_sms(self, encoded_notification)
-
-
-@notify_celery.task(bind=True, name="save-api-sms", max_retries=5, default_retry_delay=300)
-def save_api_sms(self, encoded_notification):
-    save_api_email_or_sms(self, encoded_notification)
-
-
-def save_api_email_or_sms(self, encoded_notification):
-    notification = signing.decode(encoded_notification)
-    service = SerialisedService.from_id(notification["service_id"])
-    provider_task = (
-        provider_tasks.deliver_email if notification["notification_type"] == EMAIL_TYPE else provider_tasks.deliver_sms
-    )
-    try:
-        persist_notification(
-            notification_id=notification["id"],
-            template_id=notification["template_id"],
-            template_version=notification["template_version"],
-            recipient=notification["to"],
-            service=service,
-            personalisation=notification.get("personalisation"),
-            notification_type=notification["notification_type"],
-            client_reference=notification["client_reference"],
-            api_key_id=notification.get("api_key_id"),
-            key_type=KEY_TYPE_NORMAL,
-            created_at=notification["created_at"],
-            reply_to_text=notification["reply_to_text"],
-            status=notification["status"],
-            document_download_count=notification["document_download_count"],
-        )
-
-        q = QueueNames.SEND_EMAIL if notification["notification_type"] == EMAIL_TYPE else QueueNames.SEND_SMS
-        provider_task.apply_async([notification["id"]], queue=q)
-        current_app.logger.debug(
-            "%s %s has been persisted and sent to delivery queue.",
-            notification["notification_type"],
-            notification["id"],
-        )
-    except IntegrityError:
-        current_app.logger.info("%s %s already exists.", notification["notification_type"], notification["id"])
-
-    except SQLAlchemyError:
-        try:
-            self.retry(queue=QueueNames.RETRY)
-        except self.MaxRetriesExceededError:
-            current_app.logger.error("Max retry failed Failed to persist notification %s", notification["id"])
 
 
 @notify_celery.task(bind=True, name="save-letter", max_retries=5, default_retry_delay=300)
@@ -395,205 +355,8 @@ def handle_exception(task, notification, notification_id, exc):
             current_app.logger.error("Max retry failed %s", retry_msg)
 
 
-@notify_celery.task(bind=True, name="update-letter-notifications-statuses")
-def update_letter_notifications_statuses(self, filename):
-    current_app.logger.info("update_letter_notifications_statuses has started for filename %s", filename)
-    notification_updates = parse_dvla_file(filename)
-
-    temporary_failures = []
-
-    for update in notification_updates:
-        check_billable_units(update)
-        update_letter_notification(filename, temporary_failures, update)
-    if temporary_failures:
-        # This will alert Notify that DVLA was unable to deliver the letters, we need to investigate
-        message = "DVLA response file: {filename} has failed letters with notification.reference {failures}".format(
-            filename=filename, failures=temporary_failures
-        )
-        raise DVLAException(message)
-    current_app.logger.info("update_letter_notifications_statuses has finished for filename %s", filename)
-
-
-@notify_celery.task(bind=True, name="record-daily-sorted-counts")
-def record_daily_sorted_counts(self, filename):
-    current_app.logger.info("record_daily_sorted_counts has started for filename %s", filename)
-    sorted_letter_counts = defaultdict(int)
-    notification_updates = parse_dvla_file(filename)
-    for update in notification_updates:
-        sorted_letter_counts[update.cost_threshold.value] += 1
-
-    billing_date = get_billing_date_in_bst_from_filename(filename)
-    persist_daily_sorted_letter_counts(day=billing_date, file_name=filename, sorted_letter_counts=sorted_letter_counts)
-    current_app.logger.info("record_daily_sorted_counts has finished for filename %s", filename)
-
-
-def parse_dvla_file(filename):
-    bucket_location = "{}-ftp".format(current_app.config["NOTIFY_EMAIL_DOMAIN"])
-    response_file_content = s3.get_s3_file(bucket_location, filename)
-    return process_updates_from_file(response_file_content, filename=filename)
-
-
-def get_billing_date_in_bst_from_filename(filename):
-    # exclude seconds from the date since we don't need it. We got a date ending in 60 second - which is not valid.
-    datetime_string = filename.split("-")[1][:-2]
-    datetime_obj = datetime.strptime(datetime_string, "%Y%m%d%H%M")
-    return convert_utc_to_bst(datetime_obj).date()
-
-
-def persist_daily_sorted_letter_counts(day, file_name, sorted_letter_counts):
-    daily_letter_count = DailySortedLetter(
-        billing_day=day,
-        file_name=file_name,
-        unsorted_count=sorted_letter_counts["unsorted"],
-        sorted_count=sorted_letter_counts["sorted"],
-    )
-    dao_create_or_update_daily_sorted_letter(daily_letter_count)
-
-
-@dataclass
-class NotificationUpdate:
-    reference: str
-    status: str
-    page_count: str
-    cost_threshold: LetterCostThreshold
-    despatch_date: str
-
-
-def process_updates_from_file(response_file, filename):
-    notification_updates = []
-    invalid_statuses = set()
-
-    for line in response_file.splitlines():
-        try:
-            reference, status, page_count, raw_cost_threshold, despatch_date = line.split("|")
-        except ValueError as e:
-            raise DVLAException("DVLA response file: {} has an invalid format".format(filename)) from e
-
-        try:
-            cost_threshold = LetterCostThreshold(raw_cost_threshold.lower())
-        except ValueError:
-            invalid_statuses.add(raw_cost_threshold.lower())
-            continue
-
-        notification_updates.append(
-            NotificationUpdate(
-                reference=reference,
-                status=status,
-                page_count=page_count,
-                cost_threshold=cost_threshold,
-                despatch_date=despatch_date,
-            )
-        )
-
-    if invalid_statuses:
-        raise DVLAException(f"DVLA response file: {filename} contains unknown Sorted status {invalid_statuses}")
-
-    return notification_updates
-
-
-def update_letter_notification(filename: str, temporary_failures: list, update: NotificationUpdate):
-    if update.status == DVLA_RESPONSE_STATUS_SENT:
-        status = NOTIFICATION_DELIVERED
-    else:
-        status = NOTIFICATION_TEMPORARY_FAILURE
-        temporary_failures.append(update.reference)
-
-    updated_count, _ = dao_update_notifications_by_reference(
-        references=[update.reference], update_dict={"status": status, "updated_at": datetime.utcnow()}
-    )
-    dao_record_letter_despatched_on(
-        reference=update.reference, despatched_on=update.despatch_date, cost_threshold=update.cost_threshold
-    )
-
-    if not updated_count:
-        current_app.logger.info(
-            "Update letter notification file %s failed: notification either not found "
-            "or already updated from delivered. Status %s for notification reference %s",
-            filename,
-            status,
-            update.reference,
-        )
-
-
-def check_billable_units(notification_update):
-    notification = dao_get_notification_or_history_by_reference(notification_update.reference)
-
-    if int(notification_update.page_count) != notification.billable_units:
-        current_app.logger.error(
-            "Notification with id %s has %s billable_units but DVLA says page count is %s",
-            notification.id,
-            notification.billable_units,
-            notification_update.page_count,
-        )
-
-
-@notify_celery.task(bind=True, name="send-inbound-sms", max_retries=5, default_retry_delay=300)
-def send_inbound_sms_to_service(self, inbound_sms_id, service_id):
-    inbound_api = get_service_inbound_api_for_service(service_id=service_id)
-    if not inbound_api:
-        # No API data has been set for this service
-        return
-
-    inbound_sms = dao_get_inbound_sms_by_id(service_id=service_id, inbound_id=inbound_sms_id)
-    data = {
-        "id": str(inbound_sms.id),
-        # TODO: should we be validating and formatting the phone number here?
-        "source_number": inbound_sms.user_number,
-        "destination_number": inbound_sms.notify_number,
-        "message": inbound_sms.content,
-        "date_received": inbound_sms.provider_date.strftime(DATETIME_FORMAT),
-    }
-
-    try:
-        response = request(
-            method="POST",
-            url=inbound_api.url,
-            data=json.dumps(data),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer {}".format(inbound_api.bearer_token)},
-            timeout=60,
-        )
-        current_app.logger.debug(
-            "send_inbound_sms_to_service sending %s to %s, response %s",
-            inbound_sms_id,
-            inbound_api.url,
-            response.status_code,
-        )
-        response.raise_for_status()
-    except RequestException as e:
-        current_app.logger.warning(
-            "send_inbound_sms_to_service failed for service_id: %s for inbound_sms_id: %s and url: %s. exception: %s",
-            service_id,
-            inbound_sms_id,
-            inbound_api.url,
-            e,
-        )
-        if not isinstance(e, HTTPError) or e.response.status_code >= 500:
-            try:
-                self.retry(queue=QueueNames.RETRY)
-            except self.MaxRetriesExceededError:
-                current_app.logger.error(
-                    (
-                        "Retry: send_inbound_sms_to_service has retried the max number of times "
-                        "for service: %s and inbound_sms %s"
-                    ),
-                    service_id,
-                    inbound_sms_id,
-                )
-        else:
-            current_app.logger.warning(
-                (
-                    "send_inbound_sms_to_service is not being retried for service_id: %s "
-                    "for inbound_sms id: %s and url: %s. exception: %s"
-                ),
-                service_id,
-                inbound_sms_id,
-                inbound_api.url,
-                e,
-            )
-
-
 @notify_celery.task(name="process-incomplete-jobs")
-def process_incomplete_jobs(job_ids):
+def process_incomplete_jobs(job_ids, shatter_batch_size=DEFAULT_SHATTER_JOB_ROWS_BATCH_SIZE):
     jobs = [dao_get_job_by_id(job_id) for job_id in job_ids]
 
     # reset the processing start time so that the check_job_status scheduled task doesn't pick this job up again
@@ -604,10 +367,10 @@ def process_incomplete_jobs(job_ids):
 
     current_app.logger.info("Resuming job(s) %s", job_ids)
     for job_id in job_ids:
-        process_incomplete_job(job_id)
+        process_incomplete_job(job_id, shatter_batch_size=shatter_batch_size)
 
 
-def process_incomplete_job(job_id):
+def process_incomplete_job(job_id, shatter_batch_size=DEFAULT_SHATTER_JOB_ROWS_BATCH_SIZE):
     job = dao_get_job_by_id(job_id)
 
     last_notification_added = dao_get_last_notification_added_for_job_id(job_id)
@@ -621,9 +384,21 @@ def process_incomplete_job(job_id):
 
     recipient_csv, template, sender_id = get_recipient_csv_and_template_and_sender_id(job)
 
-    for row in recipient_csv.get_rows():
-        if row.index > resume_from_row:
-            process_row(row, template, job, job.service, sender_id=sender_id)
+    for shatter_batch in batched(
+        (row for row in recipient_csv.get_rows() if row.index > resume_from_row),
+        n=shatter_batch_size,
+    ):
+        batch_args_kwargs = [
+            get_id_task_args_kwargs_for_job_row(row, template, job, job.service, sender_id=sender_id)[1]
+            for row in shatter_batch
+        ]
+        shatter_job_rows.apply_async(
+            (
+                template.template_type,
+                batch_args_kwargs,
+            ),
+            queue=QueueNames.JOBS,
+        )
 
     job_complete(job, resumed=True)
 

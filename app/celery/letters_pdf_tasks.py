@@ -4,7 +4,7 @@ from datetime import time as dt_time
 from botocore.exceptions import ClientError as BotoClientError
 from flask import current_app
 from notifications_utils.letter_timings import LETTER_PROCESSING_DEADLINE
-from notifications_utils.postal_address import PostalAddress
+from notifications_utils.recipient_validation.postal_address import PostalAddress
 from notifications_utils.timezones import convert_bst_to_utc, convert_utc_to_bst
 
 from app import notify_celery, signing
@@ -22,7 +22,6 @@ from app.constants import (
     NOTIFICATION_TECHNICAL_FAILURE,
     NOTIFICATION_VALIDATION_FAILED,
     NOTIFICATION_VIRUS_SCAN_FAILED,
-    POSTAGE_TYPES,
 )
 from app.cronitor import cronitor
 from app.dao.notifications_dao import (
@@ -119,7 +118,7 @@ def update_billable_units_for_letter(self, notification_id, page_count):
 
         current_app.logger.info(
             "Letter notification id: %(id)s reference %(ref)s: billable units set to %(units)s",
-            dict(id=notification_id, ref=notification.reference, units=billable_units),
+            {"id": notification_id, "ref": notification.reference, "units": billable_units},
         )
 
 
@@ -132,7 +131,7 @@ def update_validation_failed_for_templated_letter(self, notification_id, page_co
     dao_update_notification(notification)
     current_app.logger.info(
         "Validation failed: letter is too long %(page_count)s for letter with id: %(id)s",
-        dict(page_count=page_count, id=notification_id),
+        {"page_count": page_count, "id": notification_id},
     )
 
 
@@ -148,8 +147,7 @@ def collate_letter_pdfs_to_be_sent(print_run_deadline_utc_str: str):
     print_run_deadline_local = convert_utc_to_bst(datetime.fromisoformat(print_run_deadline_utc_str))
     _get_letters_and_sheets_volumes_and_send_to_dvla(print_run_deadline_local)
 
-    for postage in POSTAGE_TYPES:
-        send_dvla_letters_via_api(print_run_deadline_local, postage)
+    send_dvla_letters_via_api(print_run_deadline_local)
 
     current_app.logger.info("finished collate-letter-pdfs-to-be-sent")
 
@@ -230,12 +228,14 @@ def send_letters_volume_email_to_dvla(letters_volumes, date):
         send_notification_to_queue(saved_notification, queue=QueueNames.NOTIFY)
 
 
-def send_dvla_letters_via_api(print_run_deadline_local, postage):
-    current_app.logger.info("send-dvla-letters-for-day-via-api - starting queuing for postage class %s", postage)
-    for letter in dao_get_letters_to_be_printed(print_run_deadline_local, postage):
-        deliver_letter.apply_async(kwargs={"notification_id": letter.id}, queue=QueueNames.SEND_LETTER)
+def send_dvla_letters_via_api(print_run_deadline_local):
+    current_app.logger.info("send-dvla-letters-for-day-via-api - starting queuing")
+    for i, row in enumerate(dao_get_letters_to_be_printed(print_run_deadline_local)):
+        if i % 10000 == 0:
+            current_app.logger.info("triggered tasks for %i letters", i)
+        deliver_letter.apply_async(kwargs={"notification_id": row.id}, queue=QueueNames.SEND_LETTER)
 
-    current_app.logger.info("send-dvla-letters-for-day-via-api - finished queuing for postage class %s", postage)
+    current_app.logger.info("send-dvla-letters-for-day-via-api - finished queuing")
 
 
 @notify_celery.task(bind=True, name="sanitise-letter", max_retries=15, default_retry_delay=300)
@@ -270,8 +270,8 @@ def sanitise_letter(self, filename):
         except self.MaxRetriesExceededError as e:
             message = (
                 "RETRY FAILED: Max retries reached. "
-                "The task sanitise_letter failed for notification {}. "
-                "Notification has been updated to technical-failure".format(notification.id)
+                f"The task sanitise_letter failed for notification {notification.id}. "
+                "Notification has been updated to technical-failure"
             )
             update_notification_status_by_id(notification.id, NOTIFICATION_TECHNICAL_FAILURE)
             raise NotificationTechnicalFailureException(message) from e
@@ -302,6 +302,12 @@ def process_sanitised_letter(self, sanitise_data):
             current_app.logger.info(
                 "Processing invalid precompiled pdf with id %s (file %s)", notification_id, filename
             )
+
+            # Log letters that fail with no fixed abode error so we can check for false positives
+            if letter_details["message"] == "no-fixed-abode-address":
+                current_app.logger.info(
+                    "Precomiled PDF with id %s was invalid due to no fixed abode address", notification_id
+                )
 
             _move_invalid_letter_and_update_status(
                 notification=notification,
@@ -362,8 +368,8 @@ def process_sanitised_letter(self, sanitise_data):
         except self.MaxRetriesExceededError as e:
             message = (
                 "RETRY FAILED: Max retries reached. "
-                "The task process_sanitised_letter failed for notification {}. "
-                "Notification has been updated to technical-failure".format(notification.id)
+                f"The task process_sanitised_letter failed for notification {notification.id}. "
+                "Notification has been updated to technical-failure"
             )
             update_notification_status_by_id(notification.id, NOTIFICATION_TECHNICAL_FAILURE)
             raise NotificationTechnicalFailureException(message) from e
@@ -396,12 +402,10 @@ def process_virus_scan_failed(filename):
 
     if updated_count != 1:
         raise Exception(
-            "There should only be one letter notification for each reference. Found {} notifications".format(
-                updated_count
-            )
+            f"There should only be one letter notification for each reference. Found {updated_count} notifications"
         )
 
-    error = VirusScanError("notification id {} Virus scan failed: {}".format(notification.id, filename))
+    error = VirusScanError(f"notification id {notification.id} Virus scan failed: {filename}")
     raise error
 
 
@@ -414,12 +418,10 @@ def process_virus_scan_error(filename):
 
     if updated_count != 1:
         raise Exception(
-            "There should only be one letter notification for each reference. Found {} notifications".format(
-                updated_count
-            )
+            f"There should only be one letter notification for each reference. Found {updated_count} notifications"
         )
     current_app.logger.error("notification id %s Virus scan error: %s", notification.id, filename)
-    raise VirusScanError("notification id {} Virus scan error: {}".format(notification.id, filename))
+    raise VirusScanError(f"notification id {notification.id} Virus scan error: {filename}")
 
 
 def update_letter_pdf_status(reference, status, billable_units, recipient_address=None):

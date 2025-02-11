@@ -1,16 +1,24 @@
+import collections.abc
+import copy
+import inspect
 import json
 import textwrap
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
 
+import celery
 import pytest
 import pytz
 import requests_mock
 from flask import current_app, url_for
+from kombu.serialization import dumps
 from sqlalchemy.orm.session import make_transient
 
 from app import db
 from app.clients.sms.firetext import FiretextClient
+from app.clients.sms.mmg import MMGClient
+from app.config import QueueNames
 from app.constants import (
     EMAIL_TYPE,
     KEY_TYPE_NORMAL,
@@ -31,6 +39,7 @@ from app.dao.users_dao import create_secret_code, create_user_code
 from app.history_meta import create_history
 from app.models import (
     ApiKey,
+    InboundSmsHistory,
     InvitedUser,
     Job,
     Notification,
@@ -57,8 +66,9 @@ from tests.app.db import (
     create_invited_org_user,
     create_job,
     create_letter_branding,
-    create_letter_contact,
+    create_letter_rate,
     create_notification,
+    create_rate,
     create_service,
     create_template,
     create_user,
@@ -73,7 +83,7 @@ def rmock():
 
 @pytest.fixture(scope="function")
 def service_factory(sample_user):
-    class ServiceFactory(object):
+    class ServiceFactory:
         def get(self, service_name, user=None, template_type=None):
             if not user:
                 user = sample_user
@@ -168,12 +178,6 @@ def _sample_service_full_permissions(notify_db_session):
     return service
 
 
-@pytest.fixture(scope="function", name="sample_service_custom_letter_contact_block")
-def _sample_service_custom_letter_contact_block(sample_service):
-    create_letter_contact(sample_service, contact_block="((contact block))")
-    return sample_service
-
-
 @pytest.fixture(scope="function")
 def sample_template(sample_user):
     # This will be the same service as the one returned by the sample_service fixture as we look for a
@@ -202,12 +206,6 @@ def sample_sms_template(sample_template):
 
 
 @pytest.fixture(scope="function")
-def sample_template_without_sms_permission(notify_db_session):
-    service = create_service(service_permissions=[EMAIL_TYPE], check_if_service_exists=True)
-    return create_template(service, template_type=SMS_TYPE)
-
-
-@pytest.fixture(scope="function")
 def sample_template_with_placeholders(sample_service):
     # deliberate space and title case in placeholder
     return create_template(sample_service, content="Hello (( Name))\nYour thing is due soon")
@@ -225,6 +223,7 @@ def sample_email_template(sample_user):
     data = {
         "name": "Email Template Name",
         "template_type": EMAIL_TYPE,
+        "has_unsubscribe_link": False,
         "content": "This is a template",
         "service": service,
         "created_by": sample_user,
@@ -233,12 +232,6 @@ def sample_email_template(sample_user):
     template = Template(**data)
     dao_create_template(template)
     return template
-
-
-@pytest.fixture(scope="function")
-def sample_template_without_email_permission(notify_db_session):
-    service = create_service(service_permissions=[SMS_TYPE], check_if_service_exists=True)
-    return create_template(service, template_type=EMAIL_TYPE)
 
 
 @pytest.fixture
@@ -464,6 +457,7 @@ def sample_email_notification(notify_db_session):
         "billable_units": 0,
         "personalisation": None,
         "notification_type": template.template_type,
+        "unsubscribe_link": None,
         "api_key_id": None,
         "key_type": KEY_TYPE_NORMAL,
         "job_row_number": 1,
@@ -543,29 +537,51 @@ def fake_uuid():
 
 
 @pytest.fixture(scope="function")
-def ses_provider():
-    return ProviderDetails.query.filter_by(identifier="ses").one()
-
-
-@pytest.fixture(scope="function")
 def mmg_provider():
     return ProviderDetails.query.filter_by(identifier="mmg").one()
 
 
+def create_mock_firetext_config(mocker, additional_config=None):
+    config = {
+        "FIRETEXT_URL": "https://example.com/firetext",
+        "FIRETEXT_API_KEY": "foo",
+        "FIRETEXT_INTERNATIONAL_API_KEY": "international",
+        "FROM_NUMBER": "bar",
+    }
+    if additional_config:
+        config.update(additional_config)
+    return mocker.Mock(config=config)
+
+
+def create_mock_firetext_client(mocker, mock_config):
+    statsd_client = mocker.Mock()
+    return FiretextClient(mock_config, statsd_client)
+
+
 @pytest.fixture(scope="function")
 def mock_firetext_client(mocker):
-    client = FiretextClient()
+    mock_config = create_mock_firetext_config(mocker)
+    return create_mock_firetext_client(mocker, mock_config)
+
+
+@pytest.fixture(scope="function")
+def mock_firetext_client_with_receipts(mocker):
+    additional_config = {"FIRETEXT_RECEIPT_URL": "https://www.example.com/notifications/sms/firetext"}
+    mock_config = create_mock_firetext_config(mocker, additional_config)
+    return create_mock_firetext_client(mocker, mock_config)
+
+
+@pytest.fixture(scope="function")
+def mock_mmg_client_with_receipts(mocker):
     statsd_client = mocker.Mock()
     current_app = mocker.Mock(
         config={
-            "FIRETEXT_URL": "https://example.com/firetext",
-            "FIRETEXT_API_KEY": "foo",
-            "FIRETEXT_INTERNATIONAL_API_KEY": "international",
-            "FROM_NUMBER": "bar",
+            "MMG_URL": "https://example.com/mmg",
+            "MMG_API_KEY": "foo",
+            "MMG_RECEIPT_URL": "https://www.example.com/notifications/sms/mmg",
         }
     )
-    client.init_app(current_app, statsd_client)
-    return client
+    return MMGClient(current_app, statsd_client)
 
 
 @pytest.fixture(scope="function")
@@ -585,7 +601,7 @@ def email_2fa_code_template(notify_service):
         service=notify_service,
         user=notify_service.users[0],
         template_config_name="EMAIL_2FA_TEMPLATE_ID",
-        content=("Hi ((name))," "" "To sign in to GOV.​UK Notify please open this link:" "((url))"),
+        content=("Hi ((name)),To sign in to GOV.​UK Notify please open this link:((url))"),
         subject="Sign in to GOV.UK Notify",
         template_type="email",
     )
@@ -832,9 +848,41 @@ def organisation_has_new_go_live_request_template(notify_service):
     return create_custom_template(
         service=notify_service,
         user=notify_service.users[0],
-        template_config_name="GO_LIVE_NEW_REQUEST_FOR_ORG_USERS_TEMPLATE_ID",
+        template_config_name="GO_LIVE_NEW_REQUEST_FOR_ORG_APPROVERS_TEMPLATE_ID",
         content=template_content,
         subject="Request to go live: ((service_name))",
+        template_type="email",
+    )
+
+
+@pytest.fixture(scope="function")
+def organisation_has_new_go_live_request_requester_receipt_template(notify_service):
+    template_content = textwrap.dedent(
+        """\
+        Hi ((name))
+
+        You have sent a request to go live for a GOV.​UK Notify service called ‘((service_name))’.
+
+        Your request was sent to the following members of ((organisation_name)):
+
+        ((organisation_team_member_names))
+
+        If you do not receive an update about your request in the next 2 working days,
+        please reply to this email and let us know.
+
+        Thanks
+
+        GOV.​UK Notify team
+        https://www.gov.uk/notify
+        """
+    )
+
+    return create_custom_template(
+        service=notify_service,
+        user=notify_service.users[0],
+        template_config_name="GO_LIVE_NEW_REQUEST_FOR_ORG_REQUESTER_TEMPLATE_ID",
+        content=template_content,
+        subject="Your request to go live",
         template_type="email",
     )
 
@@ -877,7 +925,7 @@ def organisation_reject_go_live_request_template(notify_service):
 
         GOV.​UK Notify team
         https://www.gov.uk/notify
-        """  # noqa
+        """
     )
 
     return create_custom_template(
@@ -890,11 +938,69 @@ def organisation_reject_go_live_request_template(notify_service):
     )
 
 
+@pytest.fixture(scope="function")
+def user_research_email_for_new_users_template(notify_service):
+    template_content = textwrap.dedent(
+        """\
+        Hi ((name))
+        # How easy was it to start using GOV.UK Notify?
+
+        Please take 30 seconds to let us know:
+
+        https://surveys.publishing.service.gov.uk/s/notify-getting-started/
+
+        If you want to, you can tell us more about your experiences so far – from creating an account to setting up your first service.
+
+        We’ll read every piece of feedback we get, and your insights will help us to make GOV.UK Notify better for everyone.
+
+        Kind regards
+        GOV.UK Notify
+
+        ---
+
+        If you do not want to take part in user research, you can [unsubscribe from these emails](https://www.notifications.service.gov.uk/user-profile/take-part-in-user-research).
+        """  # noqa
+    )
+
+    return create_custom_template(
+        service=notify_service,
+        user=notify_service.users[0],
+        template_config_name="USER_RESEARCH_EMAIL_FOR_NEW_USERS_TEMPLATE_ID",
+        content=template_content,
+        subject="How easy was it to start using GOV.UK Notify?",
+        template_type="email",
+    )
+
+
+@pytest.fixture(scope="function")
+def service_join_request_approved_template(notify_service):
+    content = (
+        """
+             Hi ((requester_name))
+            ((approver_name)) has approved your request to join the following GOV.UK Notify service:
+            ^[((service_name))](((dashboard_url)))
+            Sign in to GOV.UK Notify to get started.
+            Thanks
+            GOV.​UK Notify
+            https://www.gov.uk/notify
+        """,
+    )
+    return create_custom_template(
+        service=notify_service,
+        user=notify_service.users[0],
+        template_config_name="SERVICE_JOIN_REQUEST_APPROVED_TEMPLATE_ID",
+        content=content,
+        subject="((approver_name)) has approved your request",
+        template_type="email",
+    )
+
+
 @pytest.fixture
 def notify_service(notify_db_session, sample_user):
     service = Service.query.get(current_app.config["NOTIFY_SERVICE_ID"])
     if not service:
         service = Service(
+            id=current_app.config["NOTIFY_SERVICE_ID"],
             name="Notify Service",
             email_message_limit=1000,
             sms_message_limit=1000,
@@ -903,7 +1009,7 @@ def notify_service(notify_db_session, sample_user):
             created_by=sample_user,
             prefix_sms=False,
         )
-        dao_create_service(service=service, service_id=current_app.config["NOTIFY_SERVICE_ID"], user=sample_user)
+        dao_create_service(service=service, user=sample_user)
 
         data = {
             "service": service,
@@ -931,7 +1037,7 @@ def sample_service_guest_list(notify_db_session):
 @pytest.fixture
 def sample_inbound_numbers(sample_service):
     service = create_service(service_name="sample service 2", check_if_service_exists=True)
-    inbound_numbers = list()
+    inbound_numbers = []
     inbound_numbers.append(create_inbound_number(number="1", provider="mmg"))
     inbound_numbers.append(create_inbound_number(number="2", provider="mmg", active=False, service_id=service.id))
     inbound_numbers.append(create_inbound_number(number="3", provider="firetext", service_id=sample_service.id))
@@ -939,10 +1045,38 @@ def sample_inbound_numbers(sample_service):
 
 
 @pytest.fixture
+def sample_inbound_sms_history(notify_db_session, sample_service):
+    inbound_sms = InboundSmsHistory(
+        id=uuid.uuid4(),
+        created_at=datetime.utcnow(),
+        service_id=sample_service.id,
+        notify_number="3",
+        provider_date=datetime.utcnow(),
+        provider_reference="reference-id",
+        provider="firetext",
+    )
+    notify_db_session.add(inbound_sms)
+    notify_db_session.commit()
+    return inbound_sms
+
+
+@pytest.fixture
 def sample_organisation(notify_db_session):
     org = Organisation(name="sample organisation")
     dao_create_organisation(org)
     return org
+
+
+@pytest.fixture
+def sms_rate(notify_db_session):
+    return create_rate(start_date=datetime.now(UTC) - timedelta(days=1), value=0.0227, notification_type="sms")
+
+
+@pytest.fixture
+def letter_rate(notify_db_session):
+    return create_letter_rate(
+        start_date=datetime.now(UTC) - timedelta(days=1), rate=0.54, post_class="second", sheet_count=1
+    )
 
 
 @pytest.fixture
@@ -1119,3 +1253,125 @@ def mock_onwards_request_headers(mocker):
 
 def datetime_in_past(days=0, seconds=0):
     return datetime.now(tz=pytz.utc) - timedelta(days=days, seconds=seconds)
+
+
+def merge_fields(dct, merge_dct):
+    """recursively merges `merge_dct` into `dct`, allowing for the removal of fields by setting them to `None`"""
+    for k, v in merge_dct.items():
+        if v is None:
+            # remove the field from `dct` if the value in `merge_dct` is `None`
+            dct.pop(k, None)
+        elif isinstance(v, collections.abc.Mapping):
+            # recursively merge nested dictionaries
+            dct[k] = merge_fields(dct.get(k, {}), v)
+        else:
+            # otherwise, update or add the field in `dct`
+            dct[k] = v
+    return dct
+
+
+@pytest.fixture(scope="function")
+def mock_dvla_callback_data():
+    def _mock_dvla_callback_data(overrides=None):
+        # default mock data structure
+        data = {
+            "specVersion": "1",
+            "type": "uk.gov.dvla.osl.osldatadictionaryschemas.print.messages.v2.PrintJobStatus",
+            "id": "<dvla internal messaging identifier>",
+            "source": "dvla:resource:osl:print:print-hub-fulfilment:5.18.0",
+            "time": "2021-04-01T00:00:00Z",
+            "dataContentType": "application/json",
+            "dataSchema": "https://osl-data-dictionary-schemas.engineering.dvla.gov.uk/print/messages/v2/print-job-status.json",
+            "data": {
+                "despatchProperties": [
+                    {"key": "totalSheets", "value": "5"},
+                    {"key": "postageClass", "value": "1ST"},
+                    {"key": "mailingProduct", "value": "MM UNSORTED"},
+                    {"key": "productionRunDate", "value": "2024-08-01 09:15:14.456"},
+                    {"key": "osgBatchType", "value": "UNSORTED"},
+                    {"key": "mailProvider", "value": "UKM"},
+                    {"key": "osgAppName", "value": "SEL5"},
+                    {"key": "cardChipId", "value": "null"},
+                    {"key": "uci", "value": "null"},
+                ],
+                "jobId": "cfce9e7b-1534-4c07-a66d-3cf9172f7640",
+                "jobType": "NOTIFY",
+                "jobStatus": "DESPATCHED",
+                "templateReference": "NOTIFY",
+                "transitionDate": "2021-03-31T08:15:07Z",
+            },
+            "metadata": {
+                "handler": {"urn": "dvla:resource:osl:print:print-hub-fulfilment:5.18.0"},
+                "origin": {"urn": "dvla:resource:osg:dev:printhub:1.0.1"},
+                "correlationId": "b5d9b2bd-6e8f-4275-bdd3-c8086fe09c52",
+            },
+        }
+
+        # custom mock data structure
+        if overrides:
+            data = merge_fields(copy.deepcopy(data), overrides)
+
+        return data
+
+    return _mock_dvla_callback_data
+
+
+@pytest.fixture
+def mock_celery_task(mocker):
+    def celery_mocker(celery_task: celery.local.PromiseProxy, assert_types=True) -> MagicMock:
+        def _assert_types_match(
+            args: tuple | list | None = None,
+            kwargs: dict | None = None,
+        ):
+            """
+            Checks all the args/kwargs provided match type hints if necessary by using the inspect module to introspect
+            the params and extract annotations. Handles partial args and kwargs, parameters without type hints, etc
+            """
+            args = args or []
+            kwargs = kwargs or {}
+            # get an iterator so we can loop through args in step with inspect
+            args = iter(args)
+
+            # try and check types are correct
+            for parameter_signature in inspect.signature(celery_task).parameters.values():
+                # skip if there's no type hint
+                if parameter_signature.annotation == inspect._empty:
+                    continue
+
+                # try and match with a provided arg - if there are no more args, then we must be calling with a kwarg
+                # instead. if there's no kwarg, then we're just falling back on a provided default
+                try:
+                    param_value = next(args)
+                except StopIteration:
+                    if parameter_signature.name in kwargs:
+                        param_value = kwargs[parameter_signature.name]
+                    else:
+                        # skip this param if we're not calling it as an arg or a kwarg - must be relying on a default
+                        # (the `celery_task.__header__` call would have failed if we needed to supply something)
+                        continue
+
+                assert isinstance(param_value, parameter_signature.annotation)
+
+        def check_apply_async(
+            args: tuple | list | None = None,
+            kwargs: dict | None = None,
+            queue=None,
+            **options,
+        ):
+            assert queue in QueueNames.all_queues()
+            # this'll raise an exception if the args/kwargs don't match the function definition
+            celery_task.__header__(*(args or ()), **(kwargs or {}))
+
+            if assert_types:
+                _assert_types_match(args, kwargs)
+
+            # make sure the values are all json serializable
+
+            dumps(args, serializer="json")
+            dumps(kwargs, serializer="json")
+
+        mock_apply_async = MagicMock(side_effect=check_apply_async)
+
+        return mocker.patch.object(celery_task, "apply_async", new=mock_apply_async)
+
+    return celery_mocker

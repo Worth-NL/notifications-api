@@ -7,7 +7,7 @@ from freezegun import freeze_time
 from notifications_utils.url_safe_token import generate_token
 
 from app.constants import EMAIL_AUTH_TYPE, SMS_AUTH_TYPE
-from app.models import Notification
+from app.models import Notification, ServiceJoinRequest
 from tests import create_admin_authorization_header
 from tests.app.db import create_invited_user, create_permissions, create_service, create_user
 
@@ -106,7 +106,7 @@ def test_create_invited_user_invalid_email(client, sample_service, mocker, fake_
     auth_header = create_admin_authorization_header()
 
     response = client.post(
-        "/service/{}/invite".format(sample_service.id),
+        f"/service/{sample_service.id}/invite",
         headers=[("Content-Type", "application/json"), auth_header],
         data=data,
     )
@@ -119,13 +119,13 @@ def test_create_invited_user_invalid_email(client, sample_service, mocker, fake_
 
 def test_get_all_invited_users_by_service(client, notify_db_session, sample_service):
     invites = []
-    for i in range(0, 5):
-        email = "invited_user_{}@service.gov.uk".format(i)
+    for i in range(5):
+        email = f"invited_user_{i}@service.gov.uk"
         invited_user = create_invited_user(sample_service, to_email_address=email)
 
         invites.append(invited_user)
 
-    url = "/service/{}/invite".format(sample_service.id)
+    url = f"/service/{sample_service.id}/invite"
 
     auth_header = create_admin_authorization_header()
 
@@ -143,7 +143,7 @@ def test_get_all_invited_users_by_service(client, notify_db_session, sample_serv
 
 
 def test_get_invited_users_by_service_with_no_invites(client, notify_db_session, sample_service):
-    url = "/service/{}/invite".format(sample_service.id)
+    url = f"/service/{sample_service.id}/invite"
 
     auth_header = create_admin_authorization_header()
 
@@ -178,7 +178,7 @@ def test_get_invited_user_by_service_when_user_does_not_belong_to_the_service(
 
 def test_update_invited_user_set_status_to_cancelled(client, sample_invited_user):
     data = {"status": "cancelled"}
-    url = "/service/{0}/invite/{1}".format(sample_invited_user.service_id, sample_invited_user.id)
+    url = f"/service/{sample_invited_user.service_id}/invite/{sample_invited_user.id}"
     auth_header = create_admin_authorization_header()
     response = client.post(url, data=json.dumps(data), headers=[("Content-Type", "application/json"), auth_header])
 
@@ -189,7 +189,7 @@ def test_update_invited_user_set_status_to_cancelled(client, sample_invited_user
 
 def test_update_invited_user_for_wrong_service_returns_404(client, sample_invited_user, fake_uuid):
     data = {"status": "cancelled"}
-    url = "/service/{0}/invite/{1}".format(fake_uuid, sample_invited_user.id)
+    url = f"/service/{fake_uuid}/invite/{sample_invited_user.id}"
     auth_header = create_admin_authorization_header()
     response = client.post(url, data=json.dumps(data), headers=[("Content-Type", "application/json"), auth_header])
     assert response.status_code == 404
@@ -199,7 +199,7 @@ def test_update_invited_user_for_wrong_service_returns_404(client, sample_invite
 
 def test_update_invited_user_for_invalid_data_returns_400(client, sample_invited_user):
     data = {"status": "garbage"}
-    url = "/service/{0}/invite/{1}".format(sample_invited_user.service_id, sample_invited_user.id)
+    url = f"/service/{sample_invited_user.service_id}/invite/{sample_invited_user.id}"
     auth_header = create_admin_authorization_header()
     response = client.post(url, data=json.dumps(data), headers=[("Content-Type", "application/json"), auth_header])
     assert response.status_code == 400
@@ -236,7 +236,7 @@ def test_validate_invitation_token_for_expired_token_returns_400(client):
         token = generate_token(
             str(uuid.uuid4()), current_app.config["SECRET_KEY"], current_app.config["DANGEROUS_SALT"]
         )
-    url = "/invite/service/{}".format(token)
+    url = f"/invite/service/{token}"
     auth_header = create_admin_authorization_header()
     response = client.get(url, headers=[("Content-Type", "application/json"), auth_header])
 
@@ -251,7 +251,7 @@ def test_validate_invitation_token_for_expired_token_returns_400(client):
 
 def test_validate_invitation_token_returns_400_when_invited_user_does_not_exist(client):
     token = generate_token(str(uuid.uuid4()), current_app.config["SECRET_KEY"], current_app.config["DANGEROUS_SALT"])
-    url = "/invite/service/{}".format(token)
+    url = f"/invite/service/{token}"
     auth_header = create_admin_authorization_header()
     response = client.get(url, headers=[("Content-Type", "application/json"), auth_header])
 
@@ -266,7 +266,7 @@ def test_validate_invitation_token_returns_400_when_token_is_malformed(client):
         :-2
     ]
 
-    url = "/invite/service/{}".format(token)
+    url = f"/invite/service/{token}"
     auth_header = create_admin_authorization_header()
     response = client.get(url, headers=[("Content-Type", "application/json"), auth_header])
 
@@ -286,7 +286,7 @@ def test_get_invited_user(admin_request, sample_invited_user):
     assert json_resp["data"]["permissions"] == sample_invited_user.permissions
 
 
-def test_get_invited_user_404s_if_invite_doesnt_exist(admin_request, sample_invited_user, fake_uuid):
+def test_get_invited_user_404s_if_invite_doesnt_exist(admin_request, fake_uuid):
     json_resp = admin_request.get("service_invite.get_invited_user", invited_user_id=fake_uuid, _expected_status=404)
     assert json_resp["result"] == "error"
 
@@ -317,6 +317,7 @@ def test_request_invite_to_service_email_is_sent_to_valid_service_managers(
     sample_service,
     request_invite_email_template,
     receipt_for_request_invite_email_template,
+    notify_db_session,
     mocker,
     reason,
     expected_reason_given,
@@ -326,9 +327,9 @@ def test_request_invite_to_service_email_is_sent_to_valid_service_managers(
     # service manager. Expected behaviour is that notifications will be sent only to the valid service managers.
     mocked = mocker.patch("app.celery.provider_tasks.deliver_email.apply_async")
     user_requesting_invite = create_user()
-    service_manager_1 = create_user(name="Manager 1")
-    service_manager_2 = create_user(name="Manager 2")
-    service_manager_3 = create_user(name="Manager 3")
+    service_manager_1 = create_user(name="Manager 1", email_address="manager.1@example.gov.uk")
+    service_manager_2 = create_user(name="Manager 2", email_address="manager.2@example.gov.uk")
+    service_manager_3 = create_user(name="Manager 3", email_address="manager.3@example.gov.uk")
     another_service = create_service(service_name="Another Service")
     service_manager_1.services = [sample_service]
     service_manager_2.services = [sample_service]
@@ -339,11 +340,11 @@ def test_request_invite_to_service_email_is_sent_to_valid_service_managers(
     recipients_of_invite_request = [service_manager_1.id, service_manager_2.id, service_manager_3.id]
     invite_link_host = current_app.config["ADMIN_BASE_URL"]
 
-    data = dict(
-        service_managers_ids=list(map(lambda x: str(x), recipients_of_invite_request)),
-        reason=reason,
-        invite_link_host=invite_link_host,
-    )
+    data = {
+        "service_managers_ids": [str(x) for x in recipients_of_invite_request],
+        "reason": reason,
+        "invite_link_host": invite_link_host,
+    }
     admin_request.post(
         "service_invite.request_invite_to_service",
         service_id=sample_service.id,
@@ -357,11 +358,29 @@ def test_request_invite_to_service_email_is_sent_to_valid_service_managers(
     # 2.receipt for request invite notification to the user that initiated the invite request.
 
     notifications = Notification.query.all()
-    manager_notification = [n for n in notifications if n.personalisation["name"] == service_manager_1.name][0]
-    user_notification = [n for n in notifications if n.personalisation["name"] == user_requesting_invite.name][0]
+    manager_notification = [
+        n
+        for n in notifications
+        if n.personalisation.get("approver_name") == service_manager_1.name
+        and n.template_id == request_invite_email_template.id
+    ][0]
+
+    user_notification = [
+        n
+        for n in notifications
+        if n.personalisation.get("requester_name") == user_requesting_invite.name
+        and n.template_id == receipt_for_request_invite_email_template.id
+    ][0]
 
     mocked.call_count = 3
     assert len(notifications) == 3
+
+    # Join service request is created
+    join_requests = ServiceJoinRequest.query.all()
+    db_request = [r for r in join_requests if r.requester_id == user_requesting_invite.id][0]
+
+    assert db_request.service_id == sample_service.id
+    assert len(db_request.contacted_service_users) == 3
 
     # Request invite notification
     assert len(manager_notification.personalisation.keys()) == 7
@@ -369,21 +388,23 @@ def test_request_invite_to_service_email_is_sent_to_valid_service_managers(
     assert manager_notification.personalisation["service_name"] == sample_service.name
     assert manager_notification.personalisation["reason_given"] == expected_reason_given
     assert manager_notification.personalisation["reason"] == expected_reason
+    assert manager_notification.to == service_manager_1.email_address
     assert (
         manager_notification.personalisation["url"]
-        == f"{invite_link_host}/services/{sample_service.id}/users/invite/{user_requesting_invite.id}"
+        == f"{invite_link_host}/services/{sample_service.id}/join-request/{db_request.id}/approve"
     )
     assert manager_notification.reply_to_text == user_requesting_invite.email_address
 
     # Receipt for request invite notification
     assert user_notification.personalisation == {
-        "name": user_requesting_invite.name,
-        "service name": "Sample service",
-        "service admin names": [
-            service_manager_1.name,
-            service_manager_2.name,
-            service_manager_3.name,
+        "requester_name": user_requesting_invite.name,
+        "service_name": "Sample service",
+        "service_admin_names": [
+            "Manager 1 – manager.1@example.gov.uk",
+            "Manager 2 – manager.2@example.gov.uk",
+            "Manager 3 – manager.3@example.gov.uk",
         ],
+        "url_ask_to_join_page": f"{invite_link_host}/services/{sample_service.id}/join/ask",
     }
     assert user_notification.reply_to_text == "notify@gov.uk"
 
@@ -398,11 +419,11 @@ def test_request_invite_to_service_email_is_not_sent_if_requester_is_already_par
     service_managers = [service_manager_1]
     reason = "Lots of reasons"
     invite_link_host = current_app.config["ADMIN_BASE_URL"]
-    data = dict(
-        service_managers_ids=list(map(lambda x: str(x.id), service_managers)),
-        reason=reason,
-        invite_link_host=invite_link_host,
-    )
+    data = {
+        "service_managers_ids": [str(x.id) for x in service_managers],
+        "reason": reason,
+        "invite_link_host": invite_link_host,
+    }
 
     admin_request.post(
         "service_invite.request_invite_to_service",
@@ -428,11 +449,11 @@ def test_exception_is_raised_if_no_request_invite_to_service_email_is_sent(
     recipients_of_invite_request = [service_manager.id]
     reason = "Lots of reasons"
     invite_link_host = current_app.config["ADMIN_BASE_URL"]
-    data = dict(
-        service_managers_ids=list(map(lambda x: str(x), recipients_of_invite_request)),
-        reason=reason,
-        invite_link_host=invite_link_host,
-    )
+    data = {
+        "service_managers_ids": [str(x) for x in recipients_of_invite_request],
+        "reason": reason,
+        "invite_link_host": invite_link_host,
+    }
 
     admin_request.post(
         "service_invite.request_invite_to_service",

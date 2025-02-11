@@ -56,7 +56,7 @@ def test_get_notifications_request_invalid_statuses(invalid_statuses, valid_stat
     errors = json.loads(str(e.value)).get("errors")
     assert len(errors) == len(invalid_statuses)
     for index, value in enumerate(invalid_statuses):
-        assert errors[index]["message"] == "status {} {}".format(value, partial_error_status)
+        assert errors[index]["message"] == f"status {value} {partial_error_status}"
 
 
 @pytest.mark.parametrize(
@@ -79,7 +79,7 @@ def test_get_notifications_request_invalid_template_types(invalid_template_types
     errors = json.loads(str(e.value)).get("errors")
     assert len(errors) == len(invalid_template_types)
     for index, value in enumerate(invalid_template_types):
-        assert errors[index]["message"] == "template_type {} {}".format(value, partial_error_template_type)
+        assert errors[index]["message"] == f"template_type {value} {partial_error_template_type}"
 
 
 def test_get_notifications_request_invalid_statuses_and_template_types():
@@ -96,16 +96,14 @@ def test_get_notifications_request_invalid_statuses_and_template_types():
     error_messages = [error["message"] for error in errors]
     for invalid_status in ["elephant", "giraffe"]:
         assert (
-            "status {} is not one of [cancelled, created, sending, sent, delivered, "
+            f"status {invalid_status} is not one of [cancelled, created, sending, sent, delivered, "
             "pending, failed, technical-failure, temporary-failure, permanent-failure, "
-            "pending-virus-check, validation-failed, virus-scan-failed, returned-letter, accepted, received]".format(
-                invalid_status
-            )
+            "pending-virus-check, validation-failed, virus-scan-failed, returned-letter, accepted, received]"
             in error_messages
         )
 
     for invalid_template_type in ["orange", "avocado"]:
-        assert "template_type {} is not one of [sms, email, letter]".format(invalid_template_type) in error_messages
+        assert f"template_type {invalid_template_type} is not one of [sms, email, letter]" in error_messages
 
 
 valid_json = {"phone_number": "07515111111", "template_id": str(uuid.uuid4())}
@@ -120,6 +118,11 @@ valid_json_with_optionals = {
 @pytest.mark.parametrize("input", [valid_json, valid_json_with_optionals])
 def test_post_sms_schema_is_valid(input):
     assert validate(input, post_sms_request_schema) == input
+
+
+def test_post_sms_schema_is_valid_for_landline_if_service_can_send_to_landlines():
+    sms_data = {"phone_number": "0117 496 0860", "template_id": str(uuid.uuid4())}
+    assert validate(sms_data, post_sms_request_schema) == sms_data
 
 
 @pytest.mark.parametrize(
@@ -177,7 +180,7 @@ def test_post_sms_schema_with_personalisation_that_is_not_a_dict():
 @pytest.mark.parametrize(
     "invalid_phone_number, err_msg",
     [
-        ("08515111111", "phone_number Not a UK mobile number"),
+        ("08515111111", "phone_number Number is not valid – double check the phone number you entered"),
         ("07515111*11", "phone_number Must not contain letters or symbols"),
         ("notaphoneumber", "phone_number Must not contain letters or symbols"),
         (7700900001, "phone_number 7700900001 is not of type string"),
@@ -203,7 +206,10 @@ def test_post_sms_request_schema_invalid_phone_number_and_missing_template():
         validate(j, post_sms_request_schema)
     errors = json.loads(str(e.value)).get("errors")
     assert len(errors) == 2
-    assert {"error": "ValidationError", "message": "phone_number Not a UK mobile number"} in errors
+    assert {
+        "error": "ValidationError",
+        "message": "phone_number Number is not valid – double check the phone number you entered",
+    } in errors
     assert {"error": "ValidationError", "message": "template_id is a required property"} in errors
 
 
@@ -242,6 +248,24 @@ def test_post_email_schema_invalid_email_address(email_address, err_msg):
     j = {"template_id": str(uuid.uuid4()), "email_address": email_address}
     with pytest.raises(ValidationError) as e:
         validate(j, post_email_request_schema)
+
+    errors = json.loads(str(e.value)).get("errors")
+    assert len(errors) == 1
+    assert {"error": "ValidationError", "message": err_msg} == errors[0]
+
+
+@pytest.mark.parametrize(
+    "unsubscribe_link, err_msg",
+    [
+        ("http://www.unsubscribe-me-please.com", "one_click_unsubscribe_url is not a valid https url"),
+        ("www.unsubscribe-me-please.com", "one_click_unsubscribe_url is not a valid https url"),
+    ],
+)
+def test_post_email_schema_invalid_unsubscribe_link(unsubscribe_link, err_msg):
+    j_son = valid_post_email_json_with_optionals.copy()
+    j_son["one_click_unsubscribe_url"] = unsubscribe_link
+    with pytest.raises(ValidationError) as e:
+        validate(j_son, post_email_request_schema)
 
     errors = json.loads(str(e.value)).get("errors")
     assert len(errors) == 1

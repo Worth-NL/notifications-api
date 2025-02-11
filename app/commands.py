@@ -1,3 +1,5 @@
+# ruff: noqa: T201
+
 import csv
 import functools
 import itertools
@@ -26,7 +28,7 @@ from app.celery.letters_pdf_tasks import (
     get_pdf_for_templated_letter,
     resanitise_pdf,
 )
-from app.celery.tasks import process_row, record_daily_sorted_counts
+from app.celery.tasks import get_id_task_args_kwargs_for_job_row, process_job_row
 from app.config import QueueNames
 from app.constants import KEY_TYPE_TEST, NOTIFICATION_CREATED, SMS_TYPE
 from app.dao.annual_billing_dao import (
@@ -56,10 +58,11 @@ from app.dao.services_dao import (
 )
 from app.dao.templates_dao import dao_create_template, dao_get_template_by_id
 from app.dao.users_dao import (
-    delete_model_user,
+    delete_user_and_all_associated_db_objects,
     delete_user_verify_codes,
     get_user_by_email,
 )
+from app.functional_tests_fixtures import apply_fixtures
 from app.models import (
     Domain,
     EmailBranding,
@@ -113,40 +116,70 @@ class notify_command:
     help="""
     Functional test user email prefix. eg "notify-test-preview"
 """,
-)  # noqa
+)
 def purge_functional_test_data(user_email_prefix):
     """
     Remove non-seeded functional test data
 
     users, services, etc. Give an email prefix. Probably "notify-tests-preview".
     """
-    users = User.query.filter(User.email_address.like("{}%".format(user_email_prefix))).all()
+    users = User.query.filter(User.email_address.like(f"{user_email_prefix}%")).all()
     for usr in users:
         # Make sure the full email includes a uuid in it
         # Just in case someone decides to use a similar email address.
         try:
-            uuid.UUID(usr.email_address.split("@")[0].split("+")[1])
+            uuid.UUID(usr.email_address.split("@")[0].split("+")[-1])
         except ValueError:
-            print("Skipping {} as the user email doesn't contain a UUID.".format(usr.email_address))
+            print(f"Skipping {usr.email_address} as the user email doesn't contain a UUID.")
         else:
             services = dao_fetch_all_services_by_user(usr.id)
-            if services:
-                print(f"Deleting user {usr.id} which is part of services")
-                for service in services:
+            for service in services:
+                print(f"Deleting service {service.id=} {service.name=} that {usr.id} belongs to")
+                # This also deletes the functional if the test users are associated
+                # It may require to create essential db object to run functional tests
+                if str(service.id) != current_app.config["NOTIFY_SERVICE_ID"]:
                     delete_service_and_all_associated_db_objects(service)
-            else:
-                services_created_by_this_user = dao_fetch_all_services_created_by_user(usr.id)
-                if services_created_by_this_user:
-                    # user is not part of any services but may still have been the one to create the service
-                    # sometimes things get in this state if the tests fail half way through
-                    # Remove the service they created (but are not a part of) so we can then remove the user
-                    print(f"Deleting services created by {usr.id}")
-                    for service in services_created_by_this_user:
-                        delete_service_and_all_associated_db_objects(service)
+                else:
+                    print(f"Skipping service {service.id=} {service.name=}")
 
-                print(f"Deleting user {usr.id} which is not part of any services")
-                delete_user_verify_codes(usr)
-                delete_model_user(usr)
+            services_created_by_this_user = dao_fetch_all_services_created_by_user(usr.id)
+            for service in services_created_by_this_user:
+                # user may still have been the one to create the service
+                # sometimes things get in this state if the tests fail half way through
+                # Remove the service they created (but are not a part of) so we can then remove the user
+                print(f"Deleting service {service.id=} {service.name=} created by {usr.id}")
+                delete_service_and_all_associated_db_objects(service)
+
+            print(f"Deleting user {usr.id} which is not part of any services")
+            delete_user_verify_codes(usr)
+            delete_user_and_all_associated_db_objects(usr)
+
+
+@notify_command()
+@click.option(
+    "-s",
+    "--service-id",
+    required=True,
+    help="""
+    Service id of the functional test seeded service
+""",
+)
+def delete_functional_test_service(service_id):
+    """
+    Removes a service, designed to be used on the functional tests seeded service.
+    After the services is deleted, also deletes any users who are now orphaned
+    """
+    service = dao_fetch_service_by_id(service_id)
+    users = list(service.users)
+    print(f"Deleting service {service.id} {service.name}")
+    delete_service_and_all_associated_db_objects(service)
+
+    for user in users:
+        print(len(user.services), user.services)
+        if not user.services:
+            print(f"Deleting user {user.id} {user.email_address}")
+            delete_user_verify_codes(user)
+            delete_user_and_all_associated_db_objects(user)
 
 
 @notify_command()
@@ -158,13 +191,13 @@ def backfill_notification_statuses():
     `Notification._status_enum`
     """
     LIMIT = 250000
-    subq = "SELECT id FROM notification_history WHERE notification_status is NULL LIMIT {}".format(LIMIT)
-    update = "UPDATE notification_history SET notification_status = status WHERE id in ({})".format(subq)
+    subq = f"SELECT id FROM notification_history WHERE notification_status is NULL LIMIT {LIMIT}"
+    update = f"UPDATE notification_history SET notification_status = status WHERE id in ({subq})"
     result = db.session.execute(subq).fetchall()
 
     while len(result) > 0:
         db.session.execute(update)
-        print("commit {} updates at {}".format(LIMIT, datetime.utcnow()))
+        print(f"commit {LIMIT} updates at {datetime.utcnow()}")
         db.session.commit()
         result = db.session.execute(subq).fetchall()
 
@@ -176,22 +209,22 @@ def update_notification_international_flag():
     """
     # 250,000 rows takes 30 seconds to update.
     subq = "select id from notifications where international is null limit 250000"
-    update = "update notifications set international = False where id in ({})".format(subq)
+    update = f"update notifications set international = False where id in ({subq})"
     result = db.session.execute(subq).fetchall()
 
     while len(result) > 0:
         db.session.execute(update)
-        print("commit 250000 updates at {}".format(datetime.utcnow()))
+        print(f"commit 250000 updates at {datetime.utcnow()}")
         db.session.commit()
         result = db.session.execute(subq).fetchall()
 
     # Now update notification_history
     subq_history = "select id from notification_history where international is null limit 250000"
-    update_history = "update notification_history set international = False where id in ({})".format(subq_history)
+    update_history = f"update notification_history set international = False where id in ({subq_history})"
     result_history = db.session.execute(subq_history).fetchall()
     while len(result_history) > 0:
         db.session.execute(update_history)
-        print("commit 250000 updates at {}".format(datetime.utcnow()))
+        print(f"commit 250000 updates at {datetime.utcnow()}")
         db.session.commit()
         result_history = db.session.execute(subq_history).fetchall()
 
@@ -208,25 +241,23 @@ def fix_notification_statuses_not_in_sync():
     """
     MAX = 10000
 
-    subq = "SELECT id FROM notifications WHERE cast (status as text) != notification_status LIMIT {}".format(MAX)
-    update = "UPDATE notifications SET notification_status = status WHERE id in ({})".format(subq)
+    subq = f"SELECT id FROM notifications WHERE cast (status as text) != notification_status LIMIT {MAX}"
+    update = f"UPDATE notifications SET notification_status = status WHERE id in ({subq})"
     result = db.session.execute(subq).fetchall()
 
     while len(result) > 0:
         db.session.execute(update)
-        print("Committed {} updates at {}".format(len(result), datetime.utcnow()))
+        print(f"Committed {len(result)} updates at {datetime.utcnow()}")
         db.session.commit()
         result = db.session.execute(subq).fetchall()
 
-    subq_hist = (
-        "SELECT id FROM notification_history WHERE cast (status as text) != notification_status LIMIT {}".format(MAX)
-    )
-    update = "UPDATE notification_history SET notification_status = status WHERE id in ({})".format(subq_hist)
+    subq_hist = f"SELECT id FROM notification_history WHERE cast (status as text) != notification_status LIMIT {MAX}"
+    update = f"UPDATE notification_history SET notification_status = status WHERE id in ({subq_hist})"
     result = db.session.execute(subq_hist).fetchall()
 
     while len(result) > 0:
         db.session.execute(update)
-        print("Committed {} updates at {}".format(len(result), datetime.utcnow()))
+        print(f"Committed {len(result)} updates at {datetime.utcnow()}")
         db.session.commit()
         result = db.session.execute(subq_hist).fetchall()
 
@@ -240,7 +271,7 @@ def fix_notification_statuses_not_in_sync():
               one number per line. The number must have the format of 07... not 447....""",
 )
 def insert_inbound_numbers_from_file(file_name):
-    print("Inserting inbound numbers from {}".format(file_name))
+    print(f"Inserting inbound numbers from {file_name}")
     with open(file_name) as file:
         sql = "insert into inbound_numbers values('{}', '{}', 'mmg', null, True, now(), null);"
 
@@ -261,7 +292,7 @@ def insert_inbound_numbers_from_file(file_name):
     help="Notification id of the letter that needs the get_pdf_for_templated_letter task replayed",
 )
 def replay_create_pdf_for_templated_letter(notification_id):
-    print("Create task to get_pdf_for_templated_letter for notification: {}".format(notification_id))
+    print(f"Create task to get_pdf_for_templated_letter for notification: {notification_id}")
     get_pdf_for_templated_letter.apply_async([str(notification_id)], queue=QueueNames.CREATE_LETTERS_PDF)
 
 
@@ -345,7 +376,7 @@ def bulk_invite_user_to_service(file_name, service_id, user_id, auth_type, permi
             "invite_link_host": current_app.config["ADMIN_BASE_URL"],
         }
         with current_app.test_request_context(
-            path="/service/{}/invite/".format(service_id),
+            path=f"/service/{service_id}/invite/",
             method="POST",
             data=json.dumps(data),
             headers={"Content-Type": "application/json"},
@@ -353,10 +384,10 @@ def bulk_invite_user_to_service(file_name, service_id, user_id, auth_type, permi
             try:
                 response = create_invited_user(service_id)
                 if response[1] != 201:
-                    print("*** ERROR occurred for email address: {}".format(email_address.strip()))
+                    print(f"*** ERROR occurred for email address: {email_address.strip()}")
                 print(response[0].get_data(as_text=True))
             except Exception as e:
-                print("*** ERROR occurred for email address: {}. \n{}".format(email_address.strip(), e))
+                print(f"*** ERROR occurred for email address: {email_address.strip()}. \n{e}")
 
     file.close()
 
@@ -453,10 +484,10 @@ def update_emails_to_remove_gsi(service_id):
                             AND u.email_address ilike ('%.gsi.gov.uk%')
     """
     results = db.session.execute(users_to_update, {"service_id": service_id})
-    print("Updating {} users.".format(results.rowcount))
+    print(f"Updating {results.rowcount} users.")
 
     for user in results:
-        print("User with id {} updated".format(user.user_id))
+        print(f"User with id {user.user_id} updated")
 
         update_stmt = """
         UPDATE users
@@ -466,18 +497,6 @@ def update_emails_to_remove_gsi(service_id):
         """
         db.session.execute(update_stmt, {"user_id": str(user.user_id)})
         db.session.commit()
-
-
-@notify_command(name="replay-daily-sorted-count-files")
-@click.option("-f", "--file_extension", required=False, help="File extension to search for, defaults to rs.txt")
-@statsd(namespace="tasks")
-def replay_daily_sorted_count_files(file_extension):
-    bucket_location = "{}-ftp".format(current_app.config["NOTIFY_EMAIL_DOMAIN"])
-    for filename in s3.get_list_of_files_by_suffix(
-        bucket_name=bucket_location, subfolder="root/dispatch", suffix=file_extension or ".rs.txt"
-    ):
-        print("Create task to record daily sorted counts for file: ", filename)
-        record_daily_sorted_counts.apply_async([filename], queue=QueueNames.NOTIFY)
 
 
 @notify_command(name="populate-organisations-from-file")
@@ -499,7 +518,7 @@ def populate_organisations_from_file(file_name):  # noqa: C901
     # The expectation is that the organisation, organisation_to_service
     # and user_to_organisation will be cleared before running this command.
     # Ignoring duplicates allows us to run the command again with the same file or same file with new rows.
-    with open(file_name, "r") as f:
+    with open(file_name) as f:
 
         def boolean_or_none(field):
             if field == "1":
@@ -553,7 +572,7 @@ def populate_organisations_from_file(file_name):  # noqa: C901
     "-f",
     "--file_name",
     required=True,
-    help="CSV file containing id, agreement_signed_version, " "agreement_signed_on_behalf_of_name, agreement_signed_at",
+    help="CSV file containing id, agreement_signed_version, agreement_signed_on_behalf_of_name, agreement_signed_at",
 )
 def populate_organisation_agreement_details_from_file(file_name):
     """
@@ -584,26 +603,6 @@ def populate_organisation_agreement_details_from_file(file_name):
             db.session.commit()
 
 
-@notify_command(name="get-letter-details-from-zips-sent-file")
-@click.argument("file_paths", required=True, nargs=-1)
-@statsd(namespace="tasks")
-def get_letter_details_from_zips_sent_file(file_paths):
-    """Get notification details from letters listed in zips_sent file(s)
-
-    This takes one or more file paths for the zips_sent files in S3 as its parameters, for example:
-    get-letter-details-from-zips-sent-file '2019-04-01/zips_sent/filename_1' '2019-04-01/zips_sent/filename_2'
-    """
-
-    rows_from_file = []
-
-    for path in file_paths:
-        file_contents = s3.get_s3_file(bucket_name=current_app.config["S3_BUCKET_LETTERS_PDF"], file_location=path)
-        rows_from_file.extend(json.loads(file_contents))
-
-    notification_references = tuple(row[18:34] for row in rows_from_file)
-    get_letters_data_from_references(notification_references)
-
-
 @notify_command(name="get-notification-and-service-ids-for-letters-that-failed-to-print")
 @click.option(
     "-f",
@@ -612,7 +611,7 @@ def get_letter_details_from_zips_sent_file(file_paths):
     help="""Full path of the file to upload, file should contain letter filenames, one per line""",
 )
 def get_notification_and_service_ids_for_letters_that_failed_to_print(file_name):
-    print("Getting service and notification ids for letter filenames list {}".format(file_name))
+    print(f"Getting service and notification ids for letter filenames list {file_name}")
     file = open(file_name)
     references = tuple([row[7:23] for row in file])
 
@@ -658,7 +657,7 @@ def populate_service_volume_intentions(file_name):
     # [2] Email:: volume intentions for service
     # [3] Letters:: volume intentions for service
 
-    with open(file_name, "r") as f:
+    with open(file_name) as f:
         for line in itertools.islice(f, 1, None):
             columns = line.split(",")
             print(columns)
@@ -678,7 +677,7 @@ def populate_go_live(file_name):
     import csv
 
     print("Populate go live user and date")
-    with open(file_name, "r") as f:
+    with open(file_name) as f:
         rows = csv.reader(
             f,
             quoting=csv.QUOTE_MINIMAL,
@@ -728,7 +727,7 @@ def fix_billable_units():
             prefix=notification.service.name,
             show_prefix=notification.service.prefix_sms,
         )
-        print("Updating notification: {} with {} billable_units".format(notification.id, template.fragment_count))
+        print(f"Updating notification: {notification.id} with {template.fragment_count} billable_units")
 
         Notification.query.filter(Notification.id == notification.id).update(
             {"billable_units": template.fragment_count}
@@ -752,7 +751,10 @@ def process_row_from_job(job_id, job_row_number):
         placeholders=template.placeholders,
     ).get_rows():
         if row.index == job_row_number:
-            notification_id = process_row(row, template, job, job.service)
+            notification_id, task_args_kwargs = get_id_task_args_kwargs_for_job_row(row, template, job, job.service)
+
+            process_job_row(template.template_type, task_args_kwargs)
+
             current_app.logger.info(
                 "Process row %s for job %s created notification_id: %s", job_row_number, job_id, notification_id
             )
@@ -783,10 +785,50 @@ def populate_annual_billing_with_the_previous_years_allowance(year):
         """
         free_allowance_rows = db.session.execute(latest_annual_billing, {"service_id": row.id})
         free_allowance = [x[0] for x in free_allowance_rows]
-        print("create free limit of {} for service: {}".format(free_allowance[0], row.id))
+        print(f"create free limit of {free_allowance[0]} for service: {row.id}")
         dao_create_or_update_annual_billing_for_year(
             service_id=row.id, free_sms_fragment_limit=free_allowance[0], financial_year_start=int(year)
         )
+
+
+@notify_command(name="functional-test-fixtures")
+def functional_test_fixtures():
+    """
+    Apply fixtures for functional tests. Not intended for production use.
+
+    The command will create all the database rows required for the funcitonal tests in an idempotent
+    way and output an environment file the functional tests can use to execute against the environment.
+
+    The environment file can be outputed to a file or uploaded to AWS SSM. The file is intended for local
+    testing and ssm for the pipeline.
+
+    It expects the following config to be set:
+
+        NOTIFY_ENVIRONMENT
+        MMG_INBOUND_SMS_USERNAME
+        MMG_INBOUND_SMS_AUTH
+        SQLALCHEMY_DATABASE_URI
+        REDIS_URL
+        SECRET_KEY
+        INTERNAL_CLIENT_API_KEYS
+        ADMIN_BASE_URL
+        API_HOST_NAME
+        FROM_NUMBER
+
+    and the following environment variables:
+
+        REQUEST_BIN_API_TOKEN - request bin token to be used by functional tests
+
+        FUNCTIONAL_TEST_ENV_FILE - (optional) output file for the environment variables
+
+        SSM_UPLOAD_PATH - (optional) path to upload the environment variables to AWS SSM
+
+    """
+    if current_app.config["REGISTER_FUNCTIONAL_TESTING_BLUEPRINT"]:
+        apply_fixtures()
+    else:
+        print("Functional test fixtures are disabled. Set REGISTER_FUNCTIONAL_TESTING_BLUEPRINT to True in config.")
+        raise SystemExit(1)
 
 
 @click.option("-u", "--user-id", required=True)

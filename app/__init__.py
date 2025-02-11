@@ -3,6 +3,8 @@ import random
 import string
 import time
 import uuid
+from collections.abc import Callable
+from contextvars import ContextVar
 from time import monotonic
 
 from celery import current_task
@@ -19,12 +21,15 @@ from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from gds_metrics import GDSMetrics
 from gds_metrics.metrics import Gauge, Histogram
-from notifications_utils import logging, request_helper
+from notifications_utils import request_helper
 from notifications_utils.celery import NotifyCelery
 from notifications_utils.clients.redis.redis_client import RedisClient
 from notifications_utils.clients.signing.signing_client import Signing
 from notifications_utils.clients.statsd.statsd_client import StatsdClient
 from notifications_utils.clients.zendesk.zendesk_client import ZendeskClient
+from notifications_utils.eventlet import EventletTimeout
+from notifications_utils.local_vars import LazyLocalGetter
+from notifications_utils.logging import flask as utils_logging
 from sqlalchemy import event
 from werkzeug.exceptions import HTTPException as WerkzeugHTTPException
 from werkzeug.local import LocalProxy
@@ -43,21 +48,11 @@ db = SQLAlchemy()
 migrate = Migrate()
 ma = Marshmallow()
 notify_celery = NotifyCelery()
-firetext_client = FiretextClient()
-mmg_client = MMGClient()
-aws_ses_client = AwsSesClient()
-aws_ses_stub_client = AwsSesStubClient()
-dvla_client = DVLAClient()
-spryng_client = SpryngClient()
 signing = Signing()
-zendesk_client = ZendeskClient()
 statsd_client = StatsdClient()
 redis_store = RedisClient()
 cbc_proxy_client = CBCProxyClient()
-document_download_client = DocumentDownloadClient()
 metrics = GDSMetrics()
-
-notification_provider_clients = NotificationProviderClients()
 
 api_user = LocalProxy(lambda: g.api_user)
 authenticated_service = LocalProxy(lambda: g.authenticated_service)
@@ -67,18 +62,113 @@ CONCURRENT_REQUESTS = Gauge(
     "How many concurrent requests are currently being served",
 )
 
+memo_resetters: list[Callable] = []
+
+#
+# "clients" that need thread-local copies
+#
+
+_firetext_client_context_var: ContextVar[FiretextClient] = ContextVar("firetext_client")
+get_firetext_client: LazyLocalGetter[FiretextClient] = LazyLocalGetter(
+    _firetext_client_context_var,
+    lambda: FiretextClient(current_app, statsd_client=statsd_client),
+    expected_type=FiretextClient,
+)
+memo_resetters.append(lambda: get_firetext_client.clear())
+firetext_client = LocalProxy(get_firetext_client)
+
+_mmg_client_context_var: ContextVar[MMGClient] = ContextVar("mmg_client")
+get_mmg_client: LazyLocalGetter[MMGClient] = LazyLocalGetter(
+    _mmg_client_context_var,
+    lambda: MMGClient(current_app, statsd_client=statsd_client),
+    expected_type=MMGClient,
+)
+memo_resetters.append(lambda: get_mmg_client.clear())
+mmg_client = LocalProxy(get_mmg_client)
+
+_aws_ses_client_context_var: ContextVar[AwsSesClient] = ContextVar("aws_ses_client")
+get_aws_ses_client: LazyLocalGetter[AwsSesClient] = LazyLocalGetter(
+    _aws_ses_client_context_var,
+    lambda: AwsSesClient(current_app.config["AWS_REGION"], statsd_client=statsd_client),
+    expected_type=AwsSesClient,
+)
+memo_resetters.append(lambda: get_aws_ses_client.clear())
+aws_ses_client = LocalProxy(get_aws_ses_client)
+
+_aws_ses_stub_client_context_var: ContextVar[AwsSesStubClient] = ContextVar("aws_ses_stub_client")
+get_aws_ses_stub_client: LazyLocalGetter[AwsSesStubClient] = LazyLocalGetter(
+    _aws_ses_stub_client_context_var,
+    lambda: AwsSesStubClient(
+        current_app.config["AWS_REGION"],
+        statsd_client=statsd_client,
+        stub_url=current_app.config["SES_STUB_URL"],
+    ),
+    expected_type=AwsSesStubClient,
+)
+memo_resetters.append(lambda: get_aws_ses_stub_client.clear())
+aws_ses_stub_client = LocalProxy(get_aws_ses_stub_client)
+
+_notification_provider_clients_context_var: ContextVar[NotificationProviderClients] = ContextVar(
+    "notification_provider_clients"
+)
+get_notification_provider_clients: LazyLocalGetter[NotificationProviderClients] = LazyLocalGetter(
+    _notification_provider_clients_context_var,
+    lambda: NotificationProviderClients(
+        sms_clients={
+            getter.expected_type.name: LocalProxy(getter)
+            for getter in (
+                get_firetext_client,
+                get_mmg_client,
+            )
+        },
+        email_clients={
+            getter.expected_type.name: LocalProxy(getter)
+            # If a stub url is provided for SES, then use the stub client rather
+            # than the real SES boto client
+            for getter in ((get_aws_ses_stub_client,) if current_app.config["SES_STUB_URL"] else (get_aws_ses_client,))
+        },
+    ),
+)
+memo_resetters.append(lambda: get_notification_provider_clients.clear())
+notification_provider_clients = LocalProxy(get_notification_provider_clients)
+
+
+_dvla_client_context_var: ContextVar[DVLAClient] = ContextVar("dvla_client")
+get_dvla_client: LazyLocalGetter[DVLAClient] = LazyLocalGetter(
+    _dvla_client_context_var,
+    lambda: DVLAClient(current_app, statsd_client=statsd_client),
+)
+memo_resetters.append(lambda: get_dvla_client.clear())
+dvla_client = LocalProxy(get_dvla_client)
+
+_document_download_client_context_var: ContextVar[DocumentDownloadClient] = ContextVar("document_download_client")
+get_document_download_client: LazyLocalGetter[DocumentDownloadClient] = LazyLocalGetter(
+    _document_download_client_context_var,
+    lambda: DocumentDownloadClient(current_app),
+)
+memo_resetters.append(lambda: get_document_download_client.clear())
+document_download_client = LocalProxy(get_document_download_client)
+
+_zendesk_client_context_var: ContextVar[ZendeskClient] = ContextVar("zendesk_client")
+get_zendesk_client: LazyLocalGetter[ZendeskClient] = LazyLocalGetter(
+    _zendesk_client_context_var,
+    lambda: ZendeskClient(current_app.config["ZENDESK_API_KEY"]),
+)
+memo_resetters.append(lambda: get_zendesk_client.clear())
+zendesk_client = LocalProxy(get_zendesk_client)
+
 
 def create_app(application):
-    from app.config import configs
+    from app.config import Config, configs
 
     notify_environment = os.environ["NOTIFY_ENVIRONMENT"]
 
-    application.config.from_object(configs[notify_environment])
+    if notify_environment in configs:
+        application.config.from_object(configs[notify_environment])
+    else:
+        application.config.from_object(Config)
 
     application.config["NOTIFY_APP_NAME"] = application.name
-    application.config["SQLALCHEMY_ENGINE_OPTIONS"]["connect_args"]["application_name"] = os.environ.get(
-        "NOTIFY_APP_NAME", "api"
-    )
     init_app(application)
 
     # Metrics intentionally high up to give the most accurate timing and reliability that the metric is recorded
@@ -87,27 +177,12 @@ def create_app(application):
     db.init_app(application)
     migrate.init_app(application, db=db)
     ma.init_app(application)
-    zendesk_client.init_app(application)
     statsd_client.init_app(application)
-    logging.init_app(application, statsd_client)
-    firetext_client.init_app(application, statsd_client=statsd_client)
-    mmg_client.init_app(application, statsd_client=statsd_client)
-    spryng_client.init_app(application, statsd_client=statsd_client)
-    dvla_client.init_app(application, statsd_client=statsd_client)
-    aws_ses_client.init_app(application.config["AWS_REGION"], statsd_client=statsd_client)
-    aws_ses_stub_client.init_app(
-        application.config["AWS_REGION"], statsd_client=statsd_client, stub_url=application.config["SES_STUB_URL"]
-    )
-    # If a stub url is provided for SES, then use the stub client rather than the real SES boto client
-    email_clients = [aws_ses_stub_client] if application.config["SES_STUB_URL"] else [aws_ses_client]
-    notification_provider_clients.init_app(
-        sms_clients=[firetext_client, mmg_client, spryng_client], email_clients=email_clients
-    )
+    utils_logging.init_app(application, statsd_client)
 
     notify_celery.init_app(application)
     signing.init_app(application)
     redis_store.init_app(application)
-    document_download_client.init_app(application)
 
     cbc_proxy_client.init_app(application)
 
@@ -125,14 +200,17 @@ def create_app(application):
     return application
 
 
-def _should_register_functional_testing_blueprint(environment):
-    return environment in {"development", "test", "preview"}
+def reset_memos():
+    """
+    Reset all memos registered in memo_resetters
+    """
+    for resetter in memo_resetters:
+        resetter()
 
 
 def register_blueprint(application):
     from app.authentication.auth import (
         requires_admin_auth,
-        requires_auth,
         requires_functional_test_auth,
         requires_no_auth,
     )
@@ -158,12 +236,13 @@ def register_blueprint(application):
     from app.notifications.receive_notifications import (
         receive_notifications_blueprint,
     )
-    from app.notifications.rest import notifications as notifications_blueprint
+    from app.one_click_unsubscribe.rest import one_click_unsubscribe_blueprint
     from app.organisation.invite_rest import organisation_invite_blueprint
     from app.organisation.rest import organisation_blueprint
     from app.performance_dashboard.rest import performance_dashboard_blueprint
     from app.platform_admin.rest import platform_admin_blueprint
     from app.platform_stats.rest import platform_stats_blueprint
+    from app.protected_sender_id.rest import protected_sender_id_blueprint
     from app.provider_details.rest import (
         provider_details as provider_details_blueprint,
     )
@@ -210,9 +289,6 @@ def register_blueprint(application):
     # inbound sms
     receive_notifications_blueprint.before_request(requires_no_auth)
     application.register_blueprint(receive_notifications_blueprint)
-
-    notifications_blueprint.before_request(requires_auth)
-    application.register_blueprint(notifications_blueprint)
 
     job_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(job_blueprint)
@@ -268,6 +344,9 @@ def register_blueprint(application):
     platform_stats_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(platform_stats_blueprint, url_prefix="/platform-stats")
 
+    protected_sender_id_blueprint.before_request(requires_admin_auth)
+    application.register_blueprint(protected_sender_id_blueprint, url_prefix="/protected-sender-id")
+
     template_folder_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(template_folder_blueprint)
 
@@ -286,7 +365,10 @@ def register_blueprint(application):
     sms_rate_blueprint.before_request(requires_admin_auth)
     application.register_blueprint(sms_rate_blueprint)
 
-    if _should_register_functional_testing_blueprint(application.config["NOTIFY_ENVIRONMENT"]):
+    one_click_unsubscribe_blueprint.before_request(requires_no_auth)
+    application.register_blueprint(one_click_unsubscribe_blueprint)
+
+    if application.config["REGISTER_FUNCTIONAL_TESTING_BLUEPRINT"]:
         test_blueprint.before_request(requires_functional_test_auth)
         application.register_blueprint(test_blueprint)
 
@@ -344,6 +426,11 @@ def init_app(app):
         code = getattr(error, "code", 500)
         return jsonify(result="error", message=msg), code
 
+    @app.errorhandler(EventletTimeout)
+    def eventlet_timeout(error):
+        app.logger.exception(error)
+        return jsonify(result="error", message="Timeout serving request"), 504
+
     @app.errorhandler(WerkzeugHTTPException)
     def werkzeug_exception(e):
         return make_response(jsonify(result="error", message=e.description), e.code, e.get_headers())
@@ -362,7 +449,7 @@ def create_random_identifier():
     return "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(16))
 
 
-def setup_sqlalchemy_events(app):
+def setup_sqlalchemy_events(app):  # noqa: C901
     TOTAL_DB_CONNECTIONS = Gauge(
         "db_connection_total_connected",
         "How many db connections are currently held (potentially idle) by the server",
@@ -386,6 +473,37 @@ def setup_sqlalchemy_events(app):
         def connect(dbapi_connection, connection_record):
             # connection first opened with db
             TOTAL_DB_CONNECTIONS.inc()
+
+            cursor = dbapi_connection.cursor()
+
+            # why not set most of these using connect_args/options? just to avoid the
+            # early-binding issues cross-referencing config vars in the config object
+            # raises, and it's neater to compose these calls than to overwrite connect_args
+            # with our own constructed one
+
+            cursor.execute(
+                "SET statement_timeout = %s",
+                (current_app.config["DATABASE_STATEMENT_TIMEOUT_MS"],),
+            )
+            cursor.execute(
+                "SET application_name = %s",
+                (current_app.config["NOTIFY_APP_NAME"],),
+            )
+
+            if current_app.config["DATABASE_DEFAULT_DISABLE_PARALLEL_QUERY"]:
+                # by default disable parallel query because it allows large analytic-style
+                # queries to consume more resources than smaller transactional queries
+                # typically will, and if anything we want to prioritize the small
+                # transactional queries. this can be re-enabled on a case-by-case basis by
+                # executing SET LOCAL max_parallel_workers_per_gather = ... before the
+                # intended query.
+                #
+                # because this is only done once at connection-creation time, there's a small
+                # danger that SET max_par... (instead of SET LOCAL max_par...) will be used
+                # by the application somewhere, which would persist across checkouts.
+                # however, (re-)setting this on every checkout would likely add a database
+                # round-trip of latency to every request.
+                cursor.execute("SET max_parallel_workers_per_gather = 0")
 
         @event.listens_for(db.engine, "close")
         def close(dbapi_connection, connection_record):

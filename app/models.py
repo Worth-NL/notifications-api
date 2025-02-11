@@ -1,20 +1,19 @@
 import datetime
 import enum
 import uuid
-from typing import Union
+from dataclasses import dataclass
 
 from flask import current_app, url_for
 from notifications_utils.insensitive_dict import InsensitiveDict
 from notifications_utils.letter_timings import get_letter_timings
-from notifications_utils.postal_address import (
-    address_lines_1_to_6_and_postcode_keys,
-)
-from notifications_utils.recipients import (
-    InvalidEmailError,
-    InvalidPhoneError,
+from notifications_utils.recipient_validation.email_address import validate_email_address
+from notifications_utils.recipient_validation.errors import InvalidRecipientError
+from notifications_utils.recipient_validation.phone_number import (
     try_validate_and_format_phone_number,
-    validate_email_address,
     validate_phone_number,
+)
+from notifications_utils.recipient_validation.postal_address import (
+    address_lines_1_to_6_and_postcode_keys,
 )
 from notifications_utils.safe_string import make_string_safe_for_email_local_part
 from notifications_utils.template import (
@@ -22,7 +21,6 @@ from notifications_utils.template import (
     PlainTextEmailTemplate,
     SMSMessageTemplate,
 )
-from notifications_utils.timezones import convert_utc_to_bst
 from sqlalchemy import (
     CheckConstraint,
     Index,
@@ -38,7 +36,7 @@ from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm.collections import attribute_mapped_collection
 from sqlalchemy.schema import Sequence
 
-from app import db, signing
+from app import db, redis_store, signing
 from app.constants import (
     ALL_BROADCAST_PROVIDERS,
     BRANDING_ORG,
@@ -53,16 +51,20 @@ from app.constants import (
     NOTIFICATION_CREATED,
     NOTIFICATION_DELIVERED,
     NOTIFICATION_FAILED,
+    NOTIFICATION_PENDING_VIRUS_CHECK,
     NOTIFICATION_RETURNED_LETTER,
     NOTIFICATION_SENDING,
     NOTIFICATION_STATUS_LETTER_ACCEPTED,
     NOTIFICATION_STATUS_LETTER_RECEIVED,
     NOTIFICATION_STATUS_TYPES_COMPLETED,
     NOTIFICATION_STATUS_TYPES_FAILED,
+    NOTIFICATION_STATUS_TYPES_LETTERS_NEVER_SENT,
     NOTIFICATION_TYPE,
     ORGANISATION_PERMISSION_TYPES,
     PERMISSION_LIST,
     PRECOMPILED_TEMPLATE_NAME,
+    SERVICE_JOIN_REQUEST_PENDING,
+    SERVICE_JOIN_REQUEST_STATUS_TYPES,
     SMS_AUTH_TYPE,
     SMS_TYPE,
     TEMPLATE_TYPES,
@@ -76,7 +78,10 @@ from app.utils import (
     DATETIME_FORMAT,
     DATETIME_FORMAT_NO_TIMEZONE,
     get_dt_string_or_none,
+    get_london_midnight_in_utc,
     get_uuid_string_or_none,
+    url_with_token,
+    utc_string_to_bst_string,
 )
 
 
@@ -93,7 +98,7 @@ class User(db.Model):
     __tablename__ = "users"
 
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = db.Column(db.String, nullable=False, index=True, unique=False)
+    name = db.Column(db.String, nullable=False, unique=False)
     email_address = db.Column(db.String(255), nullable=False, index=True, unique=True)
     created_at = db.Column(db.DateTime, index=False, unique=False, nullable=False, default=datetime.datetime.utcnow)
     updated_at = db.Column(db.DateTime, index=False, unique=False, nullable=True, onupdate=datetime.datetime.utcnow)
@@ -107,14 +112,15 @@ class User(db.Model):
     state = db.Column(db.String, nullable=False, default="pending")
     platform_admin = db.Column(db.Boolean, nullable=False, default=False)
     current_session_id = db.Column(UUID(as_uuid=True), nullable=True)
-    auth_type = db.Column(db.String, db.ForeignKey("auth_type.name"), index=True, nullable=False, default=SMS_AUTH_TYPE)
+    auth_type = db.Column(db.String, db.ForeignKey("auth_type.name"), nullable=False, default=SMS_AUTH_TYPE)
     email_access_validated_at = db.Column(
         db.DateTime, index=False, unique=False, nullable=False, default=datetime.datetime.utcnow
     )
     take_part_in_research = db.Column(db.Boolean, nullable=False, default=True)
+    receives_new_features_email = db.Column(db.Boolean, nullable=False, default=True)
 
     # either email auth or a mobile number must be provided
-    CheckConstraint("auth_type in ('email_auth', 'webauthn_auth') or mobile_number is not null")
+    __table_args__ = (CheckConstraint("auth_type in ('email_auth', 'webauthn_auth') or mobile_number is not null"),)
 
     services = db.relationship("Service", secondary="user_to_service", backref="users")
     organisations = db.relationship("Organisation", secondary="user_to_organisation", backref="users")
@@ -178,6 +184,7 @@ class User(db.Model):
             "id": self.id,
             "name": self.name,
             "email_address": self.email_address,
+            "created_at": self.created_at.strftime(DATETIME_FORMAT),
             "auth_type": self.auth_type,
             "current_session_id": self.current_session_id,
             "failed_login_count": self.failed_login_count,
@@ -193,6 +200,7 @@ class User(db.Model):
             "can_use_webauthn": self.can_use_webauthn,
             "state": self.state,
             "take_part_in_research": self.take_part_in_research,
+            "receives_new_features_email": self.receives_new_features_email,
         }
 
     def serialize_for_users_list(self):
@@ -531,7 +539,7 @@ class Service(db.Model, Versioned):
     restricted = db.Column(db.Boolean, index=False, unique=False, nullable=False)
     created_by_id = db.Column(UUID(as_uuid=True), db.ForeignKey("users.id"), index=True, nullable=False)
     created_by = db.relationship("User", foreign_keys=[created_by_id])
-    prefix_sms = db.Column(db.Boolean, nullable=False, default=True)
+    prefix_sms = db.Column(db.Boolean, nullable=False, default=False)
     organisation_type = db.Column(
         db.String(255),
         db.ForeignKey("organisation_types.name"),
@@ -798,7 +806,7 @@ class ServicePermission(db.Model):
     service_permission_types = db.relationship(Service, backref=db.backref("permissions", cascade="all, delete-orphan"))
 
     def __repr__(self):
-        return "<{} has service permission: {}>".format(self.service_id, self.permission)
+        return f"<{self.service_id} has service permission: {self.permission}>"
 
 
 class ServiceGuestList(db.Model):
@@ -824,15 +832,13 @@ class ServiceGuestList(db.Model):
                 instance.recipient = recipient
             else:
                 raise ValueError("Invalid recipient type")
-        except InvalidPhoneError as e:
-            raise ValueError('Invalid guest list: "{}"'.format(recipient)) from e
-        except InvalidEmailError as e:
-            raise ValueError('Invalid guest list: "{}"'.format(recipient)) from e
+        except InvalidRecipientError as e:
+            raise ValueError(f'Invalid guest list: "{recipient}"') from e
         else:
             return instance
 
     def __repr__(self):
-        return "Recipient {} of type: {}".format(self.recipient, self.recipient_type)
+        return f"Recipient {self.recipient} of type: {self.recipient_type}"
 
 
 class ServiceInboundApi(db.Model, Versioned):
@@ -920,7 +926,7 @@ class ApiKey(db.Model, Versioned):
     _secret = db.Column("secret", db.String(255), unique=True, nullable=False)
     service_id = db.Column(UUID(as_uuid=True), db.ForeignKey("services.id"), index=True, nullable=False)
     service = db.relationship("Service", backref="api_keys")
-    key_type = db.Column(db.String(255), db.ForeignKey("key_types.name"), index=True, nullable=False)
+    key_type = db.Column(db.String(255), db.ForeignKey("key_types.name"), nullable=False)
     expiry_date = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, index=False, unique=False, nullable=False, default=datetime.datetime.utcnow)
     updated_at = db.Column(db.DateTime, index=False, unique=False, nullable=True, onupdate=datetime.datetime.utcnow)
@@ -1022,8 +1028,6 @@ class TemplateBase(db.Model):
 
         super().__init__(**kwargs)
 
-    # WARNING: if we add a new column here, we must add it to templates_dao.py dao_update_template_reply_to
-    # TODO: remove dao_update_template_reply_to and make `dao_update_template` just work
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = db.Column(db.String(255), nullable=False)
     template_type = db.Column(template_types, nullable=False)
@@ -1045,6 +1049,9 @@ class TemplateBase(db.Model):
         nullable=True,
         default=letter_languages_default,
     )
+
+    # TODO: migrate this to be nullable=False
+    has_unsubscribe_link = db.Column(db.Boolean, default=False, nullable=False)
 
     @declared_attr
     def service_id(cls):
@@ -1092,6 +1099,11 @@ class TemplateBase(db.Model):
                 "(template_type != 'letter' AND letter_languages IS NULL) OR"
                 " (template_type = 'letter' AND letter_languages IS NOT NULL)"
             ),
+            # if template type is not email, then has_unsubscribe_link MUST be false
+            CheckConstraint(
+                "template_type = 'email' OR has_unsubscribe_link IS false",
+                name=f"ck_{cls.__tablename__}_non_email_has_unsubscribe_false",
+            ),
         )
 
     @property
@@ -1108,7 +1120,7 @@ class TemplateBase(db.Model):
         elif value is None:
             pass
         else:
-            raise ValueError("Unable to set sender for {} template".format(self.template_type))
+            raise ValueError(f"Unable to set sender for {self.template_type} template")
 
     def get_reply_to_text(self):
         if self.template_type == LETTER_TYPE:
@@ -1319,6 +1331,12 @@ class Job(db.Model):
     archived = db.Column(db.Boolean, nullable=False, default=False)
     contact_list_id = db.Column(UUID(as_uuid=True), db.ForeignKey("service_contact_list.id"), nullable=True, index=True)
 
+    __extended_statistics__ = (
+        # dependencies
+        ("st_dep_jobs_service_id_template_id", ("service_id", "template_id"), ("dependencies",)),
+        ("st_dep_jobs_service_id_contact_list_id", ("service_id", "contact_list_id"), ("dependencies",)),
+    )
+
 
 class VerifyCode(db.Model):
     __tablename__ = "verify_codes"
@@ -1438,6 +1456,8 @@ class Notification(db.Model):
 
     postage = db.Column(db.String, nullable=True)
 
+    unsubscribe_link = db.Column(db.String, nullable=True)
+
     __table_args__ = (
         db.ForeignKeyConstraint(
             ["template_id", "template_version"],
@@ -1446,7 +1466,51 @@ class Notification(db.Model):
         UniqueConstraint("job_id", "job_row_number", name="uq_notifications_job_row_number"),
         Index("ix_notifications_notification_type_composite", "notification_type", "status", "created_at"),
         Index("ix_notifications_service_created_at", "service_id", "created_at"),
-        Index("ix_notifications_service_id_composite", "service_id", "notification_type", "status", "created_at"),
+        Index("ix_notifications_service_id_ntype_created_at", "service_id", "notification_type", "created_at"),
+        # unsubscribe_link value should be null for non-email notifications
+        CheckConstraint(
+            "notification_type = 'email' OR unsubscribe_link is null",
+            name="ck_unsubscribe_link_is_null_if_notification_not_an_email",
+        ),
+        Index(
+            "ix_notifications_normalised_to_trgm",
+            "normalised_to",
+            postgresql_using="gin",
+            postgresql_ops={
+                "normalised_to": "gin_trgm_ops",
+            },
+        ),
+        Index(
+            "ix_notifications_client_reference_trgm",
+            "client_reference",
+            postgresql_using="gin",
+            postgresql_ops={
+                "client_reference": "gin_trgm_ops",
+            },
+        ),
+        Index(
+            "ix_notifications_failed_service_id_composite",
+            "service_id",
+            "notification_type",
+            "created_at",
+            postgresql_where=status.in_(NOTIFICATION_STATUS_TYPES_FAILED),
+        ),
+    )
+
+    __extended_statistics__ = (
+        # dependencies
+        ("st_dep_notifications_service_id_api_key_id", ("service_id", "api_key_id"), ("dependencies",)),
+        ("st_dep_notifications_service_id_job_id", ("service_id", "job_id"), ("dependencies",)),
+        ("st_dep_notifications_service_id_template_id", ("service_id", "template_id"), ("dependencies",)),
+        (
+            "st_dep_notifications_job_id_template_id_notification_type",
+            ("job_id", "template_id", "notification_type"),
+            ("dependencies",),
+        ),
+        # most common values
+        ("st_mcv_notifications_notification_type_status", ("notification_type", "notification_status"), ("mcv",)),
+        ("st_mcv_notifications_service_id_key_type", ("service_id", "key_type"), ("mcv",)),
+        ("st_mcv_notifications_service_id_notification_type", ("service_id", "notification_type"), ("mcv",)),
     )
 
     @property
@@ -1466,7 +1530,7 @@ class Notification(db.Model):
         return None
 
     @staticmethod
-    def substitute_status(status_or_statuses: Union[str, list[str]]) -> list[str]:
+    def substitute_status(status_or_statuses: str | list[str]) -> list[str]:
         """
         static function that takes a status or list of statuses and substitutes our new failure types if it finds
         the deprecated one
@@ -1566,8 +1630,8 @@ class Notification(db.Model):
             return None
 
     def serialize_for_csv(self):
-        created_at_in_bst = convert_utc_to_bst(self.created_at)
         serialized = {
+            "id": self.id,
             "row_number": "" if self.job_row_number is None else self.job_row_number + 1,
             "recipient": self.to,
             "client_reference": self.client_reference or "",
@@ -1575,7 +1639,7 @@ class Notification(db.Model):
             "template_type": self.template.template_type,
             "job_name": self.job.original_file_name if self.job else "",
             "status": self.formatted_status,
-            "created_at": created_at_in_bst.strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": utc_string_to_bst_string(self.created_at),
             "created_by_name": self.get_created_by_name(),
             "created_by_email_address": self.get_created_by_email_address(),
             "api_key_name": self.api_key.name if self.api_key else None,
@@ -1609,6 +1673,9 @@ class Notification(db.Model):
             "completed_at": self.completed_at(),
             "scheduled_for": None,
             "postage": self.postage,
+            "one_click_unsubscribe_url": self.get_unsubscribe_link_for_headers(
+                template_has_unsubscribe_link=self.template.has_unsubscribe_link
+            ),
         }
 
         if self.notification_type == LETTER_TYPE:
@@ -1629,6 +1696,133 @@ class Notification(db.Model):
             ).earliest_delivery.strftime(DATETIME_FORMAT)
 
         return serialized
+
+    def serialize_with_cost_data(self):
+        serialized = self.serialize()
+        serialized["cost_details"] = {}
+        serialized["cost_in_pounds"] = 0.00
+        serialized["is_cost_data_ready"] = True
+
+        if self.notification_type == "sms":
+            return self._add_cost_data_for_sms(serialized)
+        elif self.notification_type == "letter":
+            return self._add_cost_data_for_letter(serialized)
+
+        return serialized
+
+    def _add_cost_data_for_sms(self, serialized):
+        if not self._is_cost_data_ready_for_sms():
+            serialized["is_cost_data_ready"] = False
+            serialized["cost_details"] = {}
+            serialized["cost_in_pounds"] = None
+        else:
+            serialized["cost_details"]["billable_sms_fragments"] = self.billable_units
+            serialized["cost_details"]["international_rate_multiplier"] = self.rate_multiplier
+            sms_rate = self._get_sms_rate()
+            serialized["cost_details"]["sms_rate"] = sms_rate
+            serialized["cost_in_pounds"] = self.billable_units * self.rate_multiplier * sms_rate
+
+        return serialized
+
+    def _add_cost_data_for_letter(self, serialized):
+        if not self._is_cost_data_ready_for_letter():
+            serialized["is_cost_data_ready"] = False
+            serialized["cost_details"] = {}
+            serialized["cost_in_pounds"] = None
+        # we don't bill users for letters that were not sent
+        elif self._letter_was_never_sent():
+            serialized["cost_details"]["billable_sheets_of_paper"] = 0
+            serialized["cost_details"]["postage"] = self.postage
+            serialized["cost_in_pounds"] = 0.00
+        else:
+            serialized["cost_details"]["billable_sheets_of_paper"] = self.billable_units
+            serialized["cost_details"]["postage"] = self.postage
+            serialized["cost_in_pounds"] = self._get_letter_cost()
+
+        return serialized
+
+    def _is_cost_data_ready_for_sms(self):
+        if self.status == NOTIFICATION_CREATED and not self.billable_units:
+            return False
+        return True
+
+    def _is_cost_data_ready_for_letter(self):
+        if self.status == NOTIFICATION_PENDING_VIRUS_CHECK or (
+            self.status == NOTIFICATION_CREATED and not self.billable_units
+        ):
+            return False
+        return True
+
+    def _letter_was_never_sent(self):
+        if self.status in NOTIFICATION_STATUS_TYPES_LETTERS_NEVER_SENT:
+            return True
+        return False
+
+    def _get_sms_rate(self):
+        created_at_date = self.created_at.date()
+
+        if rate := redis_store.get(f"sms-rate-for-{created_at_date}"):
+            return float(rate)
+
+        from app.dao.sms_rate_dao import dao_get_sms_rate_for_timestamp
+
+        rate = dao_get_sms_rate_for_timestamp(created_at_date).rate
+
+        redis_store.set(f"sms-rate-for-{created_at_date}", rate, ex=86400)
+
+        return rate
+
+    def _get_letter_cost(self):
+        if self.billable_units == 0:
+            return 0.00
+
+        created_at_date = self.created_at.date()
+
+        if rate := redis_store.get(
+            f"letter-rate-for-date-{created_at_date}-sheets-{self.billable_units}-postage-{self.postage}"
+        ):
+            return float(rate)
+
+        from app.dao.letter_rate_dao import dao_get_letter_rates_for_timestamp
+
+        rates = dao_get_letter_rates_for_timestamp(created_at_date)
+        letter_rate = float(
+            next(
+                (rate for rate in rates if rate.sheet_count == self.billable_units and rate.post_class == self.postage),
+                None,
+            ).rate
+        )
+        redis_store.set(
+            f"letter-rate-for-date-{created_at_date}-sheets-{self.billable_units}-postage-{self.postage}",
+            letter_rate,
+            ex=86400,
+        )
+
+        return letter_rate
+
+    def _generate_unsubscribe_link(self, base_url):
+        return url_with_token(
+            self.to,
+            url=f"/unsubscribe/{str(self.id)}/",
+            base_url=base_url,
+        )
+
+    def get_unsubscribe_link_for_headers(self, *, template_has_unsubscribe_link):
+        """
+        Generates a URL on the API domain, which accepts a POST request from an email client
+        """
+        if self.unsubscribe_link:
+            return self.unsubscribe_link
+        if template_has_unsubscribe_link:
+            return self._generate_unsubscribe_link(current_app.config["API_HOST_NAME"])
+
+    def get_unsubscribe_link_for_body(self, *, template_has_unsubscribe_link):
+        """
+        Generates a URL on the admin domain, which serves a page telling the user they
+        have been unsubscribed
+        """
+        if template_has_unsubscribe_link:
+            return self._generate_unsubscribe_link(current_app.config["ADMIN_BASE_URL"])
 
 
 class NotificationHistory(db.Model):
@@ -1683,8 +1877,24 @@ class NotificationHistory(db.Model):
         Index("ix_notification_history_created_at", "created_at", postgresql_concurrently=True),
     )
 
+    __extended_statistics__ = (
+        # dependencies
+        ("st_dep_notification_history_service_id_api_key_id", ("service_id", "api_key_id"), ("dependencies",)),
+        ("st_dep_notification_history_service_id_job_id", ("service_id", "job_id"), ("dependencies",)),
+        ("st_dep_notification_history_service_id_tpt_id", ("service_id", "template_id"), ("dependencies",)),
+        (
+            "st_dep_notification_history_job_id_tpt_id_ntfcn_type",
+            ("job_id", "template_id", "notification_type"),
+            ("dependencies",),
+        ),
+        # most common values
+        ("st_mcv_notification_history_ntfcn_type_status", ("notification_type", "notification_status"), ("mcv",)),
+        ("st_mcv_notification_history_service_id_key_type", ("service_id", "key_type"), ("mcv",)),
+        ("st_mcv_notification_history_service_id_ntfcn_type", ("service_id", "notification_type"), ("mcv",)),
+    )
 
-class LetterCostThreshold(enum.Enum):
+
+class LetterCostThreshold(enum.StrEnum):
     sorted = "sorted"
     unsorted = "unsorted"
 
@@ -1706,6 +1916,7 @@ class NotificationLetterDespatch(db.Model):
         "NotificationAllTimeView",
         primaryjoin="NotificationLetterDespatch.notification_id == foreign(NotificationAllTimeView.id)",
         uselist=False,
+        viewonly=True,
     )
 
 
@@ -1800,9 +2011,9 @@ class Rate(db.Model):
     notification_type = db.Column(notification_types, index=True, nullable=False)
 
     def __str__(self):
-        the_string = "{}".format(self.rate)
-        the_string += " {}".format(self.notification_type)
-        the_string += " {}".format(self.valid_from)
+        the_string = f"{self.rate}"
+        the_string += f" {self.notification_type}"
+        the_string += f" {self.valid_from}"
         return the_string
 
     def serialize(self):
@@ -1849,7 +2060,7 @@ class InboundSms(db.Model):
 class InboundSmsHistory(db.Model):
     __tablename__ = "inbound_sms_history"
     id = db.Column(UUID(as_uuid=True), primary_key=True)
-    created_at = db.Column(db.DateTime, index=True, unique=False, nullable=False)
+    created_at = db.Column(db.DateTime, unique=False, nullable=False)
     service_id = db.Column(UUID(as_uuid=True), db.ForeignKey("services.id"), index=True, unique=False)
     service = db.relationship("Service")
     notify_number = db.Column(db.String, nullable=False)
@@ -1936,19 +2147,6 @@ class AuthType(db.Model):
     name = db.Column(db.String, primary_key=True)
 
 
-class DailySortedLetter(db.Model):
-    __tablename__ = "daily_sorted_letter"
-
-    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    billing_day = db.Column(db.Date, nullable=False, index=True)
-    file_name = db.Column(db.String, nullable=True, index=True)
-    unsorted_count = db.Column(db.Integer, nullable=False, default=0)
-    sorted_count = db.Column(db.Integer, nullable=False, default=0)
-    updated_at = db.Column(db.DateTime, nullable=True, onupdate=datetime.datetime.utcnow)
-
-    __table_args__ = (UniqueConstraint("file_name", "billing_day", name="uix_file_name_billing_day"),)
-
-
 class FactBillingLetterDespatch(db.Model):
     __tablename__ = "ft_billing_letter_despatch"
 
@@ -2004,6 +2202,25 @@ class FactNotificationStatus(db.Model):
     notification_count = db.Column(db.Integer(), nullable=False)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=True, onupdate=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        Index(
+            "ix_ft_notification_status_template_id_bst_date",
+            "template_id",
+            "bst_date",
+        ),
+    )
+
+    __extended_statistics__ = (
+        # dependencies
+        ("st_dep_ft_notification_status_service_id_job_id", ("service_id", "job_id"), ("dependencies",)),
+        ("st_dep_ft_notification_status_service_id_template_id", ("service_id", "template_id"), ("dependencies",)),
+        (
+            "st_dep_ft_notification_status_job_id_template_id_ntfcn_type",
+            ("job_id", "template_id", "notification_type"),
+            ("dependencies",),
+        ),
+    )
 
 
 class FactProcessingTime(db.Model):
@@ -2179,6 +2396,7 @@ class BroadcastMessage(db.Model):
             ["template_id", "template_version"],
             ["templates_history.id", "templates_history.version"],
         ),
+        CheckConstraint("created_by_id is not null or created_by_api_key_id is not null"),
         {},
     )
 
@@ -2227,8 +2445,6 @@ class BroadcastMessage(db.Model):
     cap_event = db.Column(db.String(255), nullable=True)
 
     stubbed = db.Column(db.Boolean, nullable=False)
-
-    CheckConstraint("created_by_id is not null or created_by_api_key_id is not null")
 
     @property
     def personalisation(self):
@@ -2544,3 +2760,203 @@ class LetterAttachment(db.Model):
             "original_filename": self.original_filename,
             "page_count": self.page_count,
         }
+
+
+class UnsubscribeRequestReport(db.Model):
+    __tablename__ = "unsubscribe_request_report"
+    id = db.Column(UUID(as_uuid=True), primary_key=True)
+
+    service_id = db.Column(UUID(as_uuid=True), db.ForeignKey("services.id"), nullable=False)
+    service = db.relationship(Service, backref=db.backref("unsubscribe_request_reports"))
+
+    created_at = db.Column(db.DateTime, nullable=True, default=datetime.datetime.utcnow)
+    earliest_timestamp = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+    latest_timestamp = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+    processed_by_service_at = db.Column(db.DateTime, nullable=True)
+    count = db.Column(db.BigInteger, nullable=False)
+
+    @property
+    def will_be_archived_at(self):
+        return get_london_midnight_in_utc(self.created_at + datetime.timedelta(days=7))
+
+    def serialize(self):
+        return {
+            "batch_id": str(self.id),
+            "count": self.count,
+            "created_at": self.created_at.strftime(DATETIME_FORMAT),
+            "earliest_timestamp": self.earliest_timestamp.strftime(DATETIME_FORMAT),
+            "latest_timestamp": self.latest_timestamp.strftime(DATETIME_FORMAT),
+            "processed_by_service_at": (
+                self.processed_by_service_at.strftime(DATETIME_FORMAT) if self.processed_by_service_at else None
+            ),
+            "is_a_batched_report": True,
+            "will_be_archived_at": self.will_be_archived_at.strftime(DATETIME_FORMAT),
+            "service_id": str(self.service_id),
+        }
+
+    @staticmethod
+    def serialize_unbatched_requests(unbatched_unsubscribe_requests):
+        return {
+            "batch_id": None,
+            "count": len(unbatched_unsubscribe_requests),
+            "created_at": None,
+            "earliest_timestamp": unbatched_unsubscribe_requests[-1].created_at.strftime(DATETIME_FORMAT),
+            "latest_timestamp": unbatched_unsubscribe_requests[0].created_at.strftime(DATETIME_FORMAT),
+            "processed_by_service_at": None,
+            "is_a_batched_report": False,
+            "will_be_archived_at": get_london_midnight_in_utc(
+                unbatched_unsubscribe_requests[-1].created_at + datetime.timedelta(days=90)
+            ).strftime(DATETIME_FORMAT),
+            "service_id": unbatched_unsubscribe_requests[0].service_id,
+        }
+
+
+class UnsubscribeRequest(db.Model):
+    __tablename__ = "unsubscribe_request"
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # WIP:
+    # Ignoring a strict foreign key relationship here for now. Notifications are archived to the NotificationHistory
+    # table by a nightly job and I haven't investigated whether that might break a strict FK yet or if it would
+    # work smoothly. We can still have a relationship using an explicit join condition.
+    notification_id = db.Column(UUID(as_uuid=True), index=True, nullable=False)
+    notification = db.relationship(
+        "NotificationAllTimeView",
+        primaryjoin="UnsubscribeRequest.notification_id == foreign(NotificationAllTimeView.id)",
+        uselist=False,
+        viewonly=True,
+    )
+
+    # this is denormalised but might still be useful to have as a separate column?
+    service_id = db.Column(UUID(as_uuid=True), db.ForeignKey("services.id"), nullable=False)
+    service = db.relationship(Service, backref=db.backref("unsubscribe_requests"))
+
+    template_id = db.Column(UUID(as_uuid=True), nullable=False)
+    template_version = db.Column(db.Integer, nullable=False)
+
+    template_history = db.relationship(TemplateHistory, backref=db.backref("unsubscribe_requests"))
+    template = db.relationship(
+        Template,
+        foreign_keys=[template_id],
+        primaryjoin="Template.id == UnsubscribeRequest.template_id",
+        backref=db.backref("unsubscribe_requests"),
+        viewonly=True,
+    )
+
+    email_address = db.Column(db.Text, nullable=False)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+    unsubscribe_request_report_id = db.Column(
+        UUID(as_uuid=True), db.ForeignKey("unsubscribe_request_report.id"), index=True, nullable=True
+    )
+    unsubscribe_request_report = db.relationship(UnsubscribeRequestReport, backref=db.backref("unsubscribe_requests"))
+
+    __table_args__ = (
+        db.ForeignKeyConstraint(
+            ["template_id", "template_version"],
+            ["templates_history.id", "templates_history.version"],
+        ),
+        Index("ix_unsubscribe_request_notification_id", "notification_id"),
+        Index("ix_unsubscribe_request_unsubscribe_request_report_id", "unsubscribe_request_report_id"),
+    )
+
+    def serialize_for_history(self):
+        return {
+            column.key: getattr(self, column.key) for column in self.__table__.columns if column.key != "email_address"
+        }
+
+
+class UnsubscribeRequestHistory(db.Model):
+    __tablename__ = "unsubscribe_request_history"
+
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Ignoring a strict foreign key relationship here for now. Notifications are archived to the NotificationHistory
+    # table by a nightly job and I haven't investigated whether that might break a strict FK yet or if it would
+    # work smoothly. We can still have a relationship using an explicit join condition.
+    notification_id = db.Column(UUID(as_uuid=True), index=True, nullable=False)
+    service_id = db.Column(UUID(as_uuid=True), db.ForeignKey("services.id"), nullable=False)
+    template_id = db.Column(UUID(as_uuid=True), nullable=False)
+    template_version = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False)
+    unsubscribe_request_report_id = db.Column(UUID(as_uuid=True), index=True, nullable=True)
+
+
+class ProtectedSenderId(db.Model):
+    __tablename__ = "protected_sender_ids"
+
+    sender_id = db.Column(db.String, primary_key=True, nullable=False)
+
+
+@dataclass
+class SerializedServiceJoinRequest:
+    id: str
+    service_id: str
+    created_at: str
+    status: str
+    status_changed_at: str | None
+    reason: str | None
+    contacted_service_users: list[str]
+    status_changed_by: User
+    requester: User
+
+
+contacted_users = db.Table(
+    "service_join_request_contacted_users",
+    db.Model.metadata,
+    db.Column(
+        "service_join_request_id", UUID(as_uuid=True), db.ForeignKey("service_join_requests.id"), primary_key=True
+    ),
+    db.Column("user_id", UUID(as_uuid=True), db.ForeignKey("users.id"), primary_key=True),
+)
+
+
+class ServiceJoinRequest(db.Model):
+    __tablename__ = "service_join_requests"
+
+    id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    requester_id = db.Column(UUID(as_uuid=True), db.ForeignKey("users.id"), nullable=False)
+    service_id = db.Column(UUID(as_uuid=True), db.ForeignKey("services.id"), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow())
+    status = db.Column(
+        db.Enum(*SERVICE_JOIN_REQUEST_STATUS_TYPES, name="service_join_request_status_type"),
+        nullable=False,
+        default=SERVICE_JOIN_REQUEST_PENDING,
+    )
+    status_changed_at = db.Column(db.DateTime, nullable=True)
+    status_changed_by_id = db.Column(UUID(as_uuid=True), db.ForeignKey("users.id"), nullable=True)
+    reason = db.Column(db.Text, nullable=True)
+
+    requester = db.relationship("User", foreign_keys=[requester_id])
+    status_changed_by = db.relationship("User", foreign_keys=[status_changed_by_id])
+
+    # Use lazy="joined" to load the contacted_service_users relationship with a SQL JOIN
+    # This is a nice option as we expect to load this relationship frequently when querying ServiceJoinRequest
+    contacted_service_users = db.relationship(
+        "User", secondary=contacted_users, backref="service_join_requests", lazy="joined"
+    )
+
+    def serialize(self) -> SerializedServiceJoinRequest:
+        return SerializedServiceJoinRequest(
+            id=get_uuid_string_or_none(self.id),
+            service_id=get_uuid_string_or_none(self.service_id),
+            created_at=get_dt_string_or_none(self.created_at),
+            status=self.status,
+            status_changed_by=(
+                {
+                    "id": self.status_changed_by.id,
+                    "name": self.status_changed_by.name,
+                }
+                if self.status_changed_by
+                else None
+            ),
+            requester={
+                "id": self.requester.id,
+                "name": self.requester.name,
+                "belongs_to_service": [service.id for service in self.requester.services],
+                "email_address": self.requester.email_address,
+            },
+            status_changed_at=get_dt_string_or_none(self.status_changed_at),
+            reason=self.reason,
+            contacted_service_users=[get_uuid_string_or_none(user.id) for user in self.contacted_service_users],
+        )

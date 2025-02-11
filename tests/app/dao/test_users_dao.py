@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from freezegun import freeze_time
@@ -7,19 +7,22 @@ from sqlalchemy.exc import DataError
 from sqlalchemy.orm.exc import NoResultFound
 
 from app import db
-from app.constants import EMAIL_AUTH_TYPE
+from app.constants import EMAIL_AUTH_TYPE, OrganisationUserPermissionTypes
+from app.dao.organisation_user_permissions_dao import organisation_user_permissions_dao
 from app.dao.service_user_dao import (
     dao_get_service_user,
     dao_update_service_user,
 )
+from app.dao.services_dao import dao_add_user_to_service
 from app.dao.users_dao import (
     count_user_verify_codes,
     create_secret_code,
     dao_archive_user,
     delete_codes_older_created_more_than_a_day_ago,
-    delete_model_user,
+    delete_user_and_all_associated_db_objects,
     get_user_by_email,
     get_user_by_id,
+    get_users_for_research,
     increment_failed_login_count,
     reset_failed_login_count,
     save_model_user,
@@ -28,7 +31,7 @@ from app.dao.users_dao import (
     user_can_be_archived,
 )
 from app.errors import InvalidRequest
-from app.models import User, VerifyCode
+from app.models import OrganisationUserPermissions, Permission, User, VerifyCode
 from tests.app.db import (
     create_permissions,
     create_service,
@@ -59,14 +62,6 @@ def test_create_user(notify_db_session, phone_number):
     assert not user_query.platform_admin
 
 
-def test_get_all_users(notify_db_session):
-    create_user(email="1@test.com")
-    create_user(email="2@test.com")
-
-    assert User.query.count() == 2
-    assert len(get_user_by_id()) == 2
-
-
 def test_get_user(notify_db_session):
     email = "1@test.com"
     user = create_user(email=email)
@@ -83,10 +78,23 @@ def test_get_user_invalid_id(notify_db_session):
         get_user_by_id(user_id="blah")
 
 
-def test_delete_users(sample_user):
+def test_delete_user_and_all_associated_db_objects(notify_db_session, sample_service, sample_organisation):
+    # note: doesn't delete verify codes or services that user created, need to do that separately first
+    id_to_delete = uuid.uuid4()
+    user = create_user(id_=id_to_delete, name="to delete")
+    user.services = [sample_service]
+    user.organisations = [sample_organisation]
+
+    dao_add_user_to_service(
+        sample_service, user, permissions=[Permission(service=sample_service, user=user, permission="manage_users")]
+    )
+
+    assert User.query.count() == 2
+
+    delete_user_and_all_associated_db_objects(user)
+
     assert User.query.count() == 1
-    delete_model_user(sample_user)
-    assert User.query.count() == 0
+    assert not User.query.get(id_to_delete)
 
 
 def test_increment_failed_login_should_increment_failed_logins(sample_user):
@@ -206,6 +214,7 @@ def test_create_secret_code_never_repeats_consecutive_digits(mocker):
 @freeze_time("2018-07-07 12:00:00")
 def test_dao_archive_user(sample_user, sample_organisation, fake_uuid):
     sample_user.current_session_id = fake_uuid
+    sample_user.platform_admin = True
 
     # create 2 services for sample_user to be a member of (each with another active user)
     service_1 = create_service(service_name="Service 1")
@@ -220,8 +229,21 @@ def test_dao_archive_user(sample_user, sample_organisation, fake_uuid):
     create_permissions(sample_user, service_2, "view_activity")
     create_permissions(service_2_user, service_2, "manage_settings")
 
-    # make sample_user an org member
+    # make sample_user an org member with permissions
     sample_organisation.users = [sample_user]
+    new_permissions = [
+        OrganisationUserPermissions(
+            user=sample_user,
+            organisation=sample_organisation,
+            permission=OrganisationUserPermissionTypes.can_make_services_live.value,
+        )
+    ]
+    organisation_user_permissions_dao.set_user_organisation_permission(
+        sample_user,
+        sample_organisation,
+        new_permissions,
+        _commit=True,
+    )
 
     # give sample_user folder permissions for a service_1 folder
     folder = create_template_folder(service_1)
@@ -236,11 +258,13 @@ def test_dao_archive_user(sample_user, sample_organisation, fake_uuid):
     assert sample_user.organisations == []
     assert sample_user.auth_type == EMAIL_AUTH_TYPE
     assert sample_user.name == "Archived user"
-    assert sample_user.email_address == f"_archived_2018-07-07_{sample_user.id}@test.notify.com"
+    assert sample_user.email_address == f"_archived_2018-07-07-12:00:00_{sample_user.id}@test.notify.com"
     assert sample_user.mobile_number is None
     assert sample_user.current_session_id == uuid.UUID("00000000-0000-0000-0000-000000000000")
     assert sample_user.state == "inactive"
     assert not sample_user.check_password("password")
+    assert not sample_user.platform_admin
+    assert sample_user.get_organisation_permissions() == {}
 
 
 def test_user_can_be_archived_if_they_do_not_belong_to_any_services(sample_user):
@@ -304,3 +328,24 @@ def test_user_cannot_be_archived_if_the_other_service_members_do_not_have_the_ma
 
     assert len(sample_service.users) == 3
     assert not user_can_be_archived(active_user)
+
+
+def test_get_users_for_research(notify_db_session):
+    # users that don't get returned from function
+    create_user(state="active", take_part_in_research=True, created_at=datetime(2024, 6, 30, 23, 59))
+    create_user(state="active", take_part_in_research=True, created_at=datetime(2024, 8, 14))
+    create_user(state="active", take_part_in_research=False, created_at=datetime(2024, 8, 1))
+    create_user(state="inactive", take_part_in_research=True, created_at=datetime(2024, 8, 1))
+    create_user(state="pending", take_part_in_research=True, created_at=datetime(2024, 8, 1))
+
+    # users that do get returned from function
+    returned_user_1 = create_user(state="active", take_part_in_research=True, created_at=datetime(2024, 8, 1))
+    returned_user_2 = create_user(state="active", take_part_in_research=True, created_at=datetime(2024, 8, 5, 14))
+    returned_user_3 = create_user(state="active", take_part_in_research=True, created_at=datetime(2024, 8, 13, 23, 59))
+
+    users = get_users_for_research(date(2024, 7, 31), date(2024, 8, 14))
+
+    assert len(users) == 3
+    assert returned_user_1 in users
+    assert returned_user_2 in users
+    assert returned_user_3 in users

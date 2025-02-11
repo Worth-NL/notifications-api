@@ -1,4 +1,3 @@
-import uuid
 from datetime import date, datetime, timedelta
 
 from flask import current_app
@@ -33,6 +32,8 @@ from app.models import (
     ApiKey,
     FactBilling,
     InboundNumber,
+    InboundSms,
+    InboundSmsHistory,
     InvitedUser,
     Job,
     Notification,
@@ -41,13 +42,20 @@ from app.models import (
     Permission,
     Service,
     ServiceContactList,
+    ServiceDataRetention,
     ServiceEmailReplyTo,
+    ServiceInboundApi,
+    ServiceJoinRequest,
     ServiceLetterContact,
     ServicePermission,
     ServiceSmsSender,
     Template,
+    TemplateFolder,
     TemplateHistory,
     TemplateRedacted,
+    UnsubscribeRequest,
+    UnsubscribeRequestHistory,
+    UnsubscribeRequestReport,
     User,
     VerifyCode,
 )
@@ -79,7 +87,7 @@ def dao_fetch_all_services(only_active=False):
 
 def get_services_by_partial_name(service_name):
     service_name = escape_special_characters(service_name)
-    return Service.query.filter(Service.name.ilike("%{}%".format(service_name))).all()
+    return Service.query.filter(Service.name.ilike(f"%{service_name}%")).all()
 
 
 def dao_count_live_services():
@@ -254,7 +262,6 @@ def dao_fetch_service_by_id_and_user(service_id, user_id):
 def dao_create_service(  # noqa: C901
     service,
     user,
-    service_id=None,
     service_permissions=None,
 ):
     if not user:
@@ -269,7 +276,6 @@ def dao_create_service(  # noqa: C901
 
     service.users.append(user)
     permission_dao.add_default_service_permissions_for_user(user, service)
-    service.id = service_id or uuid.uuid4()  # must be set now so version history model can use same id
     service.active = True
 
     for permission in service_permissions:
@@ -349,41 +355,71 @@ def dao_remove_user_from_service(service, user):
 
 
 def delete_service_and_all_associated_db_objects(service):
-    def _delete_commit(query):
+    """
+    To be used with functional test services only! This irrevocably deletes data, use with extreme caution!
+    """
+
+    def _delete(query):
         query.delete(synchronize_session=False)
-        db.session.commit()
 
     subq = db.session.query(Template.id).filter_by(service=service).subquery()
-    _delete_commit(TemplateRedacted.query.filter(TemplateRedacted.template_id.in_(subq)))
+    _delete(TemplateRedacted.query.filter(TemplateRedacted.template_id.in_(subq)))
 
-    _delete_commit(ServiceSmsSender.query.filter_by(service=service))
-    _delete_commit(ServiceEmailReplyTo.query.filter_by(service=service))
-    _delete_commit(ServiceLetterContact.query.filter_by(service=service))
-    _delete_commit(ServiceContactList.query.filter_by(service=service))
-    _delete_commit(InvitedUser.query.filter_by(service=service))
-    _delete_commit(Permission.query.filter_by(service=service))
-    _delete_commit(NotificationHistory.query.filter_by(service=service))
-    _delete_commit(Notification.query.filter_by(service=service))
-    _delete_commit(Job.query.filter_by(service=service))
-    _delete_commit(Template.query.filter_by(service=service))
-    _delete_commit(TemplateHistory.query.filter_by(service_id=service.id))
-    _delete_commit(ServicePermission.query.filter_by(service_id=service.id))
-    _delete_commit(ApiKey.query.filter_by(service=service))
-    _delete_commit(ApiKey.get_history_model().query.filter_by(service_id=service.id))
-    _delete_commit(AnnualBilling.query.filter_by(service_id=service.id))
+    _delete(InboundSms.query.filter_by(service=service))
+    _delete(InboundSmsHistory.query.filter_by(service=service))
+    _delete(ServiceInboundApi.query.filter_by(service=service))
+
+    _delete(UnsubscribeRequest.query.filter_by(service_id=service.id))
+    _delete(UnsubscribeRequestReport.query.filter_by(service_id=service.id))
+    _delete(UnsubscribeRequestHistory.query.filter_by(service_id=service.id))
+
+    service_join_requests = ServiceJoinRequest.query.filter_by(service_id=service.id)
+    for service_join_request in service_join_requests:
+        service_join_request.contacted_service_users = []
+    _delete(service_join_requests)
+
+    _delete(ServiceSmsSender.query.filter_by(service=service))
+    _delete(InboundNumber.query.filter_by(service=service))
+    _delete(ServiceEmailReplyTo.query.filter_by(service=service))
+    _delete(ServiceContactList.query.filter_by(service=service))
+    _delete(InvitedUser.query.filter_by(service=service))
+    _delete(Permission.query.filter_by(service=service))
+    _delete(NotificationHistory.query.filter_by(service=service))
+    _delete(Notification.query.filter_by(service=service))
+    _delete(Job.query.filter_by(service=service))
+    _delete(ServiceDataRetention.query.filter_by(service=service))
+
+    templates = Template.query.filter_by(service=service)
+    for template in templates:
+        template.folder = None
+        # Deleting TemplateHistory by Template could be inefficient
+        # DB connection timeout when filtering and deleting by Service
+        _delete(TemplateHistory.query.filter_by(id=template.id))
+    _delete(templates)
+
+    template_folders = TemplateFolder.query.filter_by(service=service)
+    for template_folder in template_folders:
+        template_folder.users = []
+    _delete(template_folders)
+
+    _delete(ServiceLetterContact.query.filter_by(service=service))
+    _delete(ServicePermission.query.filter_by(service_id=service.id))
+    _delete(ApiKey.query.filter_by(service=service))
+    _delete(ApiKey.get_history_model().query.filter_by(service_id=service.id))
+    _delete(AnnualBilling.query.filter_by(service_id=service.id))
 
     verify_codes = VerifyCode.query.join(User).filter(User.id.in_([x.id for x in service.users]))
     list(map(db.session.delete, verify_codes))
-    db.session.commit()
-    users = [x for x in service.users]
+    users = list(service.users)
     for user in users:
         user.organisations = []
         service.users.remove(user)
-    _delete_commit(Service.get_history_model().query.filter_by(id=service.id))
-    db.session.delete(service)
-    db.session.commit()
-    for user in users:
-        db.session.delete(user)
+
+    service.letter_branding = None
+    service.email_branding = None
+    _delete(Service.get_history_model().query.filter_by(id=service.id))
+    _delete(Service.query.filter_by(id=service.id))
+
     db.session.commit()
 
 

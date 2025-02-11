@@ -1,11 +1,12 @@
 from datetime import datetime
+from uuid import UUID
 
 from botocore.exceptions import ClientError as BotoClientError
 from flask import current_app
-from notifications_utils.postal_address import PostalAddress
+from notifications_utils.recipient_validation.postal_address import PostalAddress
 from sqlalchemy.orm.exc import NoResultFound
 
-from app import dvla_client, notify_celery
+from app import dvla_client, notify_celery, signing
 from app.clients.email import EmailClientNonRetryableException
 from app.clients.email.aws_ses import AwsSesClientThrottlingSendRateException
 from app.clients.letter.dvla import (
@@ -38,7 +39,7 @@ def deliver_sms(self, notification_id):
         current_app.logger.info("Start sending SMS for notification id: %s", notification_id)
         notification = notifications_dao.get_notification_by_id(notification_id)
         if not notification:
-            raise NoResultFound()
+            raise NoResultFound
         send_to_providers.send_sms_to_provider(notification)
     except Exception as e:
         if isinstance(e, SmsClientResponseException):
@@ -53,8 +54,8 @@ def deliver_sms(self, notification_id):
                 self.retry(queue=QueueNames.RETRY)
         except self.MaxRetriesExceededError as e:
             message = (
-                "RETRY FAILED: Max retries reached. The task send_sms_to_provider failed for notification {}. "
-                "Notification has been updated to technical-failure".format(notification_id)
+                f"RETRY FAILED: Max retries reached. The task send_sms_to_provider failed for "
+                f"notification {notification_id}. Notification has been updated to technical-failure"
             )
             update_notification_status_by_id(notification_id, NOTIFICATION_TECHNICAL_FAILURE)
             raise NotificationTechnicalFailureException(message) from e
@@ -66,7 +67,7 @@ def deliver_email(self, notification_id):
         current_app.logger.info("Start sending email for notification id: %s", notification_id)
         notification = notifications_dao.get_notification_by_id(notification_id)
         if not notification:
-            raise NoResultFound()
+            raise NoResultFound
         send_to_providers.send_email_to_provider(notification)
     except EmailClientNonRetryableException as e:
         current_app.logger.exception("Email notification %s failed: %s", notification_id, e)
@@ -82,8 +83,8 @@ def deliver_email(self, notification_id):
         except self.MaxRetriesExceededError as e:
             message = (
                 "RETRY FAILED: Max retries reached. "
-                "The task send_email_to_provider failed for notification {}. "
-                "Notification has been updated to technical-failure".format(notification_id)
+                f"The task send_email_to_provider failed for notification {notification_id}. "
+                "Notification has been updated to technical-failure"
             )
             update_notification_status_by_id(notification_id, NOTIFICATION_TECHNICAL_FAILURE)
             raise NotificationTechnicalFailureException(message) from e
@@ -125,6 +126,7 @@ def deliver_letter(self, notification_id):
             service_id=str(notification.service_id),
             organisation_id=str(notification.service.organisation_id),
             pdf_file=file_bytes,
+            callback_url=_get_callback_url(notification_id),
         )
         update_letter_to_sending(notification)
     except DvlaRetryableException as e:
@@ -158,3 +160,9 @@ def update_letter_to_sending(notification):
     notification.sent_by = provider.identifier
 
     notifications_dao.dao_update_notification(notification)
+
+
+def _get_callback_url(notification_id: UUID) -> str:
+    signed_notification_id = signing.encode(str(notification_id))
+
+    return f"{current_app.config['API_HOST_NAME']}/notifications/letter/status?token={signed_notification_id}"

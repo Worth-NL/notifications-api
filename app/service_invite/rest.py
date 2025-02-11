@@ -10,6 +10,7 @@ from app.dao.invited_user_dao import (
     get_invited_users_for_service,
     save_invited_user,
 )
+from app.dao.service_join_requests_dao import dao_create_service_join_request
 from app.dao.services_dao import dao_fetch_service_by_id
 from app.dao.templates_dao import dao_get_template_by_id
 from app.dao.users_dao import get_user_by_id
@@ -94,7 +95,7 @@ def invited_user_url(invited_user_id, invite_link_host=None):
     if invite_link_host is None:
         invite_link_host = current_app.config["ADMIN_BASE_URL"]
 
-    return "{0}/invitation/{1}".format(invite_link_host, token)
+    return f"{invite_link_host}/invitation/{token}"
 
 
 @service_invite.route("/invite/service/<uuid:invited_user_id>", methods=["GET"])
@@ -135,26 +136,39 @@ def request_invite_to_service(service_id, user_to_invite_id):
     service = dao_fetch_service_by_id(service_id)
     reason_for_request = request_json["reason"]
     invite_link_host = request_json["invite_link_host"]
-    accept_invite_request_url = f"{invite_link_host}/services/{service.id}/users/invite/{user_requesting_invite.id}"
+    request_again_url = f"{invite_link_host}/services/{service.id}/join/ask"
 
     if user_requesting_invite.services and service in user_requesting_invite.services:
         raise BadRequestError(400, "user-already-in-service")
 
+    # Temporary logic to capture the request
+    # Once the join service request flow is completed this needs to be refactored
+    created_service_join_request = dao_create_service_join_request(
+        requester_id=user_to_invite_id,
+        service_id=service_id,
+        contacted_user_ids=recipients_of_invite_request_ids,
+    )
+
+    approve_request_url = (
+        f"{invite_link_host}/services/{service.id}/join-request/{created_service_join_request.id}/approve"
+    )
+
     send_service_invite_request(
-        user_requesting_invite, recipients_of_invite_request, service, reason_for_request, accept_invite_request_url
+        user_requesting_invite, recipients_of_invite_request, service, reason_for_request, approve_request_url
     )
 
     send_receipt_after_sending_request_invite_letter(
         user_requesting_invite,
         service=service,
         recipients_of_invite_request=recipients_of_invite_request,
+        request_again_url=request_again_url,
     )
 
     return {}, 204
 
 
 def send_service_invite_request(
-    user_requesting_invite, recipients_of_invite_request, service, reason_for_request, accept_invite_request_url
+    user_requesting_invite, recipients_of_invite_request, service, reason_for_request, approve_request_url
 ):
     template_id = current_app.config["REQUEST_INVITE_TO_SERVICE_TEMPLATE_ID"]
     template = dao_get_template_by_id(template_id)
@@ -165,16 +179,16 @@ def send_service_invite_request(
             saved_notification = persist_notification(
                 template_id=template.id,
                 template_version=template.version,
-                recipient="notify-join-service-request@digital.cabinet-office.gov.uk",
+                recipient=recipient.email_address,
                 service=notify_service,
                 personalisation={
-                    "name": recipient.name,
+                    "approver_name": recipient.name,
                     "requester_name": user_requesting_invite.name,
-                    "requester_email": user_requesting_invite.email_address,
+                    "requester_email_address": user_requesting_invite.email_address,
                     "service_name": service.name,
                     "reason_given": "yes" if reason_for_request else "no",
                     "reason": "\n".join(f"^ {line}" for line in reason_for_request.splitlines()),
-                    "url": accept_invite_request_url,
+                    "url": approve_request_url,
                 },
                 notification_type=template.template_type,
                 api_key_id=None,
@@ -199,7 +213,13 @@ def send_service_invite_request(
         raise BadRequestError(400, "no-valid-service-managers-ids")
 
 
-def send_receipt_after_sending_request_invite_letter(user_requesting_invite, *, service, recipients_of_invite_request):
+def send_receipt_after_sending_request_invite_letter(
+    user_requesting_invite,
+    *,
+    service,
+    recipients_of_invite_request,
+    request_again_url,
+):
     template_id = current_app.config["RECEIPT_FOR_REQUEST_INVITE_TO_SERVICE_TEMPLATE_ID"]
     template = dao_get_template_by_id(template_id)
     notify_service = Service.query.get(current_app.config["NOTIFY_SERVICE_ID"])
@@ -210,9 +230,10 @@ def send_receipt_after_sending_request_invite_letter(user_requesting_invite, *, 
         recipient=user_requesting_invite.email_address,
         service=notify_service,
         personalisation={
-            "name": user_requesting_invite.name,
-            "service name": service.name,
-            "service admin names": [user.name for user in recipients_of_invite_request],
+            "requester_name": user_requesting_invite.name,
+            "service_name": service.name,
+            "service_admin_names": [f"{user.name} – {user.email_address}" for user in recipients_of_invite_request],
+            "url_ask_to_join_page": request_again_url,
         },
         notification_type=template.template_type,
         api_key_id=None,

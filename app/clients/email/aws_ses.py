@@ -54,65 +54,75 @@ class AwsSesClientThrottlingSendRateException(AwsSesClientException):
 class AwsSesClient(EmailClient):
     """
     Amazon SES email client.
+
+    This class is not thread-safe
     """
 
-    def init_app(self, region, statsd_client, *args, **kwargs):
-        self._client = boto3.client("ses", region_name=region)
-        super(AwsSesClient, self).__init__(*args, **kwargs)
+    name = "ses"
+
+    def __init__(self, region, statsd_client):
+        super().__init__()
+        self._client = boto3.client("sesv2", region_name=region)
         self.statsd_client = statsd_client
 
-    @property
-    def name(self):
-        return "ses"
+    def send_email(
+        self,
+        *,
+        from_address: str,
+        to_address: str,
+        subject: str,
+        body: str,
+        html_body: str,
+        reply_to_address: str | None,
+        headers: list[dict[str, str]],
+    ) -> str:
+        reply_to_addresses = [punycode_encode_email(reply_to_address)] if reply_to_address else []
+        to_addresses = [punycode_encode_email(to_address)]
 
-    def send_email(self, source, to_addresses, subject, body, html_body="", reply_to_address=None):
+        body = {"Text": {"Data": body}, "Html": {"Data": html_body}}
+
+        start_time = monotonic()
+
         try:
-            if isinstance(to_addresses, str):
-                to_addresses = [to_addresses]
-
-            reply_to_addresses = [reply_to_address] if reply_to_address else []
-
-            body = {"Text": {"Data": body}}
-
-            if html_body:
-                body.update({"Html": {"Data": html_body}})
-
-            start_time = monotonic()
             response = self._client.send_email(
-                Source=source,
+                FromEmailAddress=from_address,
                 Destination={
-                    "ToAddresses": [punycode_encode_email(addr) for addr in to_addresses],
+                    "ToAddresses": to_addresses,
                     "CcAddresses": [],
                     "BccAddresses": [],
                 },
-                Message={
-                    "Subject": {
-                        "Data": subject,
+                Content={
+                    "Simple": {
+                        "Subject": {"Data": subject},
+                        "Body": body,
+                        "Headers": headers,
                     },
-                    "Body": body,
                 },
-                ReplyToAddresses=[punycode_encode_email(addr) for addr in reply_to_addresses],
+                ReplyToAddresses=reply_to_addresses,
             )
         except botocore.exceptions.ClientError as e:
             self.statsd_client.incr("clients.ses.error")
 
-            # http://docs.aws.amazon.com/ses/latest/DeveloperGuide/api-error-codes.html
+            # https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html#API_SendEmail_Errors
             if e.response["Error"]["Code"] == "InvalidParameterValue":
                 raise EmailClientNonRetryableException(e.response["Error"]["Message"]) from e
-            elif (
-                e.response["Error"]["Code"] == "Throttling"
-                and e.response["Error"]["Message"] == "Maximum sending rate exceeded."
-            ):
+            elif e.response["Error"]["Code"] == "TooManyRequestsException":
                 raise AwsSesClientThrottlingSendRateException(str(e)) from e
             else:
                 self.statsd_client.incr("clients.ses.error")
-                raise AwsSesClientException(str(e)) from e
+                raise AwsSesClientException(str(e) + e.response["Error"]["Code"]) from e
         except Exception as e:
             self.statsd_client.incr("clients.ses.error")
             raise AwsSesClientException(str(e)) from e
         else:
             elapsed_time = monotonic() - start_time
-            current_app.logger.info("AWS SES request finished in %s", elapsed_time)
+            current_app.logger.info(
+                "AWS SES request finished in %s",
+                elapsed_time,
+                extra={
+                    "elapsed_time": elapsed_time,
+                },
+            )
             self.statsd_client.timing("clients.ses.request-time", elapsed_time)
             self.statsd_client.incr("clients.ses.success")
             return response["MessageId"]

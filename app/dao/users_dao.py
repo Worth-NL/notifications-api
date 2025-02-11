@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from random import SystemRandom
 
 from flask import current_app
@@ -9,10 +9,13 @@ from sqlalchemy.orm import joinedload
 from app import db
 from app.constants import EMAIL_AUTH_TYPE
 from app.dao.dao_utils import autocommit
+from app.dao.organisation_dao import dao_remove_user_from_organisation
+from app.dao.organisation_user_permissions_dao import organisation_user_permissions_dao
 from app.dao.permissions_dao import permission_dao
 from app.dao.service_user_dao import dao_get_service_users_by_user_id
+from app.dao.services_dao import dao_remove_user_from_service
 from app.errors import InvalidRequest
-from app.models import User, VerifyCode
+from app.models import ApiKey, User, VerifyCode
 from app.utils import escape_special_characters, get_archived_db_column_value
 
 
@@ -82,7 +85,18 @@ def use_user_code(id):
     db.session.commit()
 
 
-def delete_model_user(user):
+def delete_user_and_all_associated_db_objects(user):
+    # if the user has created api keys, we need to delete them. this will fail if the api key is still linked
+    # to notifications in the database - if you encounter foreign key violations here you'll need to make sure
+    # delete_service_and_all_associated_db_objects was run for the correct services that the user might have
+    # created api keys for
+    for api_key in ApiKey.query.filter_by(created_by=user):
+        db.session.delete(api_key)
+
+    organisation_user_permissions_dao.remove_user_organisation_permissions_by_user(user)
+    user.organisations = []
+    for service in user.services:
+        dao_remove_user_from_service(user=user, service=service)
     db.session.delete(user)
     db.session.commit()
 
@@ -99,10 +113,8 @@ def count_user_verify_codes(user):
     return query.count()
 
 
-def get_user_by_id(user_id=None):
-    if user_id:
-        return User.query.filter_by(id=user_id).one()
-    return User.query.filter_by().all()
+def get_user_by_id(user_id):
+    return User.query.filter_by(id=user_id).one()
 
 
 def get_user_by_email(email):
@@ -111,7 +123,7 @@ def get_user_by_email(email):
 
 def get_users_by_partial_email(email):
     email = escape_special_characters(email)
-    return User.query.filter(User.email_address.ilike("%{}%".format(email))).all()
+    return User.query.filter(User.email_address.ilike(f"%{email}%")).all()
 
 
 def increment_failed_login_count(user):
@@ -162,13 +174,15 @@ def dao_archive_user(user):
     for service_user in service_users:
         db.session.delete(service_user)
 
-    user.organisations = []
+    for organisation in user.organisations:
+        dao_remove_user_from_organisation(user=user, organisation=organisation)
 
     user.auth_type = EMAIL_AUTH_TYPE
     user.name = "Archived user"
     user.email_address = get_archived_db_column_value(f"{user.id}@{current_app.config['NOTIFY_EMAIL_DOMAIN']}")
     user.mobile_number = None
     user.password = str(uuid.uuid4())
+    user.platform_admin = False
 
     # Changing the current_session_id signs the user out
     user.current_session_id = "00000000-0000-0000-0000-000000000000"
@@ -191,3 +205,16 @@ def user_can_be_archived(user):
             return False
 
     return True
+
+
+def get_users_for_research(start_date: date, end_date: date) -> list[User]:
+    """
+    Returns active users who have consented to take part in user research and who
+    were created on or after the start but before the end date.
+    """
+    return User.query.filter(
+        User.state == "active",
+        User.take_part_in_research == True,  # noqa
+        User.created_at >= start_date,
+        User.created_at < end_date,
+    ).all()

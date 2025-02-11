@@ -106,7 +106,7 @@ def test_create_service(notify_db_session):
     assert service_db.name == "service name"
     assert service_db.id == service.id
     assert service_db.email_sender_local_part == "service.name"
-    assert service_db.prefix_sms is True
+    assert service_db.prefix_sms is False
     assert service.active is True
     assert user in service_db.users
     assert service_db.organisation_type == "central"
@@ -133,7 +133,7 @@ def test_create_service_with_organisation(notify_db_session):
     organisation = Organisation.query.get(organisation.id)
     assert service_db.name == "service_name"
     assert service_db.id == service.id
-    assert service_db.prefix_sms is True
+    assert service_db.prefix_sms is False
     assert service.active is True
     assert user in service_db.users
     assert service_db.organisation_type == "local"
@@ -742,11 +742,12 @@ def test_delete_service_and_associated_objects(notify_db_session):
     assert Job.query.count() == 0
     assert Notification.query.count() == 0
     assert Permission.query.count() == 0
-    assert User.query.count() == 0
     assert InvitedUser.query.count() == 0
     assert Service.query.count() == 0
     assert Service.get_history_model().query.count() == 0
     assert ServicePermission.query.count() == 0
+    # we don't delete users as part of this function (see delete_user_and_all_associated_db_objects)
+    assert User.query.count() == 1
     # the organisation hasn't been deleted
     assert Organisation.query.count() == 1
 
@@ -1168,7 +1169,7 @@ def test_dao_allocating_inbound_number_shows_on_service(notify_db_session):
 
 def _assert_service_permissions(service_permissions, expected):
     assert len(service_permissions) == len(expected)
-    assert set(expected) == set(p.permission for p in service_permissions)
+    assert set(expected) == {p.permission for p in service_permissions}
 
 
 def create_email_sms_letter_template():
@@ -1192,22 +1193,22 @@ def test_dao_find_services_sending_to_tv_numbers(notify_db_session, fake_uuid):
 
     for service in services:
         template = create_template(service)
-        for _ in range(0, 5):
+        for _ in range(5):
             create_notification(template, normalised_to=tv_number, status="permanent-failure")
 
     service_5 = create_service(service_name="Service 6")  # notifications too old are excluded
     with freeze_time("2019-11-30 15:00:00.000000"):
         template_5 = create_template(service_5)
-        for _ in range(0, 5):
+        for _ in range(5):
             create_notification(template_5, normalised_to=tv_number, status="permanent-failure")
 
     service_2 = create_service(service_name="Service 2")  # below threshold is excluded
     template_2 = create_template(service_2)
     create_notification(template_2, normalised_to=tv_number, status="permanent-failure")
-    for _ in range(0, 5):
+    for _ in range(5):
         # test key type is excluded
         create_notification(template_2, normalised_to=tv_number, status="permanent-failure", key_type="test")
-    for _ in range(0, 5):
+    for _ in range(5):
         # normal numbers are not counted by the query
         create_notification(template_2, normalised_to=normal_number, status="delivered")
         create_notification(template_2, normalised_to=normal_number_resembling_tv_number, status="delivered")
@@ -1228,7 +1229,7 @@ def test_dao_find_services_with_high_failure_rates(notify_db_session, fake_uuid)
 
     for service in services:
         template = create_template(service)
-        for _ in range(0, 3):
+        for _ in range(3):
             create_notification(template, status="permanent-failure")
             create_notification(template, status="delivered")
             create_notification(template, status="sending")
@@ -1237,12 +1238,12 @@ def test_dao_find_services_with_high_failure_rates(notify_db_session, fake_uuid)
     service_5 = create_service(service_name="Service 5")
     with freeze_time("2019-11-30 15:00:00.000000"):
         template_5 = create_template(service_5)
-        for _ in range(0, 4):
+        for _ in range(4):
             create_notification(template_5, status="permanent-failure")  # notifications too old are excluded
 
     service_2 = create_service(service_name="Service 2")
     template_2 = create_template(service_2)
-    for _ in range(0, 4):
+    for _ in range(4):
         create_notification(template_2, status="permanent-failure", key_type="test")  # test key type is excluded
     create_notification(template_2, status="permanent-failure")  # below threshold is excluded
 

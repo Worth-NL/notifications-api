@@ -5,14 +5,13 @@ from collections import namedtuple
 import pytest
 from boto3.exceptions import Boto3Error
 from freezegun import freeze_time
-from notifications_utils.recipients import (
-    validate_and_format_email_address,
-    validate_and_format_phone_number,
-)
+from notifications_utils.recipient_validation.email_address import validate_and_format_email_address
+from notifications_utils.recipient_validation.errors import InvalidPhoneError
+from notifications_utils.recipient_validation.phone_number import validate_and_format_phone_number
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.constants import LETTER_TYPE
-from app.models import Notification, NotificationHistory
+from app.constants import EMAIL_TYPE, KEY_TYPE_NORMAL, LETTER_TYPE, SMS_TO_UK_LANDLINES, SMS_TYPE
+from app.models import Notification, NotificationHistory, ServicePermission
 from app.notifications.process_notifications import (
     create_content_for_notification,
     persist_notification,
@@ -21,7 +20,7 @@ from app.notifications.process_notifications import (
 )
 from app.serialised_models import SerialisedTemplate
 from app.v2.errors import BadRequestError, QrCodeTooLongError
-from tests.app.db import create_api_key, create_service, create_template
+from tests.app.db import create_api_key, create_job, create_service, create_template
 from tests.conftest import set_config
 
 
@@ -291,7 +290,7 @@ def test_send_notification_to_queue(
     expected_task,
     mocker,
 ):
-    mocked = mocker.patch("app.celery.{}.apply_async".format(expected_task))
+    mocked = mocker.patch(f"app.celery.{expected_task}.apply_async")
     Notification = namedtuple("Notification", ["id", "key_type", "notification_type", "created_at"])
     notification = Notification(
         id=uuid.uuid4(),
@@ -387,7 +386,71 @@ def test_persist_notification_with_international_info_stores_correct_info(
     assert persisted_notification.rate_multiplier == expected_units
 
 
-def test_persist_notification_with_international_info_does_not_store_for_email(sample_job, sample_api_key, mocker):
+@pytest.mark.parametrize(
+    "recipient, expected_recipient_normalised, expected_prefix, expected_units",
+    [
+        ("02077091001", "442077091001", "44", 1),  # UK
+        ("+442077091002", "442077091002", "44", 1),  # UK
+        ("020 7709 1000", "442077091000", "44", 1),  # UK
+    ],
+)
+def test_persist_notification_with_send_to_landline_stores_correct_info(
+    sample_job,
+    sample_api_key,
+    recipient,
+    expected_recipient_normalised,
+    expected_prefix,
+    expected_units,
+):
+    sample_job.service.permissions = [
+        # and any other permissions we need
+        ServicePermission(service_id=sample_job.service.id, permission=SMS_TYPE),
+        ServicePermission(service_id=sample_job.service.id, permission=SMS_TO_UK_LANDLINES),
+    ]
+    persist_notification(
+        template_id=sample_job.template.id,
+        template_version=sample_job.template.version,
+        recipient=recipient,
+        service=sample_job.service,
+        personalisation=None,
+        notification_type="sms",
+        api_key_id=sample_api_key.id,
+        key_type=sample_api_key.key_type,
+        job_id=sample_job.id,
+        job_row_number=10,
+        client_reference="ref from client",
+    )
+    persisted_notification = Notification.query.all()[0]
+    assert persisted_notification.phone_prefix == expected_prefix
+    assert persisted_notification.normalised_to == expected_recipient_normalised
+    assert persisted_notification.rate_multiplier == expected_units
+
+
+def test_persist_notification_without_send_to_landline_raises_invalidphoneerror(
+    sample_job,
+    sample_api_key,
+):
+    recipient = "+442077091002"
+    sample_job.service.permissions = [
+        ServicePermission(service_id=sample_job.service.id, permission=SMS_TYPE),
+    ]
+    with pytest.raises(InvalidPhoneError):
+        persist_notification(
+            template_id=sample_job.template.id,
+            template_version=sample_job.template.version,
+            recipient=recipient,
+            service=sample_job.service,
+            personalisation=None,
+            notification_type="sms",
+            api_key_id=sample_api_key.id,
+            key_type=sample_api_key.key_type,
+            job_id=sample_job.id,
+            job_row_number=10,
+            client_reference="ref from client",
+        )
+
+
+def test_persist_notification_with_international_info_does_not_store_for_email(sample_job, sample_api_key):
     persist_notification(
         template_id=sample_job.template.id,
         template_version=sample_job.template.version,
@@ -422,7 +485,7 @@ def test_persist_notification_with_international_info_does_not_store_for_email(s
     ],
 )
 def test_persist_sms_notification_stores_normalised_number(
-    sample_job, sample_api_key, mocker, recipient, expected_recipient_normalised
+    sample_job, sample_api_key, recipient, expected_recipient_normalised
 ):
     persist_notification(
         template_id=sample_job.template.id,
@@ -445,7 +508,7 @@ def test_persist_sms_notification_stores_normalised_number(
     "recipient, expected_recipient_normalised", [("FOO@bar.com", "foo@bar.com"), ("BAR@foo.com", "bar@foo.com")]
 )
 def test_persist_email_notification_stores_normalised_email(
-    sample_job, sample_api_key, mocker, recipient, expected_recipient_normalised
+    sample_job, sample_api_key, recipient, expected_recipient_normalised
 ):
     persist_notification(
         template_id=sample_job.template.id,
@@ -494,7 +557,7 @@ def test_persist_letter_notification_finds_correct_postage(
     assert persisted_notification.postage == expected_postage
 
 
-def test_persist_notification_with_billable_units_stores_correct_info(mocker):
+def test_persist_notification_with_billable_units_stores_correct_info(notify_db_session, mocker):
     service = create_service(service_permissions=[LETTER_TYPE])
     template = create_template(service, template_type=LETTER_TYPE)
     mocker.patch("app.dao.templates_dao.dao_get_template_by_id", return_value=template)
@@ -531,3 +594,78 @@ def test_persist_notification_for_international_letter(sample_letter_template, p
     persisted_notification = Notification.query.get(notification.id)
     assert persisted_notification.postage == postage
     assert persisted_notification.international
+
+
+@pytest.mark.parametrize(
+    "unsubscribe_link",
+    ["https://please-unsubscribe-me.com/unsubscribe", None],
+)
+def test_persist_notification_when_template_has_unsubscribe_link_is_false(unsubscribe_link, sample_job):
+    service = create_service(service_name="321 Service")
+    template = create_template(service=service, has_unsubscribe_link=False, template_type=EMAIL_TYPE)
+    sample_job.template = template
+    sample_job.service = template.service
+    recipient = "foo@bar.com"
+
+    persist_notification(
+        notification_id=uuid.uuid4(),
+        template_id=sample_job.template.id,
+        template_version=sample_job.template.version,
+        template_has_unsubscribe_link=sample_job.template.has_unsubscribe_link,
+        recipient=recipient,
+        service=sample_job.service,
+        personalisation=None,
+        notification_type=EMAIL_TYPE,
+        unsubscribe_link=unsubscribe_link,
+        job_id=sample_job.id,
+        api_key_id=None,
+        key_type=KEY_TYPE_NORMAL,
+    )
+
+    persisted_notification = Notification.query.first()
+    assert persisted_notification.unsubscribe_link == unsubscribe_link
+
+
+@pytest.mark.parametrize(
+    "unsubscribe_link, expected_unsubscribe_link",
+    [
+        ("https://please-unsubscribe-me.com/unsubscribe", "https://please-unsubscribe-me.com/unsubscribe"),
+        # We don’t persist template-level unsubscribe links – they are generated at time of sending
+        (None, None),
+    ],
+)
+def test_persist_notification_when_template_has_unsubscribe_link_is_true(
+    unsubscribe_link, sample_service, expected_unsubscribe_link
+):
+    """
+    Tests that if template.has_unsubscribe_link is True that an unsubscribe link is generated by persist_notification
+    only if one hasn't already been provided.
+    """
+
+    template = create_template(
+        template_name="Subscription Template",
+        has_unsubscribe_link=True,
+        service=sample_service,
+        template_type=EMAIL_TYPE,
+    )
+    job = create_job(template=template)
+
+    recipient = "foo@bar.com"
+
+    persist_notification(
+        notification_id=uuid.uuid4(),
+        template_id=job.template.id,
+        template_version=job.template.version,
+        template_has_unsubscribe_link=job.template.has_unsubscribe_link,
+        recipient=recipient,
+        service=job.service,
+        personalisation=None,
+        notification_type=EMAIL_TYPE,
+        unsubscribe_link=unsubscribe_link,
+        job_id=job.id,
+        api_key_id=None,
+        key_type=KEY_TYPE_NORMAL,
+    )
+
+    persisted_notification = Notification.query.first()
+    assert persisted_notification.unsubscribe_link == expected_unsubscribe_link

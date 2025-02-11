@@ -1,5 +1,6 @@
 import random
 from datetime import datetime, timedelta
+from threading import RLock
 from urllib import parse
 
 from cachetools import TTLCache, cached
@@ -10,7 +11,7 @@ from notifications_utils.template import (
     SMSMessageTemplate,
 )
 
-from app import create_uuid, db, notification_provider_clients, statsd_client
+from app import create_uuid, db, notification_provider_clients, redis_store, statsd_client
 from app.celery.research_mode_tasks import (
     send_email_response,
     send_sms_response,
@@ -24,6 +25,8 @@ from app.constants import (
     NOTIFICATION_SENT,
     NOTIFICATION_STATUS_TYPES_COMPLETED,
     NOTIFICATION_TECHNICAL_FAILURE,
+    SMS_PROVIDER_ERROR_INTERVAL,
+    SMS_PROVIDER_ERROR_THRESHOLD,
     SMS_TYPE,
 )
 from app.dao.email_branding_dao import dao_get_email_branding_by_id
@@ -33,6 +36,7 @@ from app.dao.provider_details_dao import (
     get_provider_details_by_notification_type,
 )
 from app.exceptions import NotificationTechnicalFailureException
+from app.models import Notification
 from app.serialised_models import SerialisedOrganisation, SerialisedService, SerialisedTemplate
 
 
@@ -82,7 +86,12 @@ def send_sms_to_provider(notification):
             except Exception as e:
                 notification.billable_units = template.fragment_count
                 dao_update_notification(notification)
-                dao_reduce_sms_provider_priority(provider.name, time_threshold=timedelta(minutes=1))
+
+                if redis_store.exceeded_rate_limit(
+                    f"{provider.name}-error-rate", SMS_PROVIDER_ERROR_THRESHOLD, SMS_PROVIDER_ERROR_INTERVAL
+                ):
+                    dao_reduce_sms_provider_priority(provider.name, time_threshold=timedelta(minutes=1))
+                    current_app.logger.warning("Error threshold exceeded for provider %s", provider.name)
                 raise e
             else:
                 notification.billable_units = template.fragment_count
@@ -97,10 +106,18 @@ def send_sms_to_provider(notification):
             statsd_client.timing("sms.test-key.total-time", delta_seconds)
         else:
             statsd_client.timing("sms.live-key.total-time", delta_seconds)
-            if service.high_volume:
-                statsd_client.timing("sms.live-key.high-volume.total-time", delta_seconds)
-            else:
-                statsd_client.timing("sms.live-key.not-high-volume.total-time", delta_seconds)
+
+
+def _get_email_headers(notification: Notification, template: SerialisedTemplate) -> list[dict[str, str]]:
+    if unsubscribe_link := notification.get_unsubscribe_link_for_headers(
+        template_has_unsubscribe_link=template.has_unsubscribe_link
+    ):
+        return [
+            {"Name": "List-Unsubscribe", "Value": f"<{unsubscribe_link}>"},
+            {"Name": "List-Unsubscribe-Post", "Value": "List-Unsubscribe=One-Click"},
+        ]
+
+    return []
 
 
 def send_email_to_provider(notification):
@@ -112,15 +129,26 @@ def send_email_to_provider(notification):
     if notification.status == "created":
         provider = provider_to_use(EMAIL_TYPE)
 
-        template_dict = SerialisedTemplate.from_id_and_service_id(
+        template = SerialisedTemplate.from_id_and_service_id(
             template_id=notification.template_id, service_id=service.id, version=notification.template_version
-        ).__dict__
-
-        html_email = HTMLEmailTemplate(
-            template_dict, values=notification.personalisation, **get_html_email_options(service)
         )
 
-        plain_text_email = PlainTextEmailTemplate(template_dict, values=notification.personalisation)
+        unsubscribe_link_for_body = notification.get_unsubscribe_link_for_body(
+            template_has_unsubscribe_link=template.has_unsubscribe_link
+        )
+
+        html_email = HTMLEmailTemplate(
+            template.__dict__,
+            values=notification.personalisation,
+            unsubscribe_link=unsubscribe_link_for_body,
+            **get_html_email_options(service),
+        )
+
+        plain_text_email = PlainTextEmailTemplate(
+            template.__dict__,
+            values=notification.personalisation,
+            unsubscribe_link=unsubscribe_link_for_body,
+        )
         created_at = notification.created_at
         key_type = notification.key_type
         if notification.key_type == KEY_TYPE_TEST:
@@ -141,12 +169,13 @@ def send_email_to_provider(notification):
             from_address = f'"{email_sender_name}" <{service.email_sender_local_part}@{from_email_domain}>'
 
             reference = provider.send_email(
-                from_address,
-                notification.normalised_to,
-                plain_text_email.subject,
+                from_address=from_address,
+                to_address=notification.normalised_to,
+                subject=plain_text_email.subject,
                 body=str(plain_text_email),
                 html_body=str(html_email),
                 reply_to_address=notification.reply_to_text,
+                headers=_get_email_headers(notification, template),
             )
             notification.reference = reference
             update_notification_to_sending(notification, provider)
@@ -156,10 +185,6 @@ def send_email_to_provider(notification):
             statsd_client.timing("email.test-key.total-time", delta_seconds)
         else:
             statsd_client.timing("email.live-key.total-time", delta_seconds)
-            if service.high_volume:
-                statsd_client.timing("email.live-key.high-volume.total-time", delta_seconds)
-            else:
-                statsd_client.timing("email.live-key.not-high-volume.total-time", delta_seconds)
 
 
 def update_notification_to_sending(notification, provider):
@@ -171,9 +196,10 @@ def update_notification_to_sending(notification, provider):
 
 
 provider_cache = TTLCache(maxsize=8, ttl=10)
+provider_cache_lock = RLock()
 
 
-@cached(cache=provider_cache)
+@cached(cache=provider_cache, lock=provider_cache_lock)
 def provider_to_use(notification_type, international=False):
     active_providers = [
         p for p in get_provider_details_by_notification_type(notification_type, international) if p.active
@@ -181,7 +207,7 @@ def provider_to_use(notification_type, international=False):
 
     if not active_providers:
         current_app.logger.error("%s failed as no active providers", notification_type)
-        raise Exception("No active {} providers".format(notification_type))
+        raise Exception(f"No active {notification_type} providers")
 
     if len(active_providers) == 1:
         weights = [100]
@@ -241,7 +267,6 @@ def technical_failure(notification):
     notification.status = NOTIFICATION_TECHNICAL_FAILURE
     dao_update_notification(notification)
     raise NotificationTechnicalFailureException(
-        "Send {} for notification id {} to provider is not allowed: service {} is inactive".format(
-            notification.notification_type, notification.id, notification.service_id
-        )
+        f"Send {notification.notification_type} for notification id {notification.id} to provider "
+        f"is not allowed: service {notification.service_id} is inactive"
     )

@@ -39,9 +39,11 @@ def get_paginated_uploads(service_id, limit_days, page):
             "id": upload.id,
             "original_file_name": upload.original_file_name,
             "notification_count": upload.notification_count,
-            "created_at": upload.scheduled_for.strftime("%Y-%m-%d %H:%M:%S")
-            if upload.scheduled_for
-            else upload.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": (
+                upload.scheduled_for.strftime("%Y-%m-%d %H:%M:%S")
+                if upload.scheduled_for
+                else upload.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            ),
             "upload_type": upload.upload_type,
             "template_type": upload.template_type,
             "recipient": upload.recipient,
@@ -56,7 +58,7 @@ def get_paginated_uploads(service_id, limit_days, page):
                 statistics = fetch_notification_statuses_for_job(upload.id)
             else:
                 # notifications table
-                statistics = dao_get_notification_outcomes_for_job(service_id, upload.id)
+                statistics = dao_get_notification_outcomes_for_job(upload.id)
             upload_dict["statistics"] = [
                 {"status": statistic.status, "count": statistic.count} for statistic in statistics
             ]

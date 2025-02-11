@@ -10,7 +10,7 @@ import boto3
 import jwt
 import requests
 from flask import current_app
-from notifications_utils.postal_address import PostalAddress
+from notifications_utils.recipient_validation.postal_address import PostalAddress
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
 
@@ -52,12 +52,12 @@ def _handle_common_dvla_errors(custom_httperror_exc_handler: Callable[[requests.
     try:
         yield
     except (ConnectionError, requests.ConnectionError, requests.Timeout) as e:
-        raise DvlaRetryableException() from e
+        raise DvlaRetryableException from e
     except requests.HTTPError as e:
         custom_httperror_exc_handler(e)
 
         if e.response.status_code == 429:
-            raise DvlaThrottlingException() from e
+            raise DvlaThrottlingException from e
         elif e.response.status_code >= 500:
             raise DvlaRetryableException(f"Received {e.response.status_code} from {e.request.url}") from e
         else:
@@ -110,14 +110,18 @@ class _SpecifiedCiphersAdapter(HTTPAdapter):
 class DVLAClient:
     """
     DVLA HTTP API letter client.
+
+    This class is not thread-safe.
     """
+
+    name = "dvla"
 
     statsd_client = None
 
     _jwt_token = None
     _jwt_expires_at = None
 
-    def init_app(self, application, *, statsd_client):
+    def __init__(self, application, *, statsd_client):
         self.base_url = application.config["DVLA_API_BASE_URL"]
         self.ciphers = application.config["DVLA_API_TLS_CIPHERS"]
         ssm_client = boto3.client("ssm", region_name=application.config["AWS_REGION"])
@@ -128,10 +132,6 @@ class DVLAClient:
 
         self.session = requests.Session()
         self.session.mount(self.base_url, _SpecifiedCiphersAdapter(ciphers=self.ciphers))
-
-    @property
-    def name(self):
-        return "dvla"
 
     @property
     def jwt_token(self):
@@ -269,6 +269,7 @@ class DVLAClient:
         service_id: str,
         organisation_id: str,
         pdf_file: bytes,
+        callback_url: str,
     ):
         """
         Sends a letter to the DVLA for printing
@@ -297,13 +298,14 @@ class DVLAClient:
                     service_id=service_id,
                     organisation_id=organisation_id,
                     pdf_file=pdf_file,
+                    callback_url=callback_url,
                 ),
             )
             response.raise_for_status()
             return response.json()
 
     def _format_create_print_job_json(
-        self, *, notification_id, reference, address, postage, service_id, organisation_id, pdf_file
+        self, *, notification_id, reference, address, postage, service_id, organisation_id, pdf_file, callback_url
     ):
         # We shouldn't need to pass the postage in, as the address has a postage field. However, at this point we've
         # recorded the postage on the notification so we should respect that rather than introduce any possible
@@ -327,6 +329,11 @@ class DVLAClient:
                 {"key": "organisationIdentifier", "value": organisation_id},
                 {"key": "serviceIdentifier", "value": service_id},
             ],
+        }
+
+        json_payload["callbackParams"] = {
+            "target": callback_url,
+            "retryParams": {"enabled": True, "maxRetryWindow": 10800},
         }
 
         # `despatchMethod` should not be added for second class letters

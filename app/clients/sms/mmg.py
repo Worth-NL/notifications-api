@@ -1,6 +1,6 @@
 import json
 
-from requests import RequestException, request
+import requests
 
 from app.clients.sms import SmsClient, SmsClientResponseException
 
@@ -70,32 +70,36 @@ class MMGClientResponseException(SmsClientResponseException):
         self.exception = exception
 
     def __str__(self):
-        return "Code {} text {} exception {}".format(self.status_code, self.text, str(self.exception))
+        return f"Code {self.status_code} text {self.text} exception {str(self.exception)}"
 
 
 class MMGClient(SmsClient):
     """
     MMG sms client
+
+    This class is not thread-safe.
     """
 
-    def init_app(self, *args, **kwargs):
-        super().init_app(*args, **kwargs)
+    name = "mmg"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.api_key = self.current_app.config.get("MMG_API_KEY")
         self.mmg_url = self.current_app.config.get("MMG_URL")
-
-    @property
-    def name(self):
-        return "mmg"
+        self.receipt_url = self.current_app.config.get("MMG_RECEIPT_URL")
 
     def try_send_sms(self, to, content, reference, international, sender):
         data = {"reqType": "BULK", "MSISDN": to, "msg": content, "sender": sender, "cid": reference, "multi": True}
 
+        if self.receipt_url:
+            data["delurl"] = self.receipt_url
+
         try:
-            response = request(
+            response = self.requests_session.request(
                 "POST",
                 self.mmg_url,
                 data=json.dumps(data),
-                headers={"Content-Type": "application/json", "Authorization": "Basic {}".format(self.api_key)},
+                headers={"Content-Type": "application/json", "Authorization": f"Basic {self.api_key}"},
                 timeout=60,
             )
 
@@ -104,7 +108,7 @@ class MMGClient(SmsClient):
                 json.loads(response.text)
             except (ValueError, AttributeError) as e:
                 raise SmsClientResponseException("Invalid response JSON") from e
-        except RequestException as e:
+        except requests.RequestException as e:
             raise SmsClientResponseException("Request failed") from e
 
         return response
