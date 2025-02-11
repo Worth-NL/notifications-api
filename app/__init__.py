@@ -108,6 +108,15 @@ get_aws_ses_stub_client: LazyLocalGetter[AwsSesStubClient] = LazyLocalGetter(
 memo_resetters.append(lambda: get_aws_ses_stub_client.clear())
 aws_ses_stub_client = LocalProxy(get_aws_ses_stub_client)
 
+_spring_client_context_var: ContextVar[SpryngClient] = ContextVar("spring_client")
+get_spring_client: LazyLocalGetter[SpryngClient] = LazyLocalGetter(
+    _spring_client_context_var,
+    lambda: SpryngClient(current_app, statsd_client=statsd_client),
+    expected_type=SpryngClient,
+)
+memo_resetters.append(lambda: get_spring_client.clear())
+spring_client = LocalProxy(get_spring_client)
+
 _notification_provider_clients_context_var: ContextVar[NotificationProviderClients] = ContextVar(
     "notification_provider_clients"
 )
