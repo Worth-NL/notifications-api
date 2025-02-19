@@ -5,6 +5,7 @@ Revises: 0440_request_invite_templates
 Create Date: 2024-01-02 12:39:29.779099
 
 """
+
 from sqlalchemy.sql import text
 from alembic import op
 from datetime import datetime

@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bullseye as base
+FROM python:3.11-slim-bullseye AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -57,7 +57,7 @@ RUN chown -R notify:notify /home/vcap/app && \
 ENTRYPOINT [ "/home/vcap/app/entrypoint.sh" ]
 
 ##### Test Image ##############################################################
-FROM production as test
+FROM production AS test
 
 USER root
 RUN echo "Install OS dependencies for test build" && \
@@ -86,7 +86,7 @@ RUN make bootstrap
 COPY --chown=notify:notify . .
 
 ##### Concourse Test Image ##############################################################
-FROM production as concourse_tests
+FROM production AS concourse_tests
 
 USER root
 RUN echo "Install OS dependencies for test build" && \
