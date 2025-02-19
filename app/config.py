@@ -383,7 +383,7 @@ class Config(object):
     if os.getenv("CELERYD_PREFETCH_MULTIPLIER"):
         CELERY["worker_prefetch_multiplier"] = os.getenv("CELERYD_PREFETCH_MULTIPLIER")
 
-    FROM_NUMBER = "NotifyNL"
+    FROM_NUMBER = "NOTIFYNL"
 
     STATSD_HOST = os.getenv("STATSD_HOST")
     STATSD_PORT = 8125
@@ -460,15 +460,17 @@ class Development(Config):
 
     REDIS_ENABLED = os.getenv("REDIS_ENABLED") == "1"
 
-    S3_BUCKET_CSV_UPLOAD = "development-notifications-csv-upload-notifynl"
-    S3_BUCKET_CONTACT_LIST = "development-contact-list-notifynl"
-    S3_BUCKET_TEST_LETTERS = "development-test-letters-notifynl"
-    S3_BUCKET_DVLA_RESPONSE = "notify.tools-ftp-notifynl"
-    S3_BUCKET_LETTERS_PDF = "development-letters-pdf-notifynl"
-    S3_BUCKET_LETTERS_SCAN = "development-letters-scan-notifynl"
-    S3_BUCKET_INVALID_PDF = "development-letters-invalid-pdf-notifynl"
-    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "development-transient-uploaded-letters-notifynl"
-    S3_BUCKET_LETTER_SANITISE = "development-letters-sanitise-notifynl"
+    S3_BUCKET_CSV_UPLOAD = os.getenv("S3_BUCKET_CSV_UPLOAD", "notifynl-dev-notifications-csv-upload")
+    S3_BUCKET_CONTACT_LIST = os.getenv("S3_BUCKET_CONTACT_LIST", "notifynl-dev-contact-list")
+    S3_BUCKET_TEST_LETTERS = os.getenv("S3_BUCKET_TEST_LETTERS", "notifynl-dev-test-letters")
+    S3_BUCKET_DVLA_RESPONSE = os.getenv("S3_BUCKET_DVLA_RESPONSE", "notifynl-dev-tools-ftp")
+    S3_BUCKET_LETTERS_PDF = os.getenv("S3_BUCKET_LETTERS_PDF", "notifynl-dev-letters-pdf")
+    S3_BUCKET_LETTERS_SCAN = os.getenv("S3_BUCKET_LETTERS_SCAN", "notifynl-dev-letters-scan")
+    S3_BUCKET_INVALID_PDF = os.getenv("S3_BUCKET_INVALID_PDF", "notifynl-dev-letters-invalid-pdf")
+    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = os.getenv(
+        "S3_BUCKET_TRANSIENT_UPLOADED_LETTERS", "notifynl-dev-transient-uploaded-letters"
+    )
+    S3_BUCKET_LETTER_SANITISE = os.getenv("S3_BUCKET_LETTER_SANITISE", "notifynl-dev-letters-sanitise")
 
     LOGO_CDN_DOMAIN = "d26j1qfpsndp6a.cloudfront.net"
 
@@ -503,8 +505,8 @@ class Development(Config):
 
 
 class Test(Development):
-    NOTIFY_EMAIL_DOMAIN = "test.notify.com"
-    FROM_NUMBER = "testing"
+    NOTIFY_EMAIL_DOMAIN = "test.notifynl.nl"
+    FROM_NUMBER = "NOTIFYNLTEST"
     NOTIFY_ENVIRONMENT = "test"
     TESTING = True
 
@@ -515,15 +517,15 @@ class Test(Development):
         "10d1b9c9-0072-4fa9-ae1c-595e333841da",
     ]
 
-    S3_BUCKET_CSV_UPLOAD = "test-notifications-csv-upload"
-    S3_BUCKET_CONTACT_LIST = "test-contact-list"
-    S3_BUCKET_TEST_LETTERS = "test-test-letters"
-    S3_BUCKET_DVLA_RESPONSE = "test.notify.com-ftp"
-    S3_BUCKET_LETTERS_PDF = "test-letters-pdf"
-    S3_BUCKET_LETTERS_SCAN = "test-letters-scan"
-    S3_BUCKET_INVALID_PDF = "test-letters-invalid-pdf"
-    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "test-transient-uploaded-letters"
-    S3_BUCKET_LETTER_SANITISE = "test-letters-sanitise"
+    S3_BUCKET_CSV_UPLOAD = "notifynl-test-csv-upload"
+    S3_BUCKET_CONTACT_LIST = "notifynl-test-contact-list"
+    S3_BUCKET_TEST_LETTERS = "notifynl-test-test-letters"
+    S3_BUCKET_DVLA_RESPONSE = "notifynl-test-tools-ftp"
+    S3_BUCKET_LETTERS_PDF = "notifynl-test-letters-pdf"
+    S3_BUCKET_LETTERS_SCAN = "notifynl-test-letters-scan"
+    S3_BUCKET_INVALID_PDF = "notifynl-test-letters-invalid-pdf"
+    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "notifynl-test-transient-uploaded-letters"
+    S3_BUCKET_LETTER_SANITISE = "notifynl-test-letters-sanitise"
 
     # when testing, the SQLALCHEMY_DATABASE_URI is used for the postgres server's location
     # but the database name is set in the _notify_db fixture
@@ -569,36 +571,36 @@ class Preview(Config):
 
 
 class Staging(Config):
-    NOTIFY_EMAIL_DOMAIN = "staging-notify.works"
+    NOTIFY_EMAIL_DOMAIN = "acc.notifynl.nl"
     NOTIFY_ENVIRONMENT = "staging"
-    S3_BUCKET_CSV_UPLOAD = "staging-notifications-csv-upload"
-    S3_BUCKET_CONTACT_LIST = "staging-contact-list"
-    S3_BUCKET_TEST_LETTERS = "staging-test-letters"
-    S3_BUCKET_DVLA_RESPONSE = "staging-notify.works-ftp"
-    S3_BUCKET_LETTERS_PDF = "staging-letters-pdf"
-    S3_BUCKET_LETTERS_SCAN = "staging-letters-scan"
-    S3_BUCKET_INVALID_PDF = "staging-letters-invalid-pdf"
-    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "staging-transient-uploaded-letters"
-    S3_BUCKET_LETTER_SANITISE = "staging-letters-sanitise"
-    FROM_NUMBER = "stage"
+    S3_BUCKET_CSV_UPLOAD = "notifynl-acc-csv-upload"
+    S3_BUCKET_CONTACT_LIST = "notifynl-acc-contact-list"
+    S3_BUCKET_TEST_LETTERS = "notifynl-acc-test-letters"
+    S3_BUCKET_DVLA_RESPONSE = "notifynl-acc-tools-ftp"
+    S3_BUCKET_LETTERS_PDF = "notifynl-acc-letters-pdf"
+    S3_BUCKET_LETTERS_SCAN = "notifynl-acc-letters-scan"
+    S3_BUCKET_INVALID_PDF = "notifynl-acc-letters-invalid-pdf"
+    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "notifynl-acc-transient-uploaded-letters"
+    S3_BUCKET_LETTER_SANITISE = "notifynl-acc-letters-sanitise"
+    FROM_NUMBER = "NOTIFYNLACC"
     API_RATE_LIMIT_ENABLED = True
     CHECK_PROXY_HEADER = False if os.environ.get("CHECK_PROXY_HEADER") == "0" else True
     DVLA_API_TLS_CIPHERS = os.environ.get("DVLA_API_TLS_CIPHERS", "must-supply-tls-ciphers")
 
 
 class Production(Config):
-    NOTIFY_EMAIL_DOMAIN = "notifications.service.gov.uk"
+    NOTIFY_EMAIL_DOMAIN = "notifynl.nl"
     NOTIFY_ENVIRONMENT = "production"
-    S3_BUCKET_CSV_UPLOAD = "live-notifications-csv-upload"
-    S3_BUCKET_CONTACT_LIST = "production-contact-list"
-    S3_BUCKET_TEST_LETTERS = "production-test-letters"
-    S3_BUCKET_DVLA_RESPONSE = "notifications.service.gov.uk-ftp"
-    S3_BUCKET_LETTERS_PDF = "production-letters-pdf"
-    S3_BUCKET_LETTERS_SCAN = "production-letters-scan"
-    S3_BUCKET_INVALID_PDF = "production-letters-invalid-pdf"
-    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "production-transient-uploaded-letters"
-    S3_BUCKET_LETTER_SANITISE = "production-letters-sanitise"
-    FROM_NUMBER = "GOVUK"
+    S3_BUCKET_CSV_UPLOAD = "notifynl-prod-csv-upload"
+    S3_BUCKET_CONTACT_LIST = "notifynl-prod-contact-list"
+    S3_BUCKET_TEST_LETTERS = "notifynl-prod-test-letters"
+    S3_BUCKET_DVLA_RESPONSE = "notifynl-prod-tools-ftp"
+    S3_BUCKET_LETTERS_PDF = "notifynl-prod-letters-pdf"
+    S3_BUCKET_LETTERS_SCAN = "notifynl-prod-letters-scan"
+    S3_BUCKET_INVALID_PDF = "notifynl-prod-letters-invalid-pdf"
+    S3_BUCKET_TRANSIENT_UPLOADED_LETTERS = "notifynl-prod-transient-uploaded-letters"
+    S3_BUCKET_LETTER_SANITISE = "notifynl-prod-letters-sanitise"
+    FROM_NUMBER = "NOTIFYNL"
     API_RATE_LIMIT_ENABLED = True
     CHECK_PROXY_HEADER = False if os.environ.get("CHECK_PROXY_HEADER") == "0" else True
     SES_STUB_URL = None
