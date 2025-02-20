@@ -1,36 +1,31 @@
 """
-
-Revision ID: 0441_intl_letters_jan_24
-Revises: 0440_request_invite_templates
-Create Date: 2024-01-02 12:39:29.779099
-
+Create Date: 2025-01-15 15:40:34.849174
 """
 
 import itertools
 import uuid
 from datetime import datetime
-import uuid
-import itertools
 
 
-revision = "0441_intl_letters_jan_24"
-down_revision = "0440_request_invite_templates"
+from alembic import op
+from sqlalchemy.sql import text
 
+revision = "0490_letter_rates_feb_2025"
+down_revision =  "0489_add_job_status_fin_allrws"
 
-RATE_CHANGE_DATE = datetime(2024, 1, 2, 0, 0)
+RATE_CHANGE_DATE = datetime(2025, 2, 6, 0, 0)
 
 NEW_INTERNATIONAL_RATES = [
-    (1, 1.44),
-    (2, 1.49),
-    (3, 1.53),
-    (4, 1.58),
-    (5, 1.63),
+    (1, 1.56),
+    (2, 1.61),
+    (3, 1.66),
+    (4, 1.71),
+    (5, 1.76),
 ]
 
 
 def upgrade():
     conn = op.get_bind()
-
     # mark old rates as inactive
     conn.execute(
         text(
