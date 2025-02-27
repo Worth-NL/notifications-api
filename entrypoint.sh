@@ -16,7 +16,8 @@ case "$1" in
     exec gunicorn -c /home/vcap/app/gunicorn_config.py application
     ;;
   api-local)
-    exec python -m debugpy --listen 0.0.0.0:5678 -m flask run --host 0.0.0.0 --port $PORT
+    exec flask run --host 0.0.0.0 --port $PORT
+    # exec python -m debugpy --listen 0.0.0.0:5678 -m flask run --host 0.0.0.0 --port $PORT
     ;;
   migration)
     exec flask db upgrade
