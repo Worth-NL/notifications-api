@@ -193,7 +193,7 @@ pyjwt==2.5.0
     # via
     #   -r requirements.in
     #   notifications-python-client
-pypdf==3.17.0
+pypdf==6.0.0
     # via notifications-utils
 pyrsistent==0.18.1
     # via jsonschema
